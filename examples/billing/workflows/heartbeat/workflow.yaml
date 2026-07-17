@@ -1,0 +1,12 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: heartbeat }
+triggers:
+  - { type: cron, schedule: "*/30 * * * * *" }   # every 30s (6-field: seconds enabled)
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: beat,  kind: jscode, name: Beat, file: nodes/beat.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: beat }
+  - { from: beat,  to: end }

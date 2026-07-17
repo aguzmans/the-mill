@@ -1,0 +1,22 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: invoices }
+triggers:
+  - { type: cron, schedule: "0 2 * * *" }
+  - { type: manual }
+nodes:
+  - { key: start,     kind: start,      name: Start }
+  - { key: fetch,     kind: jscode,     name: Fetch Invoices,  file: nodes/fetch.js }
+  - { key: gate,      kind: if,         name: Any open invoices?, conditions: [ { expr: "input.length > 0" } ] }
+  - { key: transform, kind: jscode,     name: Compute Totals,  file: nodes/transform.js }
+  - { key: load,      kind: jscode,     name: Load Warehouse,  file: nodes/load.js, secrets: [ WAREHOUSE_DSN ] }
+  - { key: notify,    kind: callScript, name: Notify,          call: { workflow: notify, ref: workflows/notify } }
+  - { key: end,       kind: end,        name: End }
+edges:
+  - { from: start,     to: fetch }
+  - { from: fetch,     to: gate }
+  - { from: gate,      to: transform, branch: "true" }
+  - { from: gate,      to: end,       branch: "false" }
+  - { from: transform, to: load }
+  - { from: load,      to: notify }
+  - { from: notify,    to: end }

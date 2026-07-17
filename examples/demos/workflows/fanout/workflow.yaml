@@ -1,0 +1,17 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: fanout }
+triggers:
+  - { type: manual }
+  - { type: webhook }
+nodes:
+  - { key: start,     kind: start,  name: Start }
+  - { key: gen,       kind: jscode, name: List URLs,       file: nodes/gen.js }
+  - { key: each,      kind: loop,   name: Fetch each URL,  each: "input.urls", file: nodes/fetch-one.js }
+  - { key: summarize, kind: jscode, name: Summarize,       file: nodes/summarize.js }
+  - { key: end,       kind: end,    name: End }
+edges:
+  - { from: start,     to: gen }
+  - { from: gen,       to: each }
+  - { from: each,      to: summarize }
+  - { from: summarize, to: end }

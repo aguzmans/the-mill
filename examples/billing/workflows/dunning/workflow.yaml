@@ -1,0 +1,18 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: dunning }
+triggers:
+  - { type: cron, schedule: "0 9 * * 1" }
+  - { type: event }
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: query, kind: jscode, name: Query Overdue, file: nodes/query.js }
+  - { key: gate,  kind: if,     name: Anything overdue?, conditions: [ { expr: "input.length > 0" } ] }
+  - { key: send,  kind: jscode, name: Send Email, file: nodes/send.js, secrets: [ SMTP_URL ] }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: query }
+  - { from: query, to: gate }
+  - { from: gate,  to: send, branch: "true" }
+  - { from: gate,  to: end,  branch: "false" }
+  - { from: send,  to: end }

@@ -1,0 +1,11 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: double }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: dbl,   kind: jscode, name: Double,  file: nodes/dbl.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: dbl }
+  - { from: dbl,   to: end }

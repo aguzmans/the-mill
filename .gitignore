@@ -1,0 +1,27 @@
+# Multi-agent system (auto-added by init-agent-env)
+# Remove this line if you want to commit planning files to version control
+.claude-agents/
+
+# DevSpace cache and logs (auto-added by init-agent-env)
+.devspace/
+
+# Dependencies
+node_modules/
+.pnp/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# Env / local
+.env
+.env.local
+*.log
+.DS_Store

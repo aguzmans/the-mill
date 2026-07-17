@@ -1,0 +1,4 @@
+apiVersion: mill/v1
+kind: Project
+metadata: { name: demos }
+sync: { autoSync: true, selfHeal: true, prune: false }

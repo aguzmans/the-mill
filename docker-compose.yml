@@ -1,0 +1,77 @@
+# Convenience compose for Mill.
+#
+#   Local runtime stack (Gate 2 — controller + queue + worker):
+#     docker compose up redis api worker      # API at http://localhost:8787
+#     bun scripts/e2e-smoke.ts                # end-to-end smoke test (after up)
+#
+#   Web prototype:
+#     docker compose up web                   # serve the UI at http://localhost:8080
+#     docker compose run --rm e2e             # run the Playwright suite
+#
+# The api/worker use the official Bun image with the repo mounted, so there's no image
+# build for local dev (Dockerfiles for a shipped image land at M6). node_modules is the
+# host-installed one (pure-JS deps), shared into the containers via the mount.
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mill-backend
+    command: bun /app/apps/api/src/server.ts
+    restart: unless-stopped
+    environment:
+      # The controller clones this repo and reconciles a working copy toward it.
+      # Point it at your own GitHub repo via a .env file (see .env.example).
+      - PROJECT_REPO=${PROJECT_REPO:-file:///app/project-repo.git}
+      - PROJECT_BRANCH=${PROJECT_BRANCH:-main}
+      - GIT_TOKEN=${GIT_TOKEN:-}
+      - WORKDIR=/app/workdir
+      - RECONCILE_INTERVAL_MS=${RECONCILE_INTERVAL_MS:-15000}
+      - REDIS_URL=redis://redis:6379
+      - PORT=8080
+    volumes:
+      - workdir:/app/workdir   # shared working copy (PVC-equivalent) so workers see reconciled code
+    ports:
+      - "8787:8080"
+    depends_on:
+      - redis
+
+  worker:
+    image: mill-backend
+    command: bun /app/apps/worker/src/worker.ts
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MILL_CONC_MIN=1
+      - MILL_CONC_MAX=8
+      # Flat secrets, as k8s Secrets would be injected on EKS (each node still sees only its declared refs).
+      - MILL_SECRETS={"WAREHOUSE_DSN":"postgres://demo","SMTP_URL":"smtp://demo","API_URL":"https://demo"}
+    volumes:
+      - workdir:/app/workdir   # reads the same reconciled working copy the controller checks out
+    depends_on:
+      - redis
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    image: mill-web
+    ports:
+      - "8080:80"
+
+  e2e:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile.test
+    image: mill-web-e2e
+    environment:
+      - CI=1
+
+volumes:
+  workdir: {}

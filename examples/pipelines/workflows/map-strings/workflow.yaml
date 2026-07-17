@@ -1,0 +1,15 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: map-strings }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: gen,   kind: jscode, name: Words,       file: nodes/gen.js }
+  - { key: each,  kind: loop,   name: Shout each,  each: "input.words", file: nodes/shout.js }
+  - { key: join,  kind: jscode, name: Join,        file: nodes/join.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: gen }
+  - { from: gen,   to: each }
+  - { from: each,  to: join }
+  - { from: join,  to: end }

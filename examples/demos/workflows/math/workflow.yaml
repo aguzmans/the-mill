@@ -1,0 +1,12 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: math }
+triggers:
+  - { type: manual }
+nodes:
+  - { key: start,   kind: start,  name: Start }
+  - { key: compute, kind: jscode, name: Compute stats, file: nodes/compute.js }
+  - { key: end,     kind: end,    name: End }
+edges:
+  - { from: start,   to: compute }
+  - { from: compute, to: end }

@@ -1,0 +1,12 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: github-zen }
+triggers:
+  - { type: manual }
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: zen,   kind: jscode, name: Fetch a zen quote, file: nodes/zen.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: zen }
+  - { from: zen,   to: end }

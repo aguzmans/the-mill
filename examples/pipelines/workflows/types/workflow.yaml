@@ -1,0 +1,15 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: types }
+triggers: [{ type: manual }, { type: webhook }]
+nodes:
+  - { key: start,  kind: start,  name: Start }
+  - { key: seed,   kind: jscode, name: Seed all types, file: nodes/seed.js }
+  - { key: derive, kind: jscode, name: Derive + assert, file: nodes/derive.js }
+  - { key: verify, kind: jscode, name: Verify continuity, file: nodes/verify.js }
+  - { key: end,    kind: end,    name: End }
+edges:
+  - { from: start,  to: seed }
+  - { from: seed,   to: derive }
+  - { from: derive, to: verify }
+  - { from: verify, to: end }

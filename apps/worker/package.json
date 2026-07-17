@@ -1,0 +1,11 @@
+{
+  "name": "@mill/worker",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/worker.ts",
+  "dependencies": {
+    "@mill/executor": "*",
+    "@mill/queue": "*",
+    "ioredis": "^5.4.2"
+  }
+}

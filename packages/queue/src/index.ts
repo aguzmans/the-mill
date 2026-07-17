@@ -1,0 +1,230 @@
+import Redis from "ioredis";
+
+// Redis-backed job queue + worker registry + live event bus.
+//
+// This is a deliberate, minimal stand-in so the local Gate-2 stack is reliable end to
+// end. The production swap is BullMQ (retries/backoff, repeatable-cron, stalled-job
+// recovery) behind this same seam — see ARCHITECTURE §3.4 / ROADMAP M2.
+
+export type JobStatus = "queued" | "running" | "succeeded" | "failed";
+
+export interface JobSpec {
+  id: string;
+  projectDir: string;
+  workflow: string;
+  input: unknown;
+  revision?: string; // git SHA the job was enqueued at (cache-busts node imports)
+}
+
+export interface RunningJob {
+  id: string;
+  workflow: string;
+  startedAt: number; // epoch ms
+}
+
+export interface WorkerInfo {
+  id: string;
+  host: string;
+  inFlight: number;
+  concMin: number;
+  concMax: number;
+  paused: boolean;
+  // Enrichment for the Fleet view (optional — older workers may omit them).
+  beatAt?: number; // epoch ms of this heartbeat (drives "heartbeat age")
+  memMB?: number; // live RSS
+  memMaxMB?: number; // admission ceiling this worker sizes against
+  executor?: string; // "docker" (isolated) | "in-process"
+  jobs?: RunningJob[]; // jobs currently executing on this worker
+}
+
+/** A finished job, as recorded in the rolling stats window. */
+export interface CompletionRecord {
+  w: string; // workflow
+  ok: 0 | 1; // succeeded?
+  d: number; // durationMs (start → finish)
+  wait: number; // waitMs (enqueue → start)
+  t: number; // finishedAt (epoch ms)
+}
+
+export interface QueueEvent {
+  [k: string]: unknown;
+  type: string;
+}
+
+export class MillQueue {
+  private blocking?: Redis; // dedicated connection for BRPOP (blocking)
+  private ttl = 3600;
+
+  constructor(private redis: Redis, private prefix = "mill") {}
+
+  private key(...parts: (string | number)[]) {
+    return [this.prefix, ...parts].join(":");
+  }
+
+  // ── producer ──────────────────────────────────────────────────────────────
+  async enqueue(spec: JobSpec): Promise<void> {
+    await this.redis.hset(this.key("job", spec.id), {
+      status: "queued",
+      workflow: spec.workflow,
+      project: spec.projectDir,
+      createdAt: Date.now().toString(),
+    });
+    await this.redis.expire(this.key("job", spec.id), this.ttl);
+    await this.redis.lpush(this.key("queue"), JSON.stringify(spec));
+  }
+
+  // ── consumer (reliable: pulled jobs sit in the worker's processing list) ────
+  /**
+   * Blocking pull on a dedicated connection. Atomically moves the job into the worker's
+   * processing list so a crash before ack leaves it recoverable (see reapDead).
+   */
+  async pull(workerId: string, timeoutSec = 5): Promise<{ spec: JobSpec; raw: string } | null> {
+    if (!this.blocking) this.blocking = this.redis.duplicate();
+    const raw = await this.blocking.blmove(this.key("queue"), this.key("processing", workerId), "RIGHT", "LEFT", timeoutSec);
+    return raw ? { spec: JSON.parse(raw) as JobSpec, raw } : null;
+  }
+
+  /** Remove a finished job from the worker's processing list. */
+  async ack(workerId: string, raw: string): Promise<void> {
+    await this.redis.lrem(this.key("processing", workerId), 1, raw);
+  }
+
+  /**
+   * Requeue in-flight jobs of workers whose heartbeat has expired (crashed mid-job).
+   * Returns how many jobs were requeued. Run periodically by the controller.
+   */
+  async reapDead(): Promise<number> {
+    const prefix = this.key("processing", "");
+    const keys = await this.redis.keys(this.key("processing", "*"));
+    let requeued = 0;
+    for (const pk of keys) {
+      const workerId = pk.slice(prefix.length);
+      if (await this.redis.exists(this.key("worker", workerId))) continue; // still alive
+      let raw: string | null;
+      while ((raw = await this.redis.lmove(pk, this.key("queue"), "RIGHT", "LEFT"))) {
+        requeued++;
+        try {
+          const spec = JSON.parse(raw) as JobSpec;
+          await this.setStatus(spec.id, "queued", { requeued: "true" });
+        } catch { /* ignore malformed */ }
+      }
+      await this.redis.del(pk);
+    }
+    return requeued;
+  }
+
+  async setStatus(id: string, status: JobStatus, extra: Record<string, string> = {}): Promise<void> {
+    await this.redis.hset(this.key("job", id), { status, ...extra });
+  }
+
+  /** Mark a job as started (records startedAt so wait/duration can be derived). */
+  async markRunning(id: string, worker: string): Promise<void> {
+    await this.redis.hset(this.key("job", id), { status: "running", worker, startedAt: Date.now().toString() });
+  }
+
+  /**
+   * Terminal transition: write the final fields AND append a compact record to the
+   * rolling stats window (capped) so the Fleet view can compute throughput/latency.
+   */
+  async markDone(id: string, status: JobStatus, extra: Record<string, string> = {}): Promise<void> {
+    const now = Date.now();
+    const j = await this.getJob(id);
+    await this.redis.hset(this.key("job", id), { status, finishedAt: now.toString(), ...extra });
+    if (status === "succeeded" || status === "failed") {
+      const createdAt = Number(j.createdAt || now);
+      const startedAt = Number(j.startedAt || createdAt);
+      const rec: CompletionRecord = {
+        w: j.workflow || "unknown",
+        ok: status === "succeeded" ? 1 : 0,
+        d: Math.max(0, now - startedAt),
+        wait: Math.max(0, startedAt - createdAt),
+        t: now,
+      };
+      const wkey = this.key("completed");
+      await this.redis.rpush(wkey, JSON.stringify(rec));
+      await this.redis.ltrim(wkey, -2000, -1); // keep the last 2000 completions
+      await this.redis.expire(wkey, this.ttl);
+    }
+  }
+
+  /** Completions in the rolling window, newest last. Optionally only those since `sinceMs`. */
+  async completedWindow(sinceMs = 0): Promise<CompletionRecord[]> {
+    const arr = await this.redis.lrange(this.key("completed"), 0, -1);
+    const out: CompletionRecord[] = [];
+    for (const s of arr) {
+      try {
+        const r = JSON.parse(s) as CompletionRecord;
+        if (r.t >= sinceMs) out.push(r);
+      } catch { /* ignore malformed */ }
+    }
+    return out;
+  }
+
+  /** Specs currently waiting in the queue (oldest last — head-of-line is index -1). */
+  async queuedSpecs(): Promise<JobSpec[]> {
+    const arr = await this.redis.lrange(this.key("queue"), 0, -1);
+    const out: JobSpec[] = [];
+    for (const s of arr) { try { out.push(JSON.parse(s) as JobSpec); } catch { /* ignore */ } }
+    return out;
+  }
+
+  /** createdAt (epoch ms) of the oldest waiting job, or 0 if the queue is empty. */
+  async oldestQueuedCreatedAt(): Promise<number> {
+    const raw = await this.redis.lindex(this.key("queue"), -1); // RIGHT end = oldest (lpush/pull-right)
+    if (!raw) return 0;
+    try {
+      const spec = JSON.parse(raw) as JobSpec;
+      const j = await this.getJob(spec.id);
+      return Number(j.createdAt || 0);
+    } catch { return 0; }
+  }
+
+  async getJob(id: string): Promise<Record<string, string>> {
+    return this.redis.hgetall(this.key("job", id));
+  }
+
+  // ── event bus (live logs) ───────────────────────────────────────────────────
+  async publishEvent(id: string, event: QueueEvent): Promise<void> {
+    const s = JSON.stringify(event);
+    const chan = this.key("job", id, "events");
+    await this.redis.rpush(chan, s);
+    await this.redis.expire(chan, this.ttl);
+    await this.redis.publish(chan, s);
+  }
+
+  async getEvents(id: string): Promise<QueueEvent[]> {
+    const arr = await this.redis.lrange(this.key("job", id, "events"), 0, -1);
+    return arr.map((x) => JSON.parse(x) as QueueEvent);
+  }
+
+  /** Subscribe to live events for a job. Returns an async unsubscribe. */
+  subscribe(id: string, onEvent: (e: QueueEvent) => void): () => Promise<void> {
+    const sub = this.redis.duplicate();
+    const chan = this.key("job", id, "events");
+    sub.subscribe(chan).catch(() => {});
+    sub.on("error", () => {}); // a dropped pub/sub connection must never crash the process
+    sub.on("message", (_c, msg) => { try { onEvent(JSON.parse(msg) as QueueEvent); } catch { /* ignore malformed */ } });
+    // Cleanup must be crash-proof: the connection may already be closed (client gone,
+    // redis hiccup), in which case unsubscribe/disconnect throw — swallow both.
+    return async () => {
+      try { await sub.unsubscribe(chan); } catch { /* already closed */ }
+      try { sub.disconnect(); } catch { /* already gone */ }
+    };
+  }
+
+  // ── worker registry (heartbeat with TTL) ────────────────────────────────────
+  async heartbeat(w: WorkerInfo, ttlSec = 15): Promise<void> {
+    await this.redis.set(this.key("worker", w.id), JSON.stringify(w), "EX", ttlSec);
+  }
+
+  async workers(): Promise<WorkerInfo[]> {
+    const keys = await this.redis.keys(this.key("worker", "*"));
+    if (!keys.length) return [];
+    const vals = await this.redis.mget(keys);
+    return vals.filter((v): v is string => !!v).map((v) => JSON.parse(v) as WorkerInfo);
+  }
+
+  async queueDepth(): Promise<number> {
+    return this.redis.llen(this.key("queue"));
+  }
+}

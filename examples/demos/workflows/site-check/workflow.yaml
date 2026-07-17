@@ -1,0 +1,13 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: site-check }
+triggers:
+  - { type: cron, schedule: "*/30 * * * * *" }   # every 30s — a scheduled uptime probe
+  - { type: manual }
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: check, kind: jscode, name: Check site, file: nodes/check.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: check }
+  - { from: check, to: end }

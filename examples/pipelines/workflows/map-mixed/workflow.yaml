@@ -1,0 +1,15 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: map-mixed }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start,  kind: start,  name: Start }
+  - { key: gen,    kind: jscode, name: Mixed values,   file: nodes/gen.js }
+  - { key: each,   kind: loop,   name: Classify each,  each: "input.values", file: nodes/classify.js }
+  - { key: counts, kind: jscode, name: Count by type,  file: nodes/counts.js }
+  - { key: end,    kind: end,    name: End }
+edges:
+  - { from: start, to: gen }
+  - { from: gen,   to: each }
+  - { from: each,  to: counts }
+  - { from: counts, to: end }

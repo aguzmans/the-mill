@@ -1,0 +1,20 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: enrich }
+triggers: [{ type: manual }, { type: webhook }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: gen,   kind: jscode, name: TTL events,   file: nodes/gen.js }
+  - key: each
+    kind: loop
+    name: Enrich each (ms + nanoid)
+    each: "input.events"
+    file: nodes/enrich-one.js
+    deps: { ms: "^2.1.3", nanoid: "^5.0.9" }
+  - { key: summarize, kind: jscode, name: Summarize, file: nodes/summarize.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: gen }
+  - { from: gen,   to: each }
+  - { from: each,  to: summarize }
+  - { from: summarize, to: end }

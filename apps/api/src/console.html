@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mill — live console</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; background: #0b0e14; color: #cbd5e1;
+         background-image: radial-gradient(50rem 50rem at 85% -10%, rgba(99,102,241,.10), transparent 60%); }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 24px 20px 60px; }
+  h1 { font-size: 20px; color: #fff; margin: 0 0 2px; display:flex; align-items:center; gap:8px; }
+  .sub { color: #64748b; font-size: 12px; margin-bottom: 20px; }
+  .card { background: rgba(15,19,27,.7); border: 1px solid rgba(255,255,255,.06); border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+  label { display:block; font-size: 12px; color:#94a3b8; margin-bottom: 6px; }
+  select, textarea { width: 100%; background: #080a10; color:#e2e8f0; border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:8px 10px; font: inherit; }
+  textarea { font-family: ui-monospace, monospace; font-size: 12px; height: 44px; resize: vertical; }
+  .row { display:flex; gap:12px; align-items:flex-end; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 180px; }
+  button { background:#4f46e5; color:#fff; border:0; border-radius:8px; padding:9px 16px; font: inherit; font-weight:600; cursor:pointer; }
+  button:hover { background:#6366f1; }
+  button:disabled { opacity:.5; cursor: default; }
+  .badge { display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:2px 10px; font-size:12px; font-weight:600; }
+  .b-idle{background:rgba(100,116,139,.15);color:#94a3b8} .b-running{background:rgba(56,189,248,.15);color:#7dd3fc}
+  .b-succeeded{background:rgba(52,211,153,.15);color:#6ee7b7} .b-failed{background:rgba(244,63,94,.15);color:#fda4af}
+  pre#log { background:#05070c; border:1px solid rgba(255,255,255,.06); border-radius:10px; padding:12px; height: 360px; overflow:auto;
+            font-family: ui-monospace, monospace; font-size:12px; line-height:1.55; margin:0; white-space:pre-wrap; }
+  .l-running{color:#7dd3fc} .l-succeeded{color:#6ee7b7} .l-failed{color:#fda4af} .l-log{color:#94a3b8} .l-muted{color:#64748b} .l-skipped{color:#64748b}
+  .fleet { font-size:12px; color:#64748b; }
+  code { color:#a5b4fc; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>⚙️ Mill — live console</h1>
+  <div class="sub">The real backend (controller → queue → worker). Trigger a workflow and watch it execute, node by node.</div>
+  <div class="sub" id="repo">repo: …</div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Workflow</label>
+        <select id="wf"></select>
+      </div>
+      <div>
+        <label>Manual input (JSON) — try <code>{"empty":true}</code> to take the false branch</label>
+        <textarea id="input">{}</textarea>
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="run">▶ Run</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <div>Run <span id="result" class="badge b-idle">idle</span></div>
+      <div class="fleet" id="fleet">—</div>
+    </div>
+    <pre id="log">No run yet — pick a workflow and press Run.</pre>
+  </div>
+</div>
+
+<script>
+const API = location.origin + "/api";
+const $ = (id) => document.getElementById(id);
+
+function setResult(status, text) {
+  const el = $("result");
+  el.className = "badge b-" + (status || "idle");
+  el.textContent = text || status || "idle";
+}
+function append(text, cls) {
+  const log = $("log");
+  const span = document.createElement("div");
+  if (cls) span.className = "l-" + cls;
+  span.textContent = text;
+  log.appendChild(span);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function loadWorkflows() {
+  const projects = await (await fetch(API + "/projects")).json();
+  const sel = $("wf");
+  sel.innerHTML = "";
+  for (const p of projects) for (const w of p.workflows) {
+    const o = document.createElement("option");
+    o.value = p.id + "/" + w;
+    o.textContent = p.name + " / " + w;
+    sel.appendChild(o);
+  }
+}
+
+async function refreshFleet() {
+  try {
+    const f = await (await fetch(API + "/workers")).json();
+    $("fleet").textContent = (f.workers?.length || 0) + " worker(s) · queue " + (f.queueDepth ?? 0);
+  } catch {}
+}
+
+function renderEvent(e) {
+  if (e.type === "node") append("[" + e.node + "] " + e.status + (e.ms != null ? " (" + e.ms + "ms)" : "") + (e.error ? " — " + e.error : ""), e.status);
+  else if (e.type === "log") append("   [" + e.node + "] " + e.level + ": " + e.message + (e.fields ? " " + JSON.stringify(e.fields) : ""), "log");
+}
+
+async function finalize(jobId) {
+  const j = await (await fetch(API + "/jobs/" + jobId)).json();
+  setResult(j.status, j.status);
+  append(j.status === "succeeded" ? "✓ result " + JSON.stringify(j.result) : "✗ " + j.error, j.status);
+  $("run").disabled = false;
+  refreshFleet();
+}
+
+async function run() {
+  const val = $("wf").value;
+  if (!val) return;
+  const [proj, wf] = val.split("/");
+  let input = {};
+  try { input = JSON.parse($("input").value || "{}"); } catch { alert("Input is not valid JSON"); return; }
+  $("run").disabled = true;
+  $("log").innerHTML = "";
+  setResult("running", "running");
+
+  const r = await fetch(API + "/projects/" + proj + "/workflows/" + wf + "/trigger",
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ input }) });
+  const { jobId, error } = await r.json();
+  if (!jobId) { append("✗ " + (error || "trigger failed"), "failed"); setResult("failed", "failed"); $("run").disabled = false; return; }
+  append("▶ triggered " + jobId, "muted");
+
+  const es = new EventSource(API + "/jobs/" + jobId + "/events");
+  let done = false;
+  const stop = () => { if (!done) { done = true; es.close(); finalize(jobId); } };
+  es.onmessage = (m) => { const e = JSON.parse(m.data); renderEvent(e); if (e.type === "done") stop(); };
+  es.addEventListener("done", stop);
+  es.onerror = stop;
+}
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch(API + "/status")).json();
+    const el = $("repo");
+    if (s.pending) { el.textContent = "repo: reconciling…"; return; }
+    const cls = s.health === "Healthy" ? "l-succeeded" : "l-failed";
+    el.innerHTML = "GitOps: <b class='" + cls + "'>" + (s.sync || "?") + " / " + (s.health || "?") + "</b> @ " +
+      String(s.syncedRevision || "").slice(0, 7) + (s.error ? " — " + s.error : "");
+  } catch {}
+}
+
+$("run").addEventListener("click", run);
+loadWorkflows();
+refreshFleet();
+refreshStatus();
+setInterval(refreshFleet, 3000);
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,1186 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Link, useParams } from "react-router-dom";
+import {
+  ReactFlow, Background, Controls, MarkerType, addEdge, useNodesState, useEdgesState,
+  type ReactFlowInstance, type Connection, type Node, type Edge,
+} from "@xyflow/react";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  ArrowLeft, Play, Save, Download, GitCommitHorizontal, Terminal, Boxes, Clock, Webhook, Hand, Zap,
+  Copy, ShieldCheck, KeyRound, Cpu, History, RotateCcw, AreaChart, GitPullRequest, GitBranch, Flag, Split, Plus, Trash2,
+} from "lucide-react";
+import { findWorkflow, NODE_KINDS, compileCondition, type NodeStatus, type NodeKind, type WorkflowNode, type WorkflowEdge, type RunRecord, type Workflow, type IfClause } from "../lib/mock";
+import { nodeTypes, KindIcon, kindAccent } from "../graph/MillNode";
+import { resolvePosition } from "../graph/layout";
+import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
+import { JsEditor } from "../components/JsEditor";
+import { InfoTip, Tip } from "../components/InfoTip";
+import { Modal, DiffRow, Spec, useToast, Toast } from "../components/Kit";
+import { LIVE, triggerRun, streamEvents, getJob, getWorkflowGraph, saveWorkflow, testNode, type LiveGraph, type NodeTestResult } from "../lib/api";
+
+const capW = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+type EditorProject = { id: string; name: string; branch: string; revision?: string; workflows?: Workflow[] };
+
+/** Position live nodes left-to-right by graph depth (workflow.yaml has no positions). */
+function autoLayout(edges: { from: string; to: string }[], order: string[]): Record<string, { x: number; y: number }> {
+  const depth: Record<string, number> = {};
+  for (const key of order) {
+    const parents = edges.filter((e) => e.to === key).map((e) => e.from);
+    depth[key] = parents.length ? Math.max(...parents.map((p) => depth[p] ?? 0)) + 1 : 0;
+  }
+  const byDepth: Record<number, string[]> = {};
+  for (const key of order) (byDepth[depth[key] ?? 0] ??= []).push(key);
+  const pos: Record<string, { x: number; y: number }> = {};
+  for (const key of order) {
+    const d = depth[key] ?? 0;
+    pos[key] = { x: d * 210 + 20, y: byDepth[d].indexOf(key) * 96 + 20 };
+  }
+  return pos;
+}
+
+function liveToWorkflow(name: string, g: LiveGraph): Workflow {
+  const pos = autoLayout(g.edges, g.order);
+  const nodes = g.nodes.map((n: any) => ({ ...n, name: n.name || n.key, position: pos[n.key] ?? { x: 0, y: 0 } })) as WorkflowNode[];
+  const triggers = (g.triggers ?? []).map((t: any) => ({ type: t.type, detail: t.schedule ?? t.path ?? "", concurrencyPolicy: t.concurrencyPolicy }));
+  return {
+    id: name, name: capW(name), description: "Live from the git working copy.",
+    sync: "Synced", health: "Healthy", lastRun: "idle",
+    triggers: triggers as Workflow["triggers"], nodes, edges: g.edges as WorkflowEdge[], runs: [],
+  };
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const DND_MIME = "application/mill-node-kind";
+const DEFAULT_JS = `export default async function step(input, ctx) {
+  // input = upstream output · ctx = Mill SDK (ctx.log, ctx.secrets, …)
+  return input;
+}
+`;
+
+const DEFAULT_LOOP_BODY = `export default async function handle(item, ctx) {
+  // Runs once per item. item = one element of the loop's array.
+  // ctx.state.index = position · ctx.state carries across iterations.
+  ctx.log.info("handling item " + ctx.state.index, { item });
+  return item;
+}
+`;
+
+const edgeStyle = (branch?: "true" | "false") => ({
+  stroke: branch === "true" ? "#34d399" : branch === "false" ? "#fb7185" : "#6366f1",
+});
+const edgeMarker = (branch?: "true" | "false") => ({
+  type: MarkerType.ArrowClosed,
+  color: branch === "true" ? "#34d399" : branch === "false" ? "#fb7185" : "#6366f1",
+});
+
+export function WorkflowEditorPage() {
+  const { projectId, workflowId } = useParams();
+  const mock = findWorkflow(projectId, workflowId);
+  const [live, setLive] = useState<{ project: EditorProject; workflow: Workflow } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLive(null); setErr(null);
+    if ((mock.project && mock.workflow) || !LIVE || !projectId || !workflowId) return;
+    setLoading(true);
+    getWorkflowGraph(projectId, workflowId)
+      .then((g) => setLive({ project: mock.project ?? { id: projectId, name: capW(projectId), branch: "main" }, workflow: liveToWorkflow(workflowId, g) }))
+      .catch((e) => setErr(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, workflowId]);
+
+  const project = (mock.project ?? live?.project) as EditorProject | undefined;
+  const workflow = mock.workflow ?? live?.workflow;
+  if (loading) return <div className="text-slate-400">Loading workflow…</div>;
+  if (err) return <div className="text-rose-300">Failed to load workflow: {err}</div>;
+  if (!project || !workflow) return <div className="text-slate-400">Workflow not found.</div>;
+  return <EditorInner key={`${project.id}/${workflow.id}`} project={project} workflow={workflow} />;
+}
+
+function EditorInner({ project, workflow }: { project: EditorProject; workflow: Workflow }) {
+  const [statuses, setStatuses] = useState<Record<string, NodeStatus>>({});
+  const [selected, setSelected] = useState<string | null>(workflow?.nodes[0]?.key ?? null);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [running, setRunning] = useState(false);
+  const [runResult, setRunResult] = useState<NodeStatus | null>(null);
+  const [input, setInput] = useState('{ "since": "2026-07-01" }');
+  const [showCommit, setShowCommit] = useState(false);
+  const [selectedRun, setSelectedRun] = useState<string | null>(workflow?.runs?.[0]?.id ?? null);
+  const [rf, setRf] = useState<ReactFlowInstance | null>(null);
+  const dropCounter = useRef(0);
+  const { toast, flash } = useToast();
+  const logRef = useRef<HTMLDivElement>(null);
+
+  const initialNodes = useMemo<Node[]>(
+    () =>
+      (workflow?.nodes ?? []).map((n) => ({
+        id: n.key,
+        type: "mill",
+        position: n.position,
+        data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, status: "idle" as NodeStatus },
+      })),
+    [workflow],
+  );
+  const initialEdges = useMemo<Edge[]>(
+    () =>
+      (workflow?.edges ?? []).map((e) => ({
+        id: `${e.from}-${e.to}-${e.branch ?? ""}`,
+        source: e.from,
+        target: e.to,
+        sourceHandle: e.branch,
+        animated: true,
+        label: e.branch ?? e.depends,
+        labelBgStyle: { fill: "#0f131b" },
+        labelStyle: { fill: e.branch === "true" ? "#6ee7b7" : e.branch === "false" ? "#fda4af" : "#94a3b8", fontFamily: "JetBrains Mono, monospace", fontSize: 10 },
+        style: edgeStyle(e.branch),
+        markerEnd: edgeMarker(e.branch),
+      })),
+    [workflow],
+  );
+
+  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+
+  useEffect(() => {
+    setNodes((nds) => nds.map((n) => ({ ...n, data: { ...n.data, status: statuses[n.id] ?? "idle" } })));
+  }, [statuses, setNodes]);
+
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+  }, [logs]);
+
+  const onConnect = useCallback(
+    (c: Connection) => {
+      const branch = (c.sourceHandle as "true" | "false" | undefined) || undefined;
+      setEdges((eds) => addEdge({ ...c, animated: true, label: branch, style: edgeStyle(branch), markerEnd: edgeMarker(branch) } as Edge, eds));
+      flash("Edge wired");
+    },
+    [setEdges, flash],
+  );
+
+  // Add a node from the palette (drag-drop with a screen point, or click with none),
+  // always nudged to a non-overlapping spot so nodes never render on top of each other.
+  const addNode = useCallback(
+    (kind: NodeKind, screen?: { x: number; y: number }) => {
+      const id = `${kind}-${++dropCounter.current}`;
+      const label = NODE_KINDS.find((k) => k.kind === kind)?.label ?? kind;
+      const data: Record<string, unknown> = { label, nodeKey: id, kind, status: "idle", isNew: true };
+      if (kind === "if") { data.condition = "value === true"; data.conditions = [{ expr: "value === true" }]; }
+      if (kind === "callScript") data.call = { workflow: "", ref: "", standalone: true };
+      if (kind === "jscode") { data.code = DEFAULT_JS; data.filename = `nodes/${id}.js`; }
+      if (kind === "loop") { data.each = "input"; data.code = DEFAULT_LOOP_BODY; data.filename = `nodes/${id}.js`; }
+      setNodes((nds) => {
+        const base = screen && rf ? rf.screenToFlowPosition(screen) : { x: nds.length ? Math.max(...nds.map((n) => n.position.x)) + 60 : 60, y: 80 };
+        const at = resolvePosition(base, kind, nds as { position: { x: number; y: number }; data?: { kind?: NodeKind } }[]);
+        return nds.concat({ id, type: "mill", position: at, data });
+      });
+      setSelected(id);
+      flash(`Added ${label} node`);
+    },
+    [rf, setNodes, flash],
+  );
+
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      const kind = e.dataTransfer.getData(DND_MIME) as NodeKind;
+      if (kind) addNode(kind, { x: e.clientX, y: e.clientY });
+    },
+    [addNode],
+  );
+
+  const applyCode = useCallback(
+    (id: string, code: string) => {
+      setNodes((nds) => nds.map((n) => (n.id === id ? { ...n, data: { ...n.data, code } } : n)));
+      flash("Applied to draft — Save to commit");
+    },
+    [setNodes, flash],
+  );
+
+  const setDeps = useCallback(
+    (id: string, deps: Record<string, string>) => {
+      setNodes((nds) => nds.map((n) => (n.id === id ? { ...n, data: { ...n.data, deps } } : n)));
+      flash("Updated dependencies (draft) — Save to commit + install");
+    },
+    [setNodes, flash],
+  );
+
+  const [saving, setSaving] = useState(false);
+  const [commitMsg, setCommitMsg] = useState(`Update ${workflow.id}`);
+
+  // Serialize the live graph → a workflow.yaml def + the node .js files (Save = commit).
+  const serialize = useCallback(() => {
+    const defNodes = nodes.map((rn) => {
+      const d = rn.data as Record<string, unknown>;
+      const kind = d.kind as NodeKind;
+      const node: Record<string, unknown> = { key: rn.id, kind, name: (d.label as string) || rn.id };
+      if (kind === "jscode") node.file = (d.filename as string) || `nodes/${rn.id}.js`;
+      if (kind === "if") { if (d.condition) node.condition = d.condition; if (d.conditions) node.conditions = d.conditions; }
+      if (kind === "callScript") node.call = d.call;
+      if (kind === "loop") { node.each = (d.each as string) || "input"; if (d.filename) node.file = d.filename; else if (d.call) node.call = d.call; }
+      if (d.deps && Object.keys(d.deps as object).length) node.deps = d.deps; // external npm deps
+      return node;
+    });
+    const defEdges = edges.map((e) => {
+      const edge: Record<string, unknown> = { from: e.source, to: e.target };
+      if (e.sourceHandle) edge.branch = e.sourceHandle;
+      return edge;
+    });
+    // Live triggers (from the controller) carry schedule/path; the mock type only knows `type`.
+    const triggers = (workflow.triggers ?? []).map((raw) => {
+      const t = raw as unknown as { type: string; schedule?: string; path?: string };
+      return { type: t.type, ...(t.schedule ? { schedule: t.schedule } : {}), ...(t.path ? { path: t.path } : {}) };
+    });
+    const def = {
+      apiVersion: "mill/v1", kind: "Workflow", metadata: { name: workflow.id },
+      triggers: triggers.length ? triggers : [{ type: "manual" }], nodes: defNodes, edges: defEdges,
+    };
+    const files: Record<string, string> = {};
+    for (const rn of nodes) {
+      const d = rn.data as Record<string, unknown>;
+      const file = d.filename as string | undefined;
+      if (file && (d.kind === "jscode" || d.kind === "loop")) files[file] = (d.code as string) ?? DEFAULT_JS;
+    }
+    return { def, files };
+  }, [nodes, edges, workflow]);
+
+  const doSave = useCallback(async () => {
+    if (!LIVE) { setShowCommit(false); flash(`Committed to ${project.branch} · reconcile queued`); return; }
+    setSaving(true);
+    try {
+      const { def, files } = serialize();
+      await saveWorkflow(project.id, workflow.id, { message: commitMsg, workflow: def, files });
+      setShowCommit(false);
+      flash(`Saved · committed to ${project.branch} · reconciling`);
+    } catch (e) {
+      const issues = (e as { issues?: unknown[] }).issues;
+      flash(`Save failed: ${e instanceof Error ? e.message : String(e)}${issues?.length ? ` (${issues.length} issue${issues.length === 1 ? "" : "s"})` : ""}`);
+    } finally {
+      setSaving(false);
+    }
+  }, [serialize, project, workflow, commitMsg, flash]);
+
+  const addLog = (line: string) => setLogs((l) => [...l, line]);
+  // The node designated to fail on a Degraded run (the last failed run's offending node).
+  const failNodeKey = workflow.runs?.find((r) => r.status === "failed")?.error?.node;
+
+  async function run() {
+    if (running || !workflow) return;
+    if (LIVE) return runLive();
+    setRunning(true);
+    setRunResult(null);
+    setLogs([]);
+    const seq = workflow.nodes;
+    setStatuses(Object.fromEntries(seq.map((n) => [n.key, "queued" as NodeStatus])));
+    addLog(`▶ run started · ${workflow.name} · revision ${project!.revision}`);
+    addLog(`  input ${input.replace(/\s+/g, " ").trim()}`);
+    for (const n of seq) {
+      setStatuses((s) => ({ ...s, [n.key]: "running" }));
+      addLog(runningLine(n));
+      await sleep(280);
+      if (workflow.health === "Degraded" && n.key === failNodeKey) {
+        setStatuses((s) => ({ ...s, [n.key]: "failed" }));
+        addLog(`[${n.key}] ✗ Error: SMTP connection refused (ECONNREFUSED)`);
+        addLog(`✗ run failed at node "${n.key}"`);
+        setRunResult("failed");
+        setRunning(false);
+        return;
+      }
+      setStatuses((s) => ({ ...s, [n.key]: "succeeded" }));
+      addLog(doneLine(n));
+    }
+    addLog(`✓ run complete`);
+    setRunResult("succeeded");
+    setRunning(false);
+  }
+
+  // Live mode: trigger a real job on the controller and stream the worker's events.
+  async function runLive() {
+    if (!workflow || !project) return;
+    setRunning(true);
+    setRunResult(null);
+    setLogs([]);
+    const keys = workflow.nodes.map((n) => n.key);
+    setStatuses(Object.fromEntries(keys.map((k) => [k, "queued" as NodeStatus])));
+    let parsed: unknown = {};
+    try { parsed = input.trim() ? JSON.parse(input) : {}; } catch { addLog("⚠ input is not valid JSON — using {}"); }
+    addLog(`▶ triggering ${project.id}/${workflow.id} on the controller…`);
+    let jobId: string;
+    try {
+      jobId = await triggerRun(project.id, workflow.id, parsed);
+    } catch (e) {
+      addLog(`✗ ${e instanceof Error ? e.message : String(e)} — this workflow may not exist in the backend yet (try billing/invoices or billing/dunning)`);
+      setRunResult("failed");
+      setRunning(false);
+      return;
+    }
+    addLog(`  job ${jobId}`);
+    streamEvents(
+      jobId,
+      (e) => {
+        if (e.type === "node" && e.node) {
+          const st = (e.status === "skipped" ? "idle" : e.status) as NodeStatus;
+          if (keys.includes(e.node)) setStatuses((s) => ({ ...s, [e.node!]: st }));
+          addLog(`[${e.node}] ${e.status}${e.ms != null ? ` (${e.ms}ms)` : ""}${e.error ? ` — ${e.error}` : ""}`);
+        } else if (e.type === "log" && e.node) {
+          addLog(`   [${e.node}] ${e.level}: ${e.message}${e.fields ? " " + JSON.stringify(e.fields) : ""}`);
+        }
+      },
+      async () => {
+        try {
+          const j = await getJob(jobId);
+          setRunResult(j.status === "succeeded" ? "succeeded" : "failed");
+          addLog(j.status === "succeeded" ? `✓ run complete · result ${JSON.stringify(j.result)}` : `✗ run failed: ${j.error}`);
+        } finally {
+          setRunning(false);
+        }
+      },
+    );
+  }
+
+  const activeRun = workflow.runs?.find((r) => r.id === selectedRun) ?? null;
+
+  return (
+    <div className="space-y-4" data-testid="workflow-editor">
+      <Link to={`/projects/${project.id}`} className="inline-flex items-center gap-1 text-sm text-slate-400 hover:text-slate-200">
+        <ArrowLeft className="h-4 w-4" /> {project.name}
+      </Link>
+
+      {/* header / toolbar */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <h1 className="text-xl font-semibold text-white">{workflow.name}</h1>
+          <SyncBadge status={workflow.sync} />
+          <HealthBadge health={workflow.health} />
+          {workflow.concurrencyPolicy && (
+            <span className="chip bg-white/5 font-mono text-slate-300" data-testid="concurrency-policy">
+              concurrency: {workflow.concurrencyPolicy}
+              <InfoTip text="Per-workflow overlap policy (borrowed from k8s CronJob): Allow runs concurrently · Forbid skips if one is running · Replace cancels the in-flight run." />
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <Tip text="Run this workflow now with the input payload below. Nodes execute in isolated workers; status and logs stream live.">
+            <button className="btn-primary" data-testid="run-btn" onClick={run} disabled={running}>
+              <Play className="h-4 w-4" /> {running ? "Running…" : "Run"}
+            </button>
+          </Tip>
+          <Tip text="Save commits workflow.yaml + node .js back to the git repo. The reconciler then syncs running state.">
+            <button className="btn-ghost" data-testid="save-btn" onClick={() => setShowCommit(true)}>
+              <Save className="h-4 w-4" /> Save
+            </button>
+          </Tip>
+          <Tip text="Export this workflow as a standalone, runnable JS bundle (.tar.gz).">
+            <button className="btn-ghost" data-testid="export-workflow-btn" onClick={() => flash("Building export bundle · index.js + package.json + run.sh")}>
+              <Download className="h-4 w-4" /> Export
+            </button>
+          </Tip>
+        </div>
+      </div>
+
+      {/* component palette */}
+      <Palette onAdd={addNode} />
+
+      <ResizableSplit
+        storageKey="mill.editor.split"
+        left={
+          /* graph */
+          <div
+            className="card relative h-full overflow-hidden"
+            data-testid="graph-canvas"
+            onDrop={onDrop}
+            onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+          >
+            <div className="pointer-events-none absolute left-3 top-3 z-10 flex items-center gap-1.5 text-xs text-slate-400">
+              <Boxes className="h-3.5 w-3.5" /> Flow = the program
+              <InfoTip text="This graph IS the program: start → steps → end. `if` compiles to a literal if in the main file; JS Code nodes are separate .js files it loads; Call Script runs another script as a step. Drag components from the palette; drag between handles to wire edges." />
+              <Spec doc="ARCH §1" />
+            </div>
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              onInit={setRf}
+              nodeTypes={nodeTypes}
+              onNodeClick={(_, n) => setSelected(n.id)}
+              fitView
+              proOptions={{ hideAttribution: true }}
+            >
+              <Background color="#233" gap={18} />
+              <Controls className="!bg-ink-800 !border-white/10" />
+            </ReactFlow>
+          </div>
+        }
+        right={
+          /* node inspector */
+          <div className="card flex h-full flex-col overflow-auto p-4" data-testid="node-panel">
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-semibold text-white">Node</h2>
+              <InfoTip text="The selected component's configuration. What shows depends on its kind (start / JS code / if / call script / end)." />
+            </div>
+            <NodeInspector
+              key={selected ?? "none"}
+              selected={selected}
+              liveNodes={nodes}
+              workflow={workflow}
+              projectId={project.id}
+              projectWorkflows={project.workflows ?? []}
+              onEdit={flash}
+              onApplyCode={applyCode}
+              onSetDeps={setDeps}
+            />
+          </div>
+        }
+      />
+
+      {/* run controls + logs */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <div className="card p-4" data-testid="run-panel">
+          <div className="flex items-center gap-2">
+            <h2 className="text-sm font-semibold text-white">Run</h2>
+            <InfoTip text="Per-node execution status for the latest run. Updates live over WebSocket (Redis pub/sub) in the real app." />
+            {runResult && <span data-testid="run-result" data-status={runResult}><StatusPill status={runResult} /></span>}
+          </div>
+          <label className="mt-3 block">
+            <div className="mb-1 flex items-center gap-1.5 text-xs text-slate-400">
+              <Hand className="h-3.5 w-3.5" /> Manual input (JSON)
+              <InfoTip text="A manual trigger runs the workflow with this payload as the Start node's input. Cron/webhook triggers supply their own." />
+            </div>
+            <textarea
+              data-testid="run-input"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              spellCheck={false}
+              className="h-14 w-full resize-none rounded-lg border border-white/10 bg-ink-950/70 p-2 font-mono text-xs text-slate-200 outline-none focus:border-brand-500/60"
+            />
+          </label>
+          <div className="mt-3 space-y-2">
+            {workflow.nodes.map((n) => (
+              <div key={n.key} className="flex items-center justify-between" data-testid={`node-status-${n.key}`}>
+                <span className="flex items-center gap-1.5 text-sm text-slate-300">
+                  <span className={kindAccent[n.kind].text}><KindIcon kind={n.kind} className="h-3 w-3" /></span>
+                  {n.name}
+                </span>
+                <StatusPill status={statuses[n.key] ?? "idle"} />
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* logs */}
+        <div className="card p-4 lg:col-span-2" data-testid="log-panel">
+          <div className="flex items-center gap-2">
+            <Terminal className="h-4 w-4 text-slate-400" />
+            <h2 className="text-sm font-semibold text-white">Logs</h2>
+            <InfoTip text="Live log stream (Redis pub/sub in the real app; durable history goes to Loki, queryable with LogQL)." />
+          </div>
+          <div ref={logRef} data-testid="log-console" className="mt-3 h-40 overflow-auto rounded-lg bg-ink-950/80 p-3 font-mono text-xs leading-5 text-slate-300">
+            {logs.length === 0 ? (
+              <span className="text-slate-600">No logs yet — press Run.</span>
+            ) : (
+              logs.map((l, i) => (
+                <motion.div key={i} initial={{ opacity: 0 }} animate={{ opacity: 1 }} data-testid="log-line" className={l.includes("✗") ? "text-rose-300" : l.includes("✓") ? "text-emerald-300" : ""}>
+                  {l}
+                </motion.div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* triggers + observability */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <TriggersPanel workflow={workflow} onCopy={() => flash("Webhook URL copied")} />
+        <ObservabilityPanel onOpen={(dest) => flash(`Opening ${dest} …`)} />
+      </div>
+
+      {/* run history */}
+      <div className="card p-4" data-testid="run-history">
+        <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
+          <History className="h-4 w-4 text-slate-400" /> Run history
+          <InfoTip text="Mill stores no DB — recent runs live in Redis (TTL); full history is in Loki/Tempo. A run is one trace; each node is a span." />
+          <Spec doc="ARCH §8" />
+        </h2>
+        <div className="mt-3 grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div className="space-y-1.5">
+            {(workflow.runs ?? []).map((r) => (
+              <button
+                key={r.id}
+                data-testid={`run-row-${r.id}`}
+                onClick={() => setSelectedRun(r.id)}
+                className={`flex w-full items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left transition-colors ${
+                  selectedRun === r.id ? "border-brand-500/40 bg-brand-500/10" : "border-white/5 bg-ink-950/40 hover:bg-white/5"
+                }`}
+              >
+                <span className="flex items-center gap-2 text-xs">
+                  <StatusPill status={r.status} />
+                  <span className="font-mono text-slate-400">{r.id}</span>
+                </span>
+                <span className="flex items-center gap-2 text-[11px] text-slate-500">
+                  <TriggerIcon type={r.trigger} /> {r.trigger} · @{r.revision} · {r.startedAt}
+                </span>
+              </button>
+            ))}
+          </div>
+          {activeRun && <RunDetail run={activeRun} onRetry={(node) => flash(`Retry queued from “${node}” · journaling skips completed nodes`)} />}
+        </div>
+      </div>
+
+      {/* commit modal */}
+      <Modal
+        open={showCommit}
+        onClose={() => setShowCommit(false)}
+        testid="commit-modal"
+        wide
+        icon={<GitCommitHorizontal className="h-4 w-4 text-brand-400" />}
+        title={<span className="flex items-center gap-2">Save = commit <Spec doc="ARCH §5" /></span>}
+        footer={
+          <>
+            <button className="btn-ghost" onClick={() => setShowCommit(false)}>Cancel</button>
+            <button
+              className="btn-primary"
+              data-testid="commit-submit"
+              onClick={doSave}
+              disabled={saving}
+            >
+              <GitCommitHorizontal className="h-4 w-4" /> {saving ? "Committing…" : "Commit"}
+            </button>
+          </>
+        }
+      >
+        <p className="text-xs text-slate-400">
+          There are no out-of-band live writes. Edits accumulate in an in-memory <strong>draft</strong>; saving commits
+          to git, and the reconciler then syncs running state — so “what you see == what runs == what’s in git.”
+        </p>
+        <div className="mt-3 space-y-1.5">
+          <DiffRow change="modified" path={`workflows/${workflow.id}/workflow.yaml`} summary="graph: added/rewired nodes (draft)" />
+          <DiffRow change="modified" path={`workflows/${workflow.id}/nodes/${(workflow.nodes.find((n) => n.kind === "jscode")?.key) ?? "step"}.js`} summary="edited in the inspector (draft)" />
+        </div>
+        <label className="mt-4 block">
+          <div className="mb-1 text-xs font-medium text-slate-300">Commit message</div>
+          <input className="inp" value={commitMsg} onChange={(e) => setCommitMsg(e.target.value)} data-testid="commit-message" />
+        </label>
+        <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-slate-300">
+          <label className="inline-flex items-center gap-2"><input type="radio" name="target" defaultChecked /> <GitBranch className="h-3.5 w-3.5" /> Commit to <span className="font-mono">{project.branch}</span> <span className="chip bg-emerald-500/10 px-1.5 py-0 text-[10px] text-emerald-300">v1</span></label>
+          <label className="inline-flex items-center gap-2 opacity-60"><input type="radio" name="target" disabled /> <GitPullRequest className="h-3.5 w-3.5" /> Branch + PR (approval) <span className="chip bg-white/5 px-1.5 py-0 text-[10px] text-slate-400">later</span></label>
+          <InfoTip text="v1 writes directly to the tracked branch on GitHub. Branch/PR + approval flows come later. Either way the write is a git commit — the GitOps substrate." />
+        </div>
+      </Modal>
+
+      <Toast toast={toast} icon={<GitCommitHorizontal className="h-4 w-4 text-brand-400" />} />
+    </div>
+  );
+}
+
+// Log-line helpers make the simulated run read like the real program.
+function runningLine(n: WorkflowNode): string {
+  if (n.kind === "start") return `[${n.key}] ▶ entry`;
+  if (n.kind === "if") return `[${n.key}] if (${n.condition ?? "…"}) → true`;
+  if (n.kind === "callScript") return `[${n.key}] → call ${n.call?.workflow ?? "script"} (${n.call?.standalone ? "standalone" : "in-project"})`;
+  if (n.kind === "loop") return `[${n.key}] ↻ for each (${n.each ?? "input"}) → ${n.file ? n.file : `call ${n.call?.workflow ?? "script"}`}`;
+  if (n.kind === "end") return `[${n.key}] ■ return`;
+  return `[${n.key}] running…`;
+}
+function doneLine(n: WorkflowNode): string {
+  if (n.kind === "start" || n.kind === "end" || n.kind === "if") return `[${n.key}] ✓`;
+  if (n.kind === "callScript") return `[${n.key}] ✓ returned`;
+  if (n.kind === "loop") return `[${n.key}] ✓ looped`;
+  return `[${n.key}] ✓ succeeded`;
+}
+
+// ── Resizable split — drag the middle gutter to size canvas vs. inspector ─────
+function ResizableSplit({ left, right, storageKey }: { left: ReactNode; right: ReactNode; storageKey: string }) {
+  const MIN = 0.25, MAX = 0.8, DEFAULT = 0.66;
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [frac, setFrac] = useState<number>(() => {
+    const saved = typeof localStorage !== "undefined" ? Number(localStorage.getItem(storageKey)) : NaN;
+    return saved >= MIN && saved <= MAX ? saved : DEFAULT;
+  });
+  const [dragging, setDragging] = useState(false);
+
+  const onDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setDragging(true);
+    const move = (ev: MouseEvent) => {
+      const box = containerRef.current?.getBoundingClientRect();
+      if (!box || box.width === 0) return;
+      const f = Math.min(MAX, Math.max(MIN, (ev.clientX - box.left) / box.width));
+      setFrac(f);
+    };
+    const up = () => {
+      setDragging(false);
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      setFrac((f) => { try { localStorage.setItem(storageKey, String(f)); } catch { /* ignore */ } return f; });
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  }, [storageKey]);
+
+  const reset = useCallback(() => { setFrac(DEFAULT); try { localStorage.setItem(storageKey, String(DEFAULT)); } catch { /* ignore */ } }, [storageKey]);
+
+  return (
+    <div ref={containerRef} className="flex flex-col gap-4 lg:h-[460px] lg:flex-row lg:gap-0" data-testid="editor-split">
+      <div className="min-h-[320px] lg:min-h-0" style={{ flexBasis: `${frac * 100}%` }}>{left}</div>
+      {/* gutter (lg only): drag to resize, double-click to reset */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        data-testid="split-gutter"
+        onMouseDown={onDown}
+        onDoubleClick={reset}
+        title="Drag to resize · double-click to reset"
+        className={`group hidden shrink-0 cursor-col-resize items-center justify-center lg:flex ${dragging ? "" : ""}`}
+        style={{ width: 16 }}
+      >
+        <div className={`h-16 w-1 rounded-full transition-colors ${dragging ? "bg-brand-400" : "bg-white/15 group-hover:bg-brand-400/70"}`} />
+      </div>
+      <div className="min-h-[280px] lg:min-h-0 lg:flex-1">{right}</div>
+    </div>
+  );
+}
+
+// ── Component palette — tools you drag or click onto the canvas ───────────────
+function Palette({ onAdd }: { onAdd: (kind: NodeKind) => void }) {
+  return (
+    <div className="card flex flex-wrap items-center gap-2 p-3" data-testid="palette">
+      <span className="flex items-center gap-1.5 text-xs font-medium text-slate-300">
+        Components
+        <InfoTip text="Drag a component onto the canvas, or click it to drop one in — new nodes never land on top of existing ones. Then drag between node handles to wire edges. Loop = forEach over an array (body per item). Call Script runs another script as a step." />
+      </span>
+      {NODE_KINDS.map((k) => (
+        <Tip key={k.kind} text={`${k.blurb} — drag onto the canvas or click to add.`}>
+          <button
+            type="button"
+            data-testid={`palette-${k.kind}`}
+            draggable
+            onDragStart={(e) => { e.dataTransfer.setData(DND_MIME, k.kind); e.dataTransfer.effectAllowed = "move"; }}
+            onClick={() => onAdd(k.kind)}
+            className={`chip cursor-grab select-none border active:cursor-grabbing ${kindAccent[k.kind].border} ${kindAccent[k.kind].bg} ${kindAccent[k.kind].text}`}
+          >
+            <KindIcon kind={k.kind} className="h-3.5 w-3.5" />
+            {k.label}
+          </button>
+        </Tip>
+      ))}
+    </div>
+  );
+}
+
+// ── Node inspector (kind-aware) ──────────────────────────────────────────────
+type InspectorProps = {
+  selected: string | null;
+  liveNodes: { id: string; data: Record<string, unknown> }[];
+  workflow: Workflow;
+  projectId: string;
+  projectWorkflows: Workflow[];
+  onEdit: (msg: string) => void;
+  onApplyCode: (id: string, code: string) => void;
+  onSetDeps: (id: string, deps: Record<string, string>) => void;
+};
+
+function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkflows, onEdit, onApplyCode, onSetDeps }: InspectorProps) {
+  const [tab, setTab] = useState<JsTab>("code");
+  if (!selected) return <p className="mt-3 text-sm text-slate-500">Select a node in the graph.</p>;
+  const mock = workflow.nodes.find((n) => n.key === selected);
+  const live = liveNodes.find((n) => n.id === selected);
+  const liveData = (live?.data ?? {}) as Record<string, unknown>;
+  const kind = (mock?.kind ?? (liveData.kind as NodeKind) ?? "jscode") as NodeKind;
+  const name = mock?.name ?? (liveData.label as string) ?? selected;
+  const isNew = !mock;
+  const jsCode = (liveData.code as string) ?? mock?.code ?? DEFAULT_JS;
+  const jsFile = mock?.file ?? (liveData.filename as string) ?? `nodes/${selected}.js`;
+
+  return (
+    <div className="mt-3 flex-1">
+      <div className="flex items-center gap-2">
+        <span className={`chip ${kindAccent[kind].bg} ${kindAccent[kind].text}`}><KindIcon kind={kind} className="h-3 w-3" /> {kindLabel(kind)}</span>
+        <span className="text-sm font-medium text-white">{name}</span>
+      </div>
+      {isNew && <p className="mt-1 text-[11px] text-amber-300/80">New node (draft) — configure it, then Save to commit.</p>}
+
+      <div className="mt-3">
+        {kind === "start" && <StartPanel node={mock} />}
+        {kind === "end" && <EndPanel node={mock} />}
+        {kind === "if" && <IfPanel node={mock} onEdit={onEdit} />}
+        {kind === "callScript" && <CallPanel node={mock} workflow={workflow} projectWorkflows={projectWorkflows} onEdit={onEdit} />}
+        {kind === "jscode" && <JsPanel node={mock} file={jsFile} code={jsCode} tab={tab} setTab={setTab} onApply={(c) => onApplyCode(selected, c)} />}
+        {kind === "loop" && (
+          <LoopPanel
+            node={mock}
+            each={mock?.each ?? (liveData.each as string) ?? "input"}
+            call={(mock?.call ?? (liveData.call as WorkflowNode["call"]))}
+            file={jsFile}
+            code={jsCode}
+            hasFile={!!(mock?.file ?? liveData.filename)}
+            workflow={workflow}
+            projectWorkflows={projectWorkflows}
+            tab={tab}
+            setTab={setTab}
+            onApply={(c) => onApplyCode(selected, c)}
+            onEdit={onEdit}
+          />
+        )}
+      </div>
+
+      {/* External npm dependencies for JS Code / loop-body nodes. Prefer live (edited) data
+          over the static loaded definition so edits render immediately. */}
+      {(kind === "jscode" || kind === "loop") && (
+        <DepsEditor deps={((liveData.deps as Record<string, string>) ?? mock?.deps) ?? {}} onChange={(d) => onSetDeps(selected, d)} />
+      )}
+
+      {/* Test this step in isolation with a supplied input (live mode only). */}
+      {LIVE && kind !== "start" && kind !== "end" && (
+        <StepTester projectId={projectId} workflow={workflow.id} nodeKey={selected} kind={kind} each={mock?.each ?? (liveData.each as string)} />
+      )}
+    </div>
+  );
+}
+
+function DepsEditor({ deps, onChange }: { deps: Record<string, string>; onChange: (d: Record<string, string>) => void }) {
+  const [name, setName] = useState("");
+  const [ver, setVer] = useState("");
+  const entries = Object.entries(deps);
+  const add = () => {
+    const n = name.trim();
+    if (!n) return;
+    onChange({ ...deps, [n]: ver.trim() || "latest" });
+    setName(""); setVer("");
+  };
+  const remove = (k: string) => { const d = { ...deps }; delete d[k]; onChange(d); };
+  return (
+    <div className="mt-4 border-t border-white/10 pt-3" data-testid="deps-editor">
+      <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-slate-300">
+        <Boxes className="h-3.5 w-3.5 text-brand-300" /> Dependencies
+        <InfoTip text="External npm packages this node imports. On Save, the controller installs them into the project so in-process AND isolated runs resolve them — and they're written into the exported bundle's package.json too." />
+      </div>
+      {entries.length > 0 ? (
+        <div className="flex flex-wrap gap-1.5" data-testid="deps-list">
+          {entries.map(([k, v]) => (
+            <span key={k} className="chip inline-flex items-center gap-1 bg-white/5 font-mono text-[10px] text-slate-300">
+              {k}@{v}
+              <button type="button" data-testid={`dep-remove-${k}`} onClick={() => remove(k)} className="text-slate-500 hover:text-rose-300">×</button>
+            </span>
+          ))}
+        </div>
+      ) : (
+        <p className="text-[11px] text-slate-500">none — standard library only.</p>
+      )}
+      <div className="mt-2 flex gap-1.5">
+        <input data-testid="dep-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="package" spellCheck={false}
+          className="min-w-0 flex-1 rounded-md border border-white/10 bg-ink-950/70 px-2 py-1 font-mono text-[11px] text-slate-200 outline-none focus:border-brand-500/50" />
+        <input data-testid="dep-version" value={ver} onChange={(e) => setVer(e.target.value)} placeholder="^1.0.0" spellCheck={false}
+          className="w-24 rounded-md border border-white/10 bg-ink-950/70 px-2 py-1 font-mono text-[11px] text-slate-200 outline-none focus:border-brand-500/50" />
+        <button type="button" data-testid="dep-add" onClick={add} className="rounded-md bg-brand-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-brand-500">Add</button>
+      </div>
+    </div>
+  );
+}
+
+function StepTester({ projectId, workflow, nodeKey, kind, each }: { projectId: string; workflow: string; nodeKey: string; kind: NodeKind; each?: string }) {
+  // Seed a sensible sample input per kind so the tester is one click away from useful.
+  const sample = kind === "loop" ? (each && each !== "input" ? `{ "${each.replace(/^input\./, "")}": [1, 2, 3] }` : "[1, 2, 3]") : "{}";
+  const [input, setInput] = useState(sample);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<NodeTestResult | null>(null);
+  const [parseErr, setParseErr] = useState<string | null>(null);
+
+  const test = async () => {
+    let parsed: unknown;
+    try { parsed = input.trim() ? JSON.parse(input) : {}; setParseErr(null); }
+    catch (e) { setParseErr(e instanceof Error ? e.message : "invalid JSON"); return; }
+    setBusy(true);
+    try { setResult(await testNode(projectId, workflow, nodeKey, parsed)); }
+    catch (e) { setResult({ status: "failed", node: nodeKey, kind, error: e instanceof Error ? e.message : String(e), logs: [], ms: 0 }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="mt-4 border-t border-white/10 pt-3" data-testid="step-tester">
+      <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-slate-300">
+        <Play className="h-3.5 w-3.5 text-emerald-300" /> Test this step
+        <InfoTip text="Runs ONLY this node with the input you provide (no upstream steps). For a loop, pass the array (or the object the each-expression reads). Great for checking a step's output shape before wiring it." />
+      </div>
+      <textarea
+        data-testid="step-input"
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        spellCheck={false}
+        rows={3}
+        className="w-full rounded-lg border border-white/10 bg-ink-950/70 p-2 font-mono text-[11px] text-slate-200 outline-none focus:border-emerald-500/50"
+      />
+      {parseErr && <p className="mt-1 text-[11px] text-rose-300">input JSON error: {parseErr}</p>}
+      <button
+        type="button"
+        data-testid="step-run"
+        onClick={test}
+        disabled={busy}
+        className="mt-2 inline-flex items-center gap-1 rounded-md bg-emerald-600 px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-emerald-500 disabled:opacity-40"
+      >
+        <Play className="h-3 w-3" /> {busy ? "Running…" : "Run step"}
+      </button>
+      {result && (
+        <div className="mt-2 space-y-1" data-testid="step-result" data-status={result.status}>
+          <div className={`text-[11px] font-medium ${result.status === "succeeded" ? "text-emerald-300" : "text-rose-300"}`}>
+            {result.status === "succeeded" ? `✓ ${result.kind} · ${result.ms}ms` : `✗ ${result.error}`}
+          </div>
+          {result.status === "succeeded" && (
+            <pre className="max-h-40 overflow-auto rounded-lg border border-white/10 bg-ink-950/70 p-2 font-mono text-[11px] text-slate-200" data-testid="step-output">{JSON.stringify(result.output, null, 2)}</pre>
+          )}
+          {result.logs?.filter((e) => e.type === "log").length > 0 && (
+            <div className="rounded-lg border border-white/5 bg-ink-950/40 p-2 font-mono text-[10px] text-slate-400">
+              {result.logs.filter((e) => e.type === "log").map((e, i) => (
+                <div key={i}>[{e.level}] {e.message}{e.fields ? " " + JSON.stringify(e.fields) : ""}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function kindLabel(k: NodeKind) {
+  return NODE_KINDS.find((x) => x.kind === k)?.label ?? k;
+}
+
+function StartPanel({ node }: { node?: WorkflowNode }) {
+  return (
+    <div className="space-y-3 text-xs" data-testid="panel-start">
+      <p className="text-slate-400">The program entry point. The run’s input arrives here and flows to the first step.</p>
+      <SchemaBox label="run input" value={node?.inputSchema ?? "any"} tip="The manual/cron/webhook payload. Compiles to the parameter of the generated main function." />
+      <Note icon={<Play className="h-3.5 w-3.5 text-emerald-300" />}>Links to the compiled program’s entry (<span className="font-mono">index.js</span>). Exactly one Start per workflow.</Note>
+    </div>
+  );
+}
+
+function EndPanel({ node }: { node?: WorkflowNode }) {
+  return (
+    <div className="space-y-3 text-xs" data-testid="panel-end">
+      <p className="text-slate-400">The exit clause — reached when no more execution is required. The program returns here.</p>
+      <SchemaBox label="returns" value={node?.outputSchema ?? "void"} tip="Whatever the main function returns to the caller / trigger result." />
+      <Note icon={<Flag className="h-3.5 w-3.5 text-slate-300" />}>A flow can have multiple End nodes (e.g. one per branch of an if).</Note>
+    </div>
+  );
+}
+
+function IfPanel({ node, onEdit }: { node?: WorkflowNode; onEdit: (m: string) => void }) {
+  const [clauses, setClauses] = useState<IfClause[]>(
+    node?.conditions ?? (node?.condition ? [{ expr: node.condition }] : [{ expr: "value === true" }]),
+  );
+  const update = (next: IfClause[]) => { setClauses(next); onEdit("Condition updated (draft)"); };
+  const setExpr = (i: number, v: string) => update(clauses.map((c, idx) => (idx === i ? { ...c, expr: v } : c)));
+  const setConn = (i: number, v: "and" | "or") => update(clauses.map((c, idx) => (idx === i ? { ...c, connector: v } : c)));
+  const add = () => update([...clauses, { connector: "and", expr: "true" }]);
+  const remove = (i: number) => update(clauses.length > 1 ? clauses.filter((_, idx) => idx !== i) : clauses);
+  const compiled = compileCondition(clauses);
+
+  return (
+    <div className="space-y-3 text-xs" data-testid="panel-if">
+      <p className="text-slate-400">A literal <span className="font-mono">if</span> in the main file — build a multi-conditional test; the two output handles route the flow.</p>
+      <div className="space-y-1.5" data-testid="if-builder">
+        {clauses.map((c, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            {i === 0 ? (
+              <span className="w-12 shrink-0 text-right font-mono text-[10px] text-slate-500">if</span>
+            ) : (
+              <select className="inp w-12 shrink-0 px-1 py-1 text-[10px]" value={c.connector ?? "and"} onChange={(e) => setConn(i, e.target.value as "and" | "or")} data-testid={`if-connector-${i}`}>
+                <option value="and">and</option>
+                <option value="or">or</option>
+              </select>
+            )}
+            <input className="inp font-mono text-xs" value={c.expr} onChange={(e) => setExpr(i, e.target.value)} data-testid={i === 0 ? "if-condition" : `if-clause-${i}`} />
+            <button type="button" onClick={() => remove(i)} disabled={clauses.length === 1} aria-label="remove clause" className="shrink-0 rounded p-1 text-slate-500 hover:text-rose-300 disabled:opacity-30">
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ))}
+      </div>
+      <button type="button" onClick={add} data-testid="if-add-condition" className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] text-slate-300 hover:bg-white/5">
+        <Plus className="h-3 w-3" /> Add condition
+      </button>
+      <div className="rounded-lg border border-amber-400/20 bg-amber-500/5 p-2" data-testid="if-preview">
+        <div className="text-[10px] text-slate-500">compiles to a literal if</div>
+        <code className="font-mono text-[11px] text-amber-200">if ({compiled || "…"}) {"{"} … {"}"}</code>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div className="rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-2 py-1.5 text-emerald-300"><span className="font-semibold">true</span> → then-branch</div>
+        <div className="rounded-lg border border-rose-400/30 bg-rose-500/10 px-2 py-1.5 text-rose-300"><span className="font-semibold">false</span> → else-branch</div>
+      </div>
+      <Note icon={<Split className="h-3.5 w-3.5 text-amber-300" />}>Need a loop? Not yet a node — write it inside a JS Code step for now.</Note>
+    </div>
+  );
+}
+
+function CallPanel({ node, workflow, projectWorkflows, onEdit }: { node?: WorkflowNode; workflow: Workflow; projectWorkflows: Workflow[]; onEdit: (m: string) => void }) {
+  const call = node?.call;
+  const siblings = projectWorkflows.filter((w) => w.id !== workflow.id);
+  return (
+    <div className="space-y-3 text-xs" data-testid="panel-callscript">
+      <p className="text-slate-400">Invoke another script as a step. It runs like any other node — its output becomes this step’s output.</p>
+      <label className="block">
+        <div className="mb-1 flex items-center gap-1.5 text-slate-400">Target script <InfoTip text="Pick a workflow in this project, or reference a standalone/remote script. This is how you compose scripts and pull in remote components." /></div>
+        <select className="inp" defaultValue={call?.standalone ? "__standalone__" : call?.project && call.project !== workflow.id ? `__ext__${call.workflow}` : call?.workflow ?? "__standalone__"} onChange={() => onEdit("Call target updated (draft)")} data-testid="call-target">
+          <optgroup label="This project">
+            {siblings.map((w) => <option key={w.id} value={w.name}>{w.name}</option>)}
+          </optgroup>
+          <optgroup label="Other / remote">
+            {call?.project && call.project !== workflow.id && <option value={`__ext__${call.workflow}`}>{call.workflow} · {call.project}</option>}
+            <option value="__standalone__">Standalone / remote script…</option>
+          </optgroup>
+        </select>
+      </label>
+      {call && (
+        <div className="rounded-lg border border-white/5 bg-ink-950/50 p-2">
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-cyanx">{call.workflow || "(unset)"}</span>
+            <span className={`chip px-1.5 py-0 text-[10px] ${call.standalone ? "bg-cyan-500/15 text-cyanx" : "bg-white/5 text-slate-400"}`}>
+              {call.standalone ? "standalone / remote" : call.project ? `project: ${call.project}` : "in-project"}
+            </span>
+          </div>
+          <div className="mt-1 font-mono text-[10px] text-slate-500">ref: {call.ref || "—"}</div>
+        </div>
+      )}
+      <Note icon={<KindIcon kind="callScript" className="h-3.5 w-3.5 text-cyanx" />}>Same-project calls resolve inside the repo; standalone/remote calls fetch a versioned bundle by ref.</Note>
+    </div>
+  );
+}
+
+type JsTab = "code" | "schema" | "context" | "isolation";
+function JsPanel({ node, file, code, tab, setTab, onApply }: { node?: WorkflowNode; file: string; code: string; tab: JsTab; setTab: (t: JsTab) => void; onApply: (code: string) => void }) {
+  return (
+    <div>
+      <div className="mt-1 flex flex-wrap gap-1" data-testid="inspector-tabs">
+        {(["code", "schema", "context", "isolation"] as JsTab[]).map((t) => (
+          <button key={t} data-testid={`tab-${t}`} data-active={tab === t} onClick={() => setTab(t)}
+            className={`chip capitalize ${tab === t ? "bg-brand-500/20 text-brand-200" : "bg-white/5 text-slate-400 hover:text-slate-200"}`}>{t}</button>
+        ))}
+      </div>
+      <div className="mt-3">
+        {tab === "code" && (
+          <div className="space-y-3">
+            <JsEditor filename={file} value={code} onApply={onApply} />
+            <p className="text-[11px] text-slate-500">External npm packages are managed in the <span className="text-slate-300">Dependencies</span> panel below.</p>
+          </div>
+        )}
+        {tab === "schema" && (
+          <div className="space-y-3 text-xs" data-testid="tab-panel-schema">
+            <SchemaBox label="input" value={node?.inputSchema ?? "any"} tip="Validated inputs (Kestra-style). The compiler checks every edge feeds a real node — stronger than FK integrity." />
+            <SchemaBox label="output" value={node?.outputSchema ?? "any"} tip="Becomes the `input` of the downstream node." />
+            <div className="rounded-lg border border-white/5 bg-ink-950/40 p-2 text-slate-500"><span className="font-medium text-slate-400">Fan-in:</span> a node with multiple parents reads <span className="font-mono text-slate-300">ctx.inputs[nodeKey]</span>.</div>
+          </div>
+        )}
+        {tab === "context" && (
+          <div className="space-y-2 text-xs" data-testid="tab-panel-context">
+            <p className="text-slate-500">The Mill SDK surface passed as <span className="font-mono text-slate-300">ctx</span> (autocompletes in the editor):</p>
+            <CtxRow sym="ctx.log" desc="structured logging → Redis (live) + Loki (durable)" />
+            <CtxRow sym="ctx.secrets" desc="injected by ref; scrubbed from logs; never in git" />
+            <CtxRow sym="ctx.inputs" desc="upstream outputs by node key (fan-in)" />
+            <CtxRow sym="ctx.state" desc="node-boundary journal (retries skip completed nodes)" />
+            <CtxRow sym="ctx.http / ctx.db" desc="IO helpers" />
+            {node?.secrets && node.secrets.length > 0 && (
+              <div className="mt-2">
+                <div className="mb-1 flex items-center gap-1.5 text-slate-400"><KeyRound className="h-3.5 w-3.5" /> Secret refs used</div>
+                <div className="flex flex-wrap gap-1.5" data-testid="node-secrets">
+                  {node.secrets.map((s) => <span key={s} className="chip bg-amber-500/10 font-mono text-amber-200">{s}</span>)}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {tab === "isolation" && (
+          <div className="space-y-3 text-xs" data-testid="tab-panel-isolation">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-emerald-300" />
+              <span className="font-mono text-slate-200">{exLabel(node?.executor ?? "nsjail")}</span>
+              <InfoTip text="OS-level isolation, ON by default. The compiler emits pure per-node functions so swapping executor rungs is a drop-in." />
+            </div>
+            {node?.limits && (
+              <div className="grid grid-cols-2 gap-2">
+                <LimitBox icon={<Cpu className="h-3.5 w-3.5" />} label="memory" value={`${node.limits.memMB} MB`} />
+                <LimitBox icon={<Clock className="h-3.5 w-3.5" />} label="cpu" value={`${(node.limits.cpuMs / 1000).toFixed(0)}s`} />
+                <LimitBox icon={<Clock className="h-3.5 w-3.5" />} label="wall clock" value={`${(node.limits.wallMs / 1000).toFixed(0)}s`} />
+                <LimitBox icon={<Webhook className="h-3.5 w-3.5" />} label="network" value={node.limits.network} />
+              </div>
+            )}
+            <p className="text-slate-500">Enforced per-job: a hungry child is killed, never the pod. Timeout taxonomy: schedule-to-start / start-to-close / heartbeat.</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LoopPanel({ node, each, call, file, code, hasFile, workflow, projectWorkflows, tab, setTab, onApply, onEdit }: {
+  node?: WorkflowNode; each: string; call?: WorkflowNode["call"]; file: string; code: string; hasFile: boolean;
+  workflow: Workflow; projectWorkflows: Workflow[]; tab: JsTab; setTab: (t: JsTab) => void; onApply: (code: string) => void; onEdit: (m: string) => void;
+}) {
+  // A loop body is a per-item JS Code file (hasFile) OR a per-item Call Script.
+  const isCall = !hasFile && !!call?.workflow;
+  return (
+    <div className="space-y-3" data-testid="panel-loop">
+      <label className="block">
+        <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-slate-300">
+          Iterate <span className="font-normal text-slate-500">· each item of this array</span>
+          <InfoTip text="A JS expression over `input` (the previous node's output) that yields an array. Omit to iterate the upstream output directly. e.g. input.urls" />
+        </div>
+        <input
+          data-testid="loop-each"
+          defaultValue={each}
+          onBlur={(e) => onEdit(`each = ${e.target.value} (draft)`)}
+          className="w-full rounded-lg border border-white/10 bg-ink-950/70 p-2 font-mono text-xs text-slate-200 outline-none focus:border-fuchsia-500/60"
+        />
+        <p className="mt-1 text-[11px] text-slate-500">Runs the body once per item, in order. <span className="font-mono">ctx.state.index</span> is the position; <span className="font-mono">ctx.state</span> carries across items.</p>
+      </label>
+
+      <div className="rounded-lg border border-white/10 bg-ink-950/40 p-2 text-[11px] text-slate-400">
+        Body per item: <span className="font-mono text-fuchsia-200">{isCall ? `call ${call?.workflow}` : (file || "nodes/…js")}</span>
+        <span className="ml-1 chip bg-white/5 px-1.5 py-0 text-[9px] text-slate-400">{isCall ? "Call Script" : "JS Code"}</span>
+      </div>
+
+      {isCall
+        ? <CallPanel node={node} workflow={workflow} projectWorkflows={projectWorkflows} onEdit={onEdit} />
+        : <JsPanel node={node} file={file} code={code} tab={tab} setTab={setTab} onApply={onApply} />}
+    </div>
+  );
+}
+
+function Note({ icon, children }: { icon: React.ReactNode; children: React.ReactNode }) {
+  return <div className="flex items-start gap-2 rounded-lg border border-white/5 bg-ink-950/40 p-2 text-[11px] text-slate-400">{icon}<span>{children}</span></div>;
+}
+function exLabel(e: string) {
+  return { nsjail: "NsjailProcessExecutor", gvisor: "GvisorExecutor", firecracker: "FirecrackerExecutor", k8sjob: "K8sJobExecutor" }[e] ?? e;
+}
+function SchemaBox({ label, value, tip }: { label: string; value: string; tip: string }) {
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1.5 text-slate-400">{label} <InfoTip text={tip} /></div>
+      <pre className="overflow-x-auto rounded-lg border border-white/5 bg-ink-950/60 p-2 font-mono text-[11px] text-slate-300">{value}</pre>
+    </div>
+  );
+}
+function CtxRow({ sym, desc }: { sym: string; desc: string }) {
+  return <div className="flex items-baseline gap-2"><span className="font-mono text-slate-200">{sym}</span><span className="text-slate-500">— {desc}</span></div>;
+}
+function LimitBox({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-white/5 bg-ink-950/50 px-2.5 py-1.5">
+      <div className="flex items-center gap-1.5 text-slate-500">{icon}{label}</div>
+      <div className="mt-0.5 font-mono text-slate-200">{value}</div>
+    </div>
+  );
+}
+
+// ── Triggers panel ───────────────────────────────────────────────────────────
+function TriggerIcon({ type }: { type: string }) {
+  return type === "cron" ? <Clock className="h-3.5 w-3.5" /> : type === "webhook" ? <Webhook className="h-3.5 w-3.5" /> : type === "event" ? <Zap className="h-3.5 w-3.5" /> : <Hand className="h-3.5 w-3.5" />;
+}
+
+function TriggersPanel({ workflow, onCopy }: { workflow: Workflow; onCopy: () => void }) {
+  return (
+    <div className="card p-4" data-testid="triggers-panel">
+      <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
+        Triggers <InfoTip text="How runs start. Cron (app-level BullMQ repeatable jobs by default), webhook (Ingress route), manual, or an event (e.g. called by another script)." /> <Spec doc="ARCH §8" />
+      </h2>
+      <div className="mt-3 space-y-2">
+        {workflow.triggers.map((t, i) => (
+          <div key={i} className="flex items-center justify-between gap-2 rounded-lg border border-white/5 bg-ink-950/40 px-3 py-2 text-xs">
+            <span className="flex items-center gap-2 text-slate-300">
+              <TriggerIcon type={t.type} />
+              <span className="font-medium capitalize">{t.type}</span>
+              {t.detail && <span className="font-mono text-slate-400">{t.detail}</span>}
+            </span>
+            <span className="flex items-center gap-2 text-slate-500">
+              {t.type === "cron" && t.nextRun && <span className="chip bg-white/5 text-slate-400">next {t.nextRun}</span>}
+              {t.type === "webhook" && (
+                <button className="chip bg-white/5 text-slate-400 hover:text-slate-200" onClick={onCopy} data-testid="copy-webhook"><Copy className="h-3 w-3" /> copy URL</button>
+              )}
+              {t.concurrencyPolicy && <span className="font-mono text-[10px] text-slate-600">{t.concurrencyPolicy}</span>}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Observability panel ──────────────────────────────────────────────────────
+function ObservabilityPanel({ onOpen }: { onOpen: (dest: string) => void }) {
+  return (
+    <div className="card p-4" data-testid="observability-panel">
+      <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
+        <AreaChart className="h-4 w-4 text-slate-400" /> Observability
+        <InfoTip text="Mill stores no history itself — everything historical is logged/traced. Logs → Loki, metrics → Prometheus, traces → Tempo, all via Alloy, visualized in Grafana." />
+        <Spec doc="ARCH §3.6" />
+      </h2>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {["Grafana", "Loki logs", "Tempo trace"].map((d) => (
+          <button key={d} className="btn-ghost text-xs" onClick={() => onOpen(d)} data-testid={`open-${d.split(" ")[0].toLowerCase()}`}>{d}</button>
+        ))}
+      </div>
+      <div className="mt-3 rounded-lg border border-white/5 bg-ink-950/40 p-3">
+        <div className="mb-2 text-xs text-slate-400">Trace — a run is one trace, each node a span</div>
+        <div className="space-y-1">
+          <SpanBar label="fetch" w="45%" ml="0%" />
+          <SpanBar label="transform" w="12%" ml="45%" />
+          <SpanBar label="load" w="40%" ml="57%" />
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-1.5 text-[10px]">
+        {["queue depth", "job rate", "p95 duration", "per-job mem/cpu", "sync rate"].map((m) => (
+          <span key={m} className="chip bg-white/5 text-slate-400">{m}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+function SpanBar({ label, w, ml }: { label: string; w: string; ml: string }) {
+  return (
+    <div className="flex items-center gap-2 text-[10px]">
+      <span className="w-16 shrink-0 font-mono text-slate-500">{label}</span>
+      <div className="relative h-3 flex-1 rounded bg-white/5">
+        <div className="absolute h-3 rounded bg-brand-500/60" style={{ width: w, marginLeft: ml }} />
+      </div>
+    </div>
+  );
+}
+
+// ── Run detail + retry ───────────────────────────────────────────────────────
+function RunDetail({ run, onRetry }: { run: RunRecord; onRetry: (node: string) => void }) {
+  const max = Math.max(1, ...run.nodeTimings.map((t) => t.ms));
+  return (
+    <div className="rounded-lg border border-white/5 bg-ink-950/40 p-3" data-testid="run-detail">
+      <div className="flex items-center justify-between text-xs">
+        <span className="flex items-center gap-2"><StatusPill status={run.status} /><span className="font-mono text-slate-400">{run.id}</span></span>
+        <span className="text-slate-500">{run.durationMs ? `${(run.durationMs / 1000).toFixed(1)}s` : "—"}</span>
+      </div>
+      <div className="mt-3 space-y-1.5">
+        {run.nodeTimings.map((t) => (
+          <div key={t.key} className="flex items-center gap-2 text-[11px]">
+            <span className="w-20 shrink-0 font-mono text-slate-400">{t.key}</span>
+            <div className="relative h-3 flex-1 rounded bg-white/5">
+              <div className={`h-3 rounded ${t.status === "failed" ? "bg-rose-500/60" : t.status === "running" ? "bg-sky-500/60" : t.status === "idle" ? "bg-white/10" : "bg-emerald-500/50"}`} style={{ width: `${Math.max(6, (t.ms / max) * 100)}%` }} />
+            </div>
+            <span className="w-10 shrink-0 text-right font-mono text-slate-600">{t.ms ? `${t.ms}ms` : "—"}</span>
+          </div>
+        ))}
+      </div>
+      {run.error && (
+        <div className="mt-3 rounded-lg border border-rose-500/20 bg-rose-500/[0.06] p-2 text-xs" data-testid="failure-inspection">
+          <div className="font-medium text-rose-200">Failed at node “{run.error.node}”</div>
+          <pre className="mt-1 overflow-x-auto whitespace-pre-wrap font-mono text-[11px] text-rose-200/70">{run.error.message}</pre>
+          <div className="mt-2 flex items-center gap-2">
+            <button className="btn-ghost text-xs" data-testid="retry-btn" onClick={() => onRetry(run.error!.node)}>
+              <RotateCcw className="h-3.5 w-3.5" /> Retry from “{run.error.node}”
+            </button>
+            <InfoTip text="Two retry tiers: per-node backoff+jitter+condition, and a run-level retry that survives worker death. Node-boundary journaling means retries skip already-completed nodes." />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

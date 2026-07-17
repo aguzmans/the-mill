@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1
+# Run the Playwright e2e suite in a container (browsers preinstalled).
+# The Playwright config's webServer builds + serves the app, so this is self-contained.
+#   docker build -f apps/web/Dockerfile.test -t mill-web-e2e apps/web
+#   docker run --rm mill-web-e2e
+FROM mcr.microsoft.com/playwright:v1.61.1-jammy
+WORKDIR /app
+COPY package.json ./
+RUN npm install
+COPY . .
+ENV CI=1
+CMD ["npx", "playwright", "test"]

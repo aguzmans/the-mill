@@ -1,0 +1,12 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: notify }
+triggers:
+  - { type: event }
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: post,  kind: jscode, name: Post to Slack, file: nodes/post.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: post }
+  - { from: post,  to: end }

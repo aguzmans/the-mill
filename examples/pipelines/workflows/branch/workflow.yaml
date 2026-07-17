@@ -1,0 +1,20 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: branch }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start,   kind: start,  name: Start }
+  - { key: produce, kind: jscode, name: Produce,     file: nodes/produce.js }
+  - { key: gate,    kind: if,     name: Even?,       condition: "input.n % 2 === 0" }
+  - { key: even,    kind: jscode, name: Tag even,    file: nodes/tagEven.js }
+  - { key: odd,     kind: jscode, name: Tag odd,     file: nodes/tagOdd.js }
+  - { key: join,    kind: jscode, name: Join + assert, file: nodes/join.js }
+  - { key: end,     kind: end,    name: End }
+edges:
+  - { from: start,   to: produce }
+  - { from: produce, to: gate }
+  - { from: gate,    to: even, branch: "true" }
+  - { from: gate,    to: odd,  branch: "false" }
+  - { from: even,    to: join }
+  - { from: odd,     to: join }
+  - { from: join,    to: end }

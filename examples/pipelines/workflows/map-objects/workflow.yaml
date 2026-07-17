@@ -1,0 +1,15 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: map-objects }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start,  kind: start,  name: Start }
+  - { key: gen,    kind: jscode, name: Line items,     file: nodes/gen.js }
+  - { key: each,   kind: loop,   name: Line total,     each: "input.items", file: nodes/line.js }
+  - { key: totals, kind: jscode, name: Grand total,    file: nodes/totals.js }
+  - { key: end,    kind: end,    name: End }
+edges:
+  - { from: start, to: gen }
+  - { from: gen,   to: each }
+  - { from: each,  to: totals }
+  - { from: totals, to: end }

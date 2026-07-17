@@ -1,0 +1,15 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: map-numbers }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: gen,   kind: jscode, name: Numbers,      file: nodes/gen.js }
+  - { key: each,  kind: loop,   name: Square each,  each: "input.nums", file: nodes/square.js }
+  - { key: sum,   kind: jscode, name: Reduce sum,   file: nodes/sum.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: gen }
+  - { from: gen,   to: each }
+  - { from: each,  to: sum }
+  - { from: sum,   to: end }

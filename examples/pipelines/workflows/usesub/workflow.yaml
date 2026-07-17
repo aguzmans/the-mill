@@ -1,0 +1,15 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: usesub }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,      name: Start }
+  - { key: prep,  kind: jscode,     name: Prepare,        file: nodes/prep.js }
+  - { key: call,  kind: callScript, name: Call double,    call: { workflow: double, ref: workflows/double } }
+  - { key: check, kind: jscode,     name: Check + assert, file: nodes/check.js }
+  - { key: end,   kind: end,        name: End }
+edges:
+  - { from: start, to: prep }
+  - { from: prep,  to: call }
+  - { from: call,  to: check }
+  - { from: check, to: end }

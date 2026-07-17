@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+apps/web/src
+apps/web/e2e
+apps/web/public
+**/.git
+test-results
+playwright-report
+**/*.log

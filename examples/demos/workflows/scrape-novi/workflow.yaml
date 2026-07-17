@@ -1,0 +1,15 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: scrape-novi }
+triggers:
+  - { type: manual }
+  - { type: webhook }
+nodes:
+  - { key: start,   kind: start,  name: Start }
+  - { key: fetch,   kind: jscode, name: Fetch page,  file: nodes/fetch.js }
+  - { key: extract, kind: jscode, name: Extract info, file: nodes/extract.js }
+  - { key: end,     kind: end,    name: End }
+edges:
+  - { from: start,   to: fetch }
+  - { from: fetch,   to: extract }
+  - { from: extract, to: end }

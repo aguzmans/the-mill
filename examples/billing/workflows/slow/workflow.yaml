@@ -1,0 +1,12 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: slow }
+triggers:
+  - { type: manual }
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: work,  kind: jscode, name: Slow Work, file: nodes/wait.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: work }
+  - { from: work,  to: end }
