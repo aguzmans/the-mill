@@ -24,7 +24,7 @@ export type ExecutorTier = "nsjail" | "gvisor" | "firecracker" | "k8sjob";
  *  - callScript — invoke another script as a step (same project OR standalone/remote).
  *  - end        — the exit clause; the flow returns when no more work remains.
  */
-export type NodeKind = "start" | "jscode" | "if" | "callScript" | "loop" | "end";
+export type NodeKind = "start" | "jscode" | "if" | "callScript" | "loop" | "fanout" | "end";
 
 /** One clause of an `if` condition; clauses after the first carry a connector. */
 export interface IfClause {
@@ -46,6 +46,7 @@ export const NODE_KINDS: { kind: NodeKind; label: string; blurb: string }[] = [
   { kind: "if", label: "If", blurb: "A literal `if` in the main file — branches the flow on a condition into a true and a false path." },
   { kind: "callScript", label: "Call Script", blurb: "Invoke another script as a step. The target can live in this project or be a standalone/remote script." },
   { kind: "loop", label: "Loop", blurb: "forEach over an array (from the previous node) — runs a body per item and collects the results. The body is a JS Code file or a Call Script; iterations run in order and share ctx.state." },
+  { kind: "fanout", label: "Fanout", blurb: "Dynamic router: an expression yields a list of { workflow, input } targets, called in PARALLEL. Returns a per-target { workflow, ok, result|error } so one failure never kills the batch — ideal for conditionally calling 1-N downstream workloads." },
   { kind: "end", label: "End", blurb: "Exit clause — the flow returns when no more execution is required." },
 ];
 

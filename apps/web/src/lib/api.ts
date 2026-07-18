@@ -104,6 +104,49 @@ async function del(path: string) {
 export const deleteWorkflow = (projectId: string, wf: string) => del(`/projects/${projectId}/workflows/${wf}`);
 export const deleteProject = (projectId: string) => del(`/projects/${projectId}`);
 
+export async function createProject(id: string, opts?: { autoSync?: boolean; selfHeal?: boolean; prune?: boolean }) {
+  const r = await fetch(`${BASE}/projects`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id, ...opts }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `create ${r.status}`);
+  return j;
+}
+
+export interface LiveRun { id: string; status: string; trigger?: string; revision?: string; createdAt?: string; startedAt?: string; finishedAt?: string; ms?: string; error?: string; workflow?: string }
+export async function getRuns(projectId: string, wf: string): Promise<{ runs: LiveRun[] }> {
+  return (await fetch(`${BASE}/projects/${projectId}/workflows/${wf}/runs`)).json();
+}
+export interface NodeTiming { key: string; status: string; ms: number }
+export async function getTimeline(jobId: string): Promise<{ nodeTimings: NodeTiming[]; error?: { node: string; message: string } }> {
+  return (await fetch(`${BASE}/jobs/${jobId}/timeline`)).json();
+}
+export async function retryRun(jobId: string): Promise<{ jobId: string }> {
+  const r = await fetch(`${BASE}/jobs/${jobId}/retry`, { method: "POST" });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `retry ${r.status}`);
+  return j;
+}
+export interface ReconcileEventLive { at: number; targetRevision: string; syncedRevision: string; sync: string; health: string; error?: string }
+export async function getReconcileEvents(): Promise<{ events: ReconcileEventLive[] }> {
+  return (await fetch(`${BASE}/reconcile-events`)).json();
+}
+export interface DiffEntryLive { change: string; path: string }
+export async function getDiff(projectId: string): Promise<{ diff: DiffEntryLive[]; synced: boolean; targetRevision?: string; syncedRevision?: string }> {
+  return (await fetch(`${BASE}/projects/${projectId}/diff`)).json();
+}
+export interface ProjectEndpoints {
+  project: string;
+  projectPath: string;
+  workflows: { workflow: string; path: string; customPaths: string[] }[];
+  authRequired: boolean;
+}
+export async function getEndpoints(projectId: string): Promise<ProjectEndpoints> {
+  return (await fetch(`${BASE}/projects/${projectId}/endpoints`)).json();
+}
+
 export interface NodeTestResult { status: "succeeded" | "failed"; node: string; kind: string; output?: unknown; error?: string; logs: LiveEvent[]; ms: number }
 export async function testNode(projectId: string, wf: string, key: string, input: unknown, secrets?: Record<string, string>): Promise<NodeTestResult> {
   const r = await fetch(`${BASE}/projects/${projectId}/workflows/${wf}/nodes/${key}/test`, {

@@ -1,0 +1,15 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: retry }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - key: flaky
+    kind: jscode
+    name: Flaky (fails twice)
+    file: nodes/flaky.js
+    retry: { maxAttempts: 3, backoffMs: 30 }
+  - { key: end, kind: end, name: End }
+edges:
+  - { from: start, to: flaky }
+  - { from: flaky, to: end }

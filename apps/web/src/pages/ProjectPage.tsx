@@ -1,19 +1,42 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link, useParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import {
   ArrowLeft, GitBranch, RefreshCw, Download, Plus, Clock, Webhook, Hand, Zap,
   GitCommitHorizontal, AlertTriangle, ShieldCheck, FileArchive, ArrowRight, CheckCircle2, Trash2,
 } from "lucide-react";
-import { findProject, exportBundle, nodeKindCounts, type Trigger, type Project, type ReconcileEvent, type Workflow } from "../lib/mock";
+import { findProject, exportBundle, nodeKindCounts, type Trigger, type Project, type ReconcileEvent, type DiffEntry, type Workflow } from "../lib/mock";
 import { KindIcon, kindAccent } from "../graph/MillNode";
 import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
 import { InfoTip, Tip } from "../components/InfoTip";
 import { Modal, Drawer, Toggle, DiffRow, Spec, useToast, Toast } from "../components/Kit";
 import { useLiveStatus } from "../lib/useLive";
-import { LIVE, reconcileNow, deleteWorkflow } from "../lib/api";
+import { LIVE, reconcileNow, deleteWorkflow, getReconcileEvents, getDiff, getEndpoints, type ReconcileEventLive, type DiffEntryLive, type ProjectEndpoints } from "../lib/api";
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+function relTime(ms: number): string {
+  if (!ms) return "—";
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+function toReconEvent(e: ReconcileEventLive): ReconcileEvent {
+  const kind: ReconcileEvent["kind"] = e.error ? "error" : e.sync === "Synced" ? "apply" : "fetch";
+  const detail = e.error
+    ? e.error
+    : e.sync === "Synced"
+      ? `applied ${(e.syncedRevision || "").slice(0, 7)} — Synced/${e.health}`
+      : `fetched ${(e.targetRevision || "").slice(0, 7)} — ${e.sync}`;
+  return { time: relTime(e.at), kind, detail, revision: (e.syncedRevision || e.targetRevision || "").slice(0, 7) };
+}
+function toDiffEntry(d: DiffEntryLive): DiffEntry {
+  const change: DiffEntry["change"] = d.change === "deleted" ? "removed" : d.change === "added" ? "added" : "modified";
+  return { path: d.path, change, summary: "" };
+}
 
 function TriggerChip({ t }: { t: Trigger }) {
   const icon =
@@ -53,6 +76,23 @@ export function ProjectPage() {
   const [policy, setPolicy] = useState({ autoSync: mockProject?.autoSync ?? false, selfHeal: mockProject?.selfHeal ?? false, prune: mockProject?.prune ?? false });
   const { toast, flash } = useToast();
   const { status, reload, ready } = useLiveStatus();
+
+  // Live reconcile activity + sync diff from the controller.
+  const [liveRecon, setLiveRecon] = useState<ReconcileEvent[]>([]);
+  const [liveDiff, setLiveDiff] = useState<DiffEntry[]>([]);
+  const [endpoints, setEndpoints] = useState<ProjectEndpoints | null>(null);
+  useEffect(() => {
+    if (!LIVE || !projectId) return;
+    let on = true;
+    const load = () => {
+      getReconcileEvents().then((r) => { if (on) setLiveRecon(r.events.map(toReconEvent)); }).catch(() => {});
+      getDiff(projectId).then((r) => { if (on) setLiveDiff((r.diff ?? []).map(toDiffEntry)); }).catch(() => {});
+    };
+    load();
+    getEndpoints(projectId).then((e) => { if (on) setEndpoints(e); }).catch(() => {});
+    const t = setInterval(load, 5000);
+    return () => { on = false; clearInterval(t); };
+  }, [projectId]);
 
   // In Live mode, overlay real GitOps status from the controller onto the header + workflows.
   const liveProject = ready ? status?.projects?.find((p) => p.id === projectId) : undefined;
@@ -136,6 +176,11 @@ export function ProjectPage() {
                   <RefreshCw className="h-4 w-4" /> Sync
                 </button>
               </Tip>
+              <Tip text="GitOps details: the fetch/apply split, what a Sync would change, and recent reconcile activity.">
+                <button className="btn-ghost" data-testid="gitops-btn" onClick={() => setShowReconcile(true)}>
+                  <GitBranch className="h-4 w-4" /> GitOps
+                </button>
+              </Tip>
               <Tip text="Export this project as a standalone .tar.gz (YAML + JS + generated entrypoint) that runs on any JS runtime.">
                 <button className="btn-ghost" data-testid="export-btn" onClick={() => { if (LIVE) { window.location.href = `/api/projects/${project.id}/export`; } else setShowExport(true); }}>
                   <Download className="h-4 w-4" /> Export
@@ -211,6 +256,9 @@ export function ProjectPage() {
           </div>
         </div>
       </div>
+
+      {/* ── Endpoints (tokenized ingress) ─────────────────────── */}
+      {LIVE && endpoints && <EndpointsCard endpoints={endpoints} onCopy={(u) => { navigator.clipboard?.writeText(u).catch(() => {}); flash("Endpoint URL copied"); }} />}
 
       {/* ── Workflows ─────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
@@ -296,7 +344,12 @@ export function ProjectPage() {
         icon={<RefreshCw className="h-4 w-4 text-brand-400" />}
         title={<span className="flex items-center gap-2">Reconcile <Spec doc="ARCH §5" /></span>}
       >
-        <ReconcilePanel project={project} onApply={() => { setShowReconcile(false); flash("Reconcile queued · fetch → validate → compile → atomic swap"); }} />
+        <ReconcilePanel
+          project={project}
+          diff={live ? liveDiff : (project.diff ?? [])}
+          reconcile={live ? liveRecon : (project.reconcile ?? [])}
+          onApply={() => { setShowReconcile(false); flash("Reconcile queued · fetch → validate → compile → atomic swap"); }}
+        />
       </Drawer>
 
       {/* ── Export modal ──────────────────────────────────────── */}
@@ -368,7 +421,43 @@ export function ProjectPage() {
 }
 
 // ── Reconcile drawer body ─────────────────────────────────────────────────────
-function ReconcilePanel({ project, onApply }: { project: Project; onApply: () => void }) {
+function EndpointsCard({ endpoints, onCopy }: { endpoints: ProjectEndpoints; onCopy: (url: string) => void }) {
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const abs = (p: string) => `${origin}${p}`;
+  return (
+    <div className="card p-4" data-testid="endpoints-card">
+      <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
+        <Webhook className="h-4 w-4 text-brand-400" /> Endpoints
+        <InfoTip text="Stable URLs on this host that trigger workloads over HTTP/REST. Send the bearer token in an Authorization header. Add ?wait=1 to get the result synchronously; omit it for a webhook-style { jobId }." />
+      </h2>
+      <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-400">
+        {endpoints.authRequired
+          ? <span className="chip bg-emerald-500/10 text-emerald-300"><ShieldCheck className="h-3 w-3" /> Bearer token required</span>
+          : <span className="chip bg-amber-500/10 text-amber-300"><AlertTriangle className="h-3 w-3" /> ingress token not set (MILL_INGRESS_TOKEN)</span>}
+        <span className="font-mono text-slate-500">Authorization: Bearer &lt;token&gt;</span>
+      </div>
+      <div className="mt-3 space-y-1.5">
+        <EndpointRow label="project" url={abs(endpoints.projectPath)} onCopy={onCopy} />
+        {endpoints.workflows.map((w) => (
+          <EndpointRow key={w.workflow} label={w.workflow} url={abs(w.path)} onCopy={onCopy} />
+        ))}
+      </div>
+    </div>
+  );
+}
+function EndpointRow({ label, url, onCopy }: { label: string; url: string; onCopy: (u: string) => void }) {
+  return (
+    <div className="flex items-center justify-between gap-2 rounded-lg border border-white/5 bg-ink-950/40 px-2.5 py-1.5 text-[11px]" data-testid={`endpoint-${label}`}>
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="w-20 shrink-0 truncate text-slate-400">{label}</span>
+        <span className="truncate font-mono text-slate-300">{url}</span>
+      </span>
+      <button type="button" data-testid={`copy-endpoint-${label}`} onClick={() => onCopy(url)} className="chip shrink-0 bg-white/5 text-slate-400 hover:text-slate-200"><FileArchive className="h-3 w-3" /> copy</button>
+    </div>
+  );
+}
+
+function ReconcilePanel({ project, onApply, diff, reconcile }: { project: Project; onApply: () => void; diff: DiffEntry[]; reconcile: ReconcileEvent[] }) {
   const synced = project.sync === "Synced";
   return (
     <div className="space-y-5 text-sm">
@@ -394,9 +483,9 @@ function ReconcilePanel({ project, onApply }: { project: Project; onApply: () =>
         <h3 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
           Changes to apply <InfoTip text="Reconcile is level-triggered: a pure function of observed-vs-desired. This is the delta re-derived from scratch, not a reaction to one event." />
         </h3>
-        {project.diff && project.diff.length > 0 ? (
+        {diff.length > 0 ? (
           <div className="space-y-1.5" data-testid="reconcile-diff">
-            {project.diff.map((d) => (
+            {diff.map((d) => (
               <DiffRow key={d.path} change={d.change} path={d.path} summary={d.summary} />
             ))}
           </div>
@@ -413,9 +502,9 @@ function ReconcilePanel({ project, onApply }: { project: Project; onApply: () =>
           Reconcile activity <InfoTip text="Wake-ups: git webhook (instant) or ~3min poll + jitter (authoritative backstop). A webhook + poll landing together coalesce into one run; failures back off, they don't hot-loop." />
         </h3>
         <div className="space-y-1" data-testid="reconcile-feed">
-          {(project.reconcile ?? []).map((e, i) => (
+          {reconcile.length ? reconcile.map((e, i) => (
             <ReconcileRow key={i} e={e} />
-          ))}
+          )) : <p className="text-xs text-slate-500">No reconcile activity yet.</p>}
         </div>
       </div>
 

@@ -1,0 +1,11 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: create-invoice }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: invoice, kind: jscode, name: create-invoice, file: nodes/invoice.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: invoice }
+  - { from: invoice, to: end }

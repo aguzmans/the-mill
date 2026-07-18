@@ -14,6 +14,7 @@ export interface JobSpec {
   workflow: string;
   input: unknown;
   revision?: string; // git SHA the job was enqueued at (cache-busts node imports)
+  request?: unknown; // webhook envelope (raw body + headers + query) → ctx.request
 }
 
 export interface RunningJob {
@@ -62,15 +63,36 @@ export class MillQueue {
   }
 
   // ── producer ──────────────────────────────────────────────────────────────
-  async enqueue(spec: JobSpec): Promise<void> {
+  async enqueue(spec: JobSpec & { trigger?: string; runKey?: string }): Promise<void> {
     await this.redis.hset(this.key("job", spec.id), {
       status: "queued",
       workflow: spec.workflow,
       project: spec.projectDir,
+      input: JSON.stringify(spec.input ?? {}), // kept so a run can be retried with the same input
+      trigger: spec.trigger ?? "manual",
+      revision: spec.revision ?? "",
       createdAt: Date.now().toString(),
     });
     await this.redis.expire(this.key("job", spec.id), this.ttl);
+    // Per-workflow recent-runs index (newest first, capped) for the Run history view.
+    if (spec.runKey) {
+      const rk = this.key("runs", spec.runKey);
+      await this.redis.lpush(rk, spec.id);
+      await this.redis.ltrim(rk, 0, 49);
+      await this.redis.expire(rk, this.ttl);
+    }
     await this.redis.lpush(this.key("queue"), JSON.stringify(spec));
+  }
+
+  /** Recent runs for a workflow (newest first), each enriched with its job hash. */
+  async recentRuns(runKey: string, limit = 20): Promise<Record<string, string>[]> {
+    const ids = await this.redis.lrange(this.key("runs", runKey), 0, limit - 1);
+    const out: Record<string, string>[] = [];
+    for (const id of ids) {
+      const j = await this.getJob(id);
+      if (Object.keys(j).length) out.push({ id, ...j });
+    }
+    return out;
   }
 
   // ── consumer (reliable: pulled jobs sit in the worker's processing list) ────
@@ -117,6 +139,21 @@ export class MillQueue {
     await this.redis.hset(this.key("job", id), { status, ...extra });
   }
 
+  // ── monotonic metrics (a single Redis hash of counters, for Prometheus) ──────
+  /** Latency histogram bucket upper-bounds, in seconds (Prometheus convention). */
+  static readonly BUCKETS = [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60];
+  async metricInc(field: string, by = 1): Promise<void> { await this.redis.hincrby(this.key("metrics"), field, by).catch(() => {}); }
+  async metricAll(): Promise<Record<string, string>> { return this.redis.hgetall(this.key("metrics")); }
+  /** Observe a duration/wait into a named cumulative histogram (…_bucket:le, …_sum, …_count). */
+  private async observe(name: string, seconds: number): Promise<void> {
+    const p = this.redis.pipeline();
+    for (const le of MillQueue.BUCKETS) if (seconds <= le) p.hincrby(this.key("metrics"), `${name}_bucket:${le}`, 1);
+    p.hincrby(this.key("metrics"), `${name}_bucket:+Inf`, 1);
+    p.hincrbyfloat(this.key("metrics"), `${name}_sum`, seconds);
+    p.hincrby(this.key("metrics"), `${name}_count`, 1);
+    await p.exec().catch(() => {});
+  }
+
   /** Mark a job as started (records startedAt so wait/duration can be derived). */
   async markRunning(id: string, worker: string): Promise<void> {
     await this.redis.hset(this.key("job", id), { status: "running", worker, startedAt: Date.now().toString() });
@@ -144,6 +181,11 @@ export class MillQueue {
       await this.redis.rpush(wkey, JSON.stringify(rec));
       await this.redis.ltrim(wkey, -2000, -1); // keep the last 2000 completions
       await this.redis.expire(wkey, this.ttl);
+      // Monotonic counters + latency/wait histograms for Prometheus.
+      await this.metricInc(`jobs_total:${status}`);
+      await this.metricInc(`jobs_wf:${rec.w}:${status}`);
+      await this.observe("job_duration_seconds", rec.d / 1000);
+      await this.observe("job_wait_seconds", rec.wait / 1000);
     }
   }
 
@@ -181,6 +223,22 @@ export class MillQueue {
 
   async getJob(id: string): Promise<Record<string, string>> {
     return this.redis.hgetall(this.key("job", id));
+  }
+
+  // ── node-boundary journal (durability: a requeued job resumes, skipping done nodes) ──
+  async journalGet(id: string): Promise<Record<string, unknown>> {
+    const h = await this.redis.hgetall(this.key("job", id, "journal"));
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(h)) { try { out[k] = JSON.parse(v); } catch { /* skip */ } }
+    return out;
+  }
+  async journalSet(id: string, node: string, output: unknown): Promise<void> {
+    const k = this.key("job", id, "journal");
+    await this.redis.hset(k, node, JSON.stringify(output ?? null));
+    await this.redis.expire(k, this.ttl);
+  }
+  async journalClear(id: string): Promise<void> {
+    await this.redis.del(this.key("job", id, "journal"));
   }
 
   // ── event bus (live logs) ───────────────────────────────────────────────────

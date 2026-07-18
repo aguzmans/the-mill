@@ -8,11 +8,14 @@ import { join, resolve } from "node:path";
 import { MillQueue } from "@mill/queue";
 import { computeStats, computeQueueView } from "./fleet";
 import { runNode } from "@mill/executor";
+import { createLogger } from "@mill/telemetry";
+
+const log = createLogger("api");
 
 const ENV_SECRETS: Record<string, string> = process.env.MILL_SECRETS ? JSON.parse(process.env.MILL_SECRETS) : {};
 import { loadProject, listWorkflows, loadWorkflow, listProjects, collectDeps } from "@mill/projectfs";
 import { buildPlan } from "@mill/compiler";
-import { openRepo, reconcile, deletePaths, writePaths, type RepoState, type ReconcileStatus } from "@mill/gitops";
+import { openRepo, reconcile, deletePaths, writePaths, diffToApply, type RepoState, type ReconcileStatus } from "@mill/gitops";
 import { parseWorkflow } from "@mill/core";
 import { stringify as yamlStringify } from "yaml";
 import { TriggerEngine, type TriggerDef } from "./triggers";
@@ -50,30 +53,84 @@ setInterval(() => {
 
 let repoState: RepoState | null = null;
 
-function enqueueJob(projectDir: string, workflow: string, input: unknown): string {
+function enqueueJob(projectDir: string, workflow: string, input: unknown, trigger = "manual", request?: unknown): string {
   const jobId = "job_" + crypto.randomUUID().slice(0, 8);
-  q.enqueue({ id: jobId, projectDir, workflow, input, revision: lastStatus?.syncedRevision }).catch((e) => console.error("enqueue failed:", e));
+  const projectId = projectDir.split("/").filter(Boolean).pop() ?? projectDir;
+  q.enqueue({ id: jobId, projectDir, workflow, input, revision: lastStatus?.syncedRevision, trigger, runKey: `${projectId}/${workflow}`, request })
+    .catch((e) => console.error("enqueue failed:", e));
+  q.metricInc(`triggered:${trigger}`).catch(() => {});
   return jobId;
 }
 
 // Cron + webhook triggers, rebuilt from the reconciled workflows on every reconcile.
 const triggerEngine = new TriggerEngine((t, input) => {
-  const jobId = enqueueJob(join(PROJECTS_DIR, t.project), t.workflow, input);
-  console.log(`trigger[${t.type}] ${t.project}/${t.workflow} → ${jobId}`);
+  const jobId = enqueueJob(join(PROJECTS_DIR, t.project), t.workflow, input, t.type);
+  log.info("trigger", { type: t.type, project: t.project, workflow: t.workflow, job: jobId });
 });
+
+// ── Tokenized ingress: stable per-project (/p/:path) and per-workflow (/p/w/:wf/:path)
+// URLs on the same host, rebuilt from the reconciled workflows. Bearer-token secured.
+const INGRESS_TOKEN = process.env.MILL_INGRESS_TOKEN; // global fallback token
+const wfRoutes = new Map<string, { project: string; workflow: string }>(); // key: `${workflow}/${path}`
+const projRoutes = new Map<string, string>(); // key: path → project id
+const projectTokens = new Map<string, string>(); // project id → its bearer token (per-project override)
+
+function safeEq(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+/** The bearer token that guards a project's /p endpoints: its own (via ingress.tokenEnv) or the global one. */
+function tokenFor(projectId: string): string | undefined {
+  return projectTokens.get(projectId) ?? INGRESS_TOKEN;
+}
+/** Returns an error Response if the request's bearer token doesn't match the project's, else null. */
+function bearerGuard(c: { req: { header: (k: string) => string | undefined }; json: (o: unknown, s?: number) => Response }, projectId: string): Response | null {
+  const token = tokenFor(projectId);
+  if (!token) { q.metricInc("ingress_total:disabled").catch(() => {}); return c.json({ error: "ingress disabled for this project — set MILL_INGRESS_TOKEN or the project's ingress.tokenEnv" }, 503); }
+  const m = (c.req.header("authorization") ?? "").match(/^Bearer\s+(.+)$/i);
+  if (!m || !safeEq(m[1], token)) {
+    q.metricInc("ingress_total:unauthorized").catch(() => {});
+    q.metricInc("ingress_auth_failures_total").catch(() => {}); // security alerting
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  return null;
+}
 
 function syncTriggers() {
   const triggers: TriggerDef[] = [];
+  wfRoutes.clear();
+  projRoutes.clear();
+  projectTokens.clear();
   for (const pid of listProjects(PROJECTS_DIR)) {
+    projRoutes.set(pid, pid); // default project endpoint: /p/<project-id>
+    try {
+      const proj = loadProject(join(PROJECTS_DIR, pid));
+      const env = proj.ingress?.tokenEnv;
+      if (env && process.env[env]) projectTokens.set(pid, process.env[env]!); // per-project token via Secret/env ref
+    } catch { /* invalid project.yaml — skip */ }
     for (const wname of listWorkflows(join(PROJECTS_DIR, pid))) {
+      wfRoutes.set(`${wname}/${pid}`, { project: pid, workflow: wname }); // default: /p/w/<wf>/<project-id>
       try {
         const { def } = loadWorkflow(join(PROJECTS_DIR, pid), wname);
-        for (const t of def.triggers) triggers.push({ project: pid, workflow: wname, type: t.type, schedule: t.schedule, path: t.path, concurrencyPolicy: t.concurrencyPolicy });
+        for (const t of def.triggers) {
+          triggers.push({ project: pid, workflow: wname, type: t.type, schedule: t.schedule, path: t.path, concurrencyPolicy: t.concurrencyPolicy });
+          if (t.type === "webhook" && t.path) wfRoutes.set(`${wname}/${t.path}`, { project: pid, workflow: wname }); // custom token path
+        }
       } catch { /* skip invalid workflow */ }
     }
   }
+  // Prune allow-empty guard: never let a suddenly-empty tree (broken clone, bad revision)
+  // deregister every trigger — keep the last non-empty set until real triggers reappear.
+  if (triggers.length === 0 && lastTriggerCount > 0) {
+    console.warn("prune guard: 0 triggers resolved but previous set was non-empty — keeping existing triggers");
+    return;
+  }
+  lastTriggerCount = triggers.length;
   triggerEngine.sync(triggers);
 }
+let lastTriggerCount = 0;
 let lastStatus: (ReconcileStatus & { at: number }) | null = null;
 let installedRev = "";
 
@@ -108,11 +165,29 @@ function writeGitExclude(repoDir: string): void {
   } catch { /* best-effort */ }
 }
 
-async function doReconcile(): Promise<(ReconcileStatus & { at: number }) | null> {
+// Rolling reconcile-activity log (newest first) for the project page's activity feed.
+const reconcileLog: { at: number; targetRevision: string; syncedRevision: string; sync: string; health: string; error?: string }[] = [];
+let lastLoggedRev = "";
+
+// Workspace autoSync gate (single-repo v1): when off, the reconciler validates new revisions
+// but holds them (OutOfSync) until a manual Sync. A manual `POST /api/reconcile` always applies.
+const AUTOSYNC = (process.env.MILL_AUTOSYNC ?? "true") !== "false";
+
+async function doReconcile(apply: boolean = AUTOSYNC): Promise<(ReconcileStatus & { at: number }) | null> {
   if (!repoState) return null;
-  const s = await reconcile(repoState);
+  const s = await reconcile(repoState, { apply });
   lastStatus = { ...s, at: Date.now() };
+  // Log an activity entry when something changed (new target, applied revision, or an error).
+  const sig = `${s.targetRevision}|${s.syncedRevision}|${s.error ?? ""}`;
+  if (sig !== lastLoggedRev) {
+    reconcileLog.unshift({ at: Date.now(), targetRevision: s.targetRevision, syncedRevision: s.syncedRevision, sync: s.sync, health: s.health, error: s.error });
+    if (reconcileLog.length > 50) reconcileLog.pop();
+    lastLoggedRev = sig;
+  }
   if (s.sync === "Synced") await installDeps().catch((e) => console.error("deps install error:", e));
+  // Classify the pass for the reconcile_total counter (dashboards/alerts).
+  const result = s.health === "Degraded" ? "degraded" : /held/.test(s.error ?? "") ? "held" : s.syncedRevision === s.targetRevision ? "applied" : "nochange";
+  q.metricInc(`reconcile_total:${result}`).catch(() => {});
   syncTriggers(); // re-register cron/webhook triggers from the reconciled workflows
   return lastStatus;
 }
@@ -124,7 +199,7 @@ async function initRepo() {
   PROJECTS_DIR = WORKDIR;
   writeGitExclude(WORKDIR); // so runtime-installed node_modules never get committed
   await doReconcile();
-  console.log(`reconciled: ${lastStatus?.sync}/${lastStatus?.health} @ ${lastStatus?.syncedRevision?.slice(0, 7)}`);
+  log.info("reconciled", { sync: lastStatus?.sync, health: lastStatus?.health, rev: lastStatus?.syncedRevision?.slice(0, 7) });
   setInterval(() => { doReconcile().catch((e) => console.error("reconcile error:", e)); }, RECONCILE_MS);
 }
 initRepo().catch((e) => console.error("repo init failed:", e));
@@ -132,7 +207,27 @@ if (!PROJECT_REPO) syncTriggers(); // dir mode: register triggers from the mount
 
 const app = new Hono();
 const api = new Hono(); // all JSON endpoints live under /api so they never collide with SPA routes
-app.use("*", cors());
+// CORS: same-origin by default (the UI is served by this controller, so it needs no CORS).
+// Cross-origin browser access is denied unless explicitly allowlisted via MILL_CORS_ORIGINS
+// (comma-separated). Server-to-server callers (webhooks/REST) are unaffected — CORS is a
+// browser control. Removes the "Access-Control-Allow-Origin: *" foot-gun on the control plane.
+const CORS_ORIGINS = (process.env.MILL_CORS_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+app.use("*", cors({ origin: (origin) => (CORS_ORIGINS.includes(origin) ? origin : "") }));
+
+// App-level admin token (defense-in-depth if Ingress SSO is misconfigured). When set, every
+// /api/* route requires `Authorization: Bearer <MILL_ADMIN_TOKEN>` EXCEPT the infra endpoints
+// /api/health (liveness probe) and /api/metrics (Prometheus scrape — send it a bearer_token).
+// NOTE: enabling this locks the browser UI too — use it for headless/API deployments, or leave
+// it unset and terminate auth (SSO) at the Ingress.
+const ADMIN_TOKEN = process.env.MILL_ADMIN_TOKEN;
+const ADMIN_OPEN = new Set(["/api/health", "/api/metrics"]);
+api.use("*", async (c, next) => {
+  if (!ADMIN_TOKEN) return next();
+  if (ADMIN_OPEN.has(new URL(c.req.url).pathname)) return next();
+  const m = (c.req.header("authorization") ?? "").match(/^Bearer\s+(.+)$/i);
+  if (!m || !safeEq(m[1], ADMIN_TOKEN)) return c.json({ error: "unauthorized (admin token required)" }, 401);
+  return next();
+});
 
 const projectDirs = (): string[] => listProjects(PROJECTS_DIR);
 
@@ -169,8 +264,7 @@ api.post("/projects/:id/workflows/:wf/trigger", async (c) => {
   const dir = join(PROJECTS_DIR, id);
   if (!existsSync(join(dir, "workflows", wf, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
   const body = await c.req.json().catch(() => ({}));
-  const jobId = "job_" + crypto.randomUUID().slice(0, 8);
-  await q.enqueue({ id: jobId, projectDir: dir, workflow: wf, input: body?.input ?? {}, revision: lastStatus?.syncedRevision });
+  const jobId = enqueueJob(dir, wf, body?.input ?? {}, "manual");
   return c.json({ jobId });
 });
 
@@ -194,6 +288,31 @@ api.get("/jobs/:id", async (c) => {
   const job = await q.getJob(c.req.param("id"));
   if (!Object.keys(job).length) return c.json({ error: "not found" }, 404);
   return c.json({ ...job, result: job.result ? JSON.parse(job.result) : null });
+});
+
+// Per-node timeline for a run (from its recorded events) — powers the Run detail spans.
+api.get("/jobs/:id/timeline", async (c) => {
+  const events = await q.getEvents(c.req.param("id"));
+  const byNode = new Map<string, { key: string; status: string; ms: number }>();
+  let error: { node: string; message: string } | undefined;
+  for (const e of events as { type?: string; node?: string; status?: string; ms?: number; error?: string }[]) {
+    if (e.type !== "node" || !e.node) continue;
+    byNode.set(e.node, { key: e.node, status: e.status ?? "idle", ms: e.ms ?? 0 });
+    if (e.status === "failed") error = { node: e.node, message: e.error ?? "failed" };
+  }
+  return c.json({ nodeTimings: [...byNode.values()], error });
+});
+
+// Retry a run: re-enqueue the same workflow with the same input (a fresh run).
+api.post("/jobs/:id/retry", async (c) => {
+  const job = await q.getJob(c.req.param("id"));
+  if (!Object.keys(job).length) return c.json({ error: "job not found" }, 404);
+  let input: unknown = {};
+  try { input = job.input ? JSON.parse(job.input) : {}; } catch { /* default {} */ }
+  const projectId = (job.project || "").split("/").filter(Boolean).pop() ?? "";
+  const jobId = enqueueJob(job.project, job.workflow, input, "manual");
+  q.metricInc("retries_total").catch(() => {});
+  return c.json({ jobId, retriedFrom: c.req.param("id"), project: projectId, workflow: job.workflow });
 });
 
 // Live per-node status + logs (Server-Sent Events). Replays history, then streams.
@@ -227,6 +346,63 @@ api.get("/jobs/:id/events", (c) => {
 
 api.get("/workers", async (c) => c.json({ workers: await q.workers(), queueDepth: await q.queueDepth() }));
 
+// Prometheus metrics — monotonic counters + histograms (from Redis) and live gauges. The
+// counters/histograms let your monitoring compute rates + real quantiles; see docs/RUNNING.md.
+api.get("/metrics", async (c) => {
+  const now = Date.now();
+  const [workers, queueDepth, counters, oldestCreatedAt] = await Promise.all([q.workers(), q.queueDepth(), q.metricAll(), q.oldestQueuedCreatedAt()]);
+  const inFlight = workers.reduce((n, w) => n + (w.inFlight ?? 0), 0);
+  const num = (v: string | undefined) => Number(v ?? 0);
+  const lines: string[] = [];
+  const help = (name: string, h: string, type: string) => lines.push(`# HELP ${name} ${h}`, `# TYPE ${name} ${type}`);
+  const g = (name: string, h: string, value: number) => { help(name, h, "gauge"); lines.push(`${name} ${value}`); };
+
+  // ── gauges (current state) ──
+  g("mill_workers", "Workers currently registered", workers.length);
+  g("mill_workers_inflight", "Jobs executing across the fleet", inFlight);
+  g("mill_queue_depth", "Jobs waiting in the queue", queueDepth);
+  g("mill_queue_oldest_wait_seconds", "Age of the head-of-line queued job", oldestCreatedAt ? Math.max(0, (now - oldestCreatedAt) / 1000) : 0);
+  g("mill_reconcile_synced", "1 if the repo is Synced", lastStatus?.sync === "Synced" ? 1 : 0);
+  g("mill_reconcile_healthy", "1 if the repo is Healthy", lastStatus?.health === "Healthy" ? 1 : 0);
+  g("mill_reconcile_age_seconds", "Seconds since the last reconcile pass", lastStatus ? Math.max(0, (now - lastStatus.at) / 1000) : 0);
+
+  // ── counters (grouped from the Redis metrics hash) ──
+  const byPrefix = (prefix: string) => Object.entries(counters).filter(([k]) => k.startsWith(prefix));
+  const counterFamily = (metric: string, help_: string, prefix: string, label: string, keyToLabel: (k: string) => string) => {
+    const rows = byPrefix(prefix);
+    if (!rows.length) return;
+    help(metric, help_, "counter");
+    for (const [k, v] of rows) lines.push(`${metric}{${label}="${keyToLabel(k)}"} ${num(v)}`);
+  };
+  counterFamily("mill_jobs_total", "Jobs finished by status", "jobs_total:", "status", (k) => k.slice("jobs_total:".length));
+  // jobs_wf:<workflow>:<status> → two labels (workflow, status) for flexible querying.
+  const wfRows = byPrefix("jobs_wf:");
+  if (wfRows.length) {
+    help("mill_jobs_by_workflow_total", "Jobs finished by workflow + status", "counter");
+    for (const [k, v] of wfRows) {
+      const rest = k.slice("jobs_wf:".length); const i = rest.lastIndexOf(":");
+      lines.push(`mill_jobs_by_workflow_total{workflow="${rest.slice(0, i)}",status="${rest.slice(i + 1)}"} ${num(v)}`);
+    }
+  }
+  counterFamily("mill_triggered_total", "Jobs enqueued by trigger type", "triggered:", "trigger", (k) => k.slice("triggered:".length));
+  counterFamily("mill_reconcile_total", "Reconcile passes by result", "reconcile_total:", "result", (k) => k.slice("reconcile_total:".length));
+  counterFamily("mill_ingress_total", "Ingress requests by outcome", "ingress_total:", "outcome", (k) => k.slice("ingress_total:".length));
+  if (counters["retries_total"]) { help("mill_retries_total", "Run-level retries", "counter"); lines.push(`mill_retries_total ${num(counters["retries_total"])}`); }
+  if (counters["ingress_auth_failures_total"]) { help("mill_ingress_auth_failures_total", "Ingress bearer auth failures", "counter"); lines.push(`mill_ingress_auth_failures_total ${num(counters["ingress_auth_failures_total"])}`); }
+
+  // ── histograms (cumulative buckets + _sum + _count → real p50/p95/p99 in Prometheus) ──
+  const histogram = (metric: string, h: string, name: string) => {
+    if (!counters[`${name}_count`]) return;
+    help(metric, h, "histogram");
+    for (const le of [...MillQueue.BUCKETS.map(String), "+Inf"]) lines.push(`${metric}_bucket{le="${le}"} ${num(counters[`${name}_bucket:${le}`])}`);
+    lines.push(`${metric}_sum ${num(counters[`${name}_sum`])}`, `${metric}_count ${num(counters[`${name}_count`])}`);
+  };
+  histogram("mill_job_duration_seconds", "Job execution duration", "job_duration_seconds");
+  histogram("mill_job_wait_seconds", "Schedule→start wait", "job_wait_seconds");
+
+  return c.text(lines.join("\n") + "\n", 200, { "content-type": "text/plain; version=0.0.4" });
+});
+
 // Fleet view: live workers (enriched), queue breakdown, and rolling execution stats.
 api.get("/fleet", async (c) => {
   const now = Date.now();
@@ -250,13 +426,69 @@ api.get("/fleet", async (c) => {
 // GitOps: current sync/health for the reconciled repo, and a manual reconcile trigger.
 api.get("/status", (c) => c.json(lastStatus ?? { pending: true, repo: PROJECT_REPO ?? null, source: PROJECT_REPO ? "git" : "dir" }));
 api.post("/reconcile", async (c) => {
-  const s = await doReconcile();
+  const s = await doReconcile(true); // a manual Sync always applies (force), regardless of autoSync
   return s ? c.json(s) : c.json({ error: "no PROJECT_REPO configured — reading from a mounted dir" }, 400);
 });
 
 api.get("/triggers", (c) => c.json(triggerEngine.summary()));
 
+// Recent runs for a workflow (newest first) — powers the editor's Run history.
+api.get("/projects/:id/workflows/:wf/runs", async (c) => {
+  const { id, wf } = c.req.param();
+  const runs = await q.recentRuns(`${id}/${wf}`, 20);
+  return c.json({ runs });
+});
+
+// Reconcile activity feed (newest first) for the project page.
+api.get("/reconcile-events", (c) => c.json({ events: reconcileLog }));
+
+// Tokenized ingress URLs for a project + its workflows (for the UI to show/copy).
+api.get("/projects/:id/endpoints", (c) => {
+  const { id } = c.req.param();
+  if (!existsSync(join(PROJECTS_DIR, id, "project.yaml"))) return c.json({ error: "project not found" }, 404);
+  const workflows = listWorkflows(join(PROJECTS_DIR, id)).map((w) => {
+    const custom: string[] = [];
+    try { const { def } = loadWorkflow(join(PROJECTS_DIR, id), w); for (const t of def.triggers) if (t.type === "webhook" && t.path) custom.push(`/p/w/${w}/${t.path}`); } catch { /* skip */ }
+    return { workflow: w, path: `/p/w/${w}/${id}`, customPaths: custom };
+  });
+  return c.json({ project: id, projectPath: `/p/${id}`, workflows, authRequired: !!tokenFor(id), perProjectToken: projectTokens.has(id) });
+});
+
+// What a Sync would apply: the name-status diff between the live and target revisions.
+api.get("/projects/:id/diff", async (c) => {
+  const { id } = c.req.param();
+  if (!repoState || !lastStatus) return c.json({ diff: [], synced: true });
+  const diff = await diffToApply(repoState, lastStatus.targetRevision, id).catch(() => []);
+  return c.json({
+    diff,
+    synced: lastStatus.sync === "Synced",
+    targetRevision: lastStatus.targetRevision,
+    syncedRevision: lastStatus.syncedRevision,
+  });
+});
+
 // Delete a workflow (script) — removes it from git and reconciles.
+// Register a new project: write <id>/project.yaml, commit, reconcile. v1 is single-repo,
+// folder-per-project, so a "new project" is a new folder in the tracked repo.
+api.post("/projects", async (c) => {
+  if (!repoState) return c.json({ error: "creating a project requires a git-backed workspace (PROJECT_REPO)" }, 400);
+  const body = await c.req.json().catch(() => ({}));
+  const id = String(body.id ?? "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$/.test(id)) return c.json({ error: "project id must be 2–40 chars: lowercase letters, digits, hyphens" }, 400);
+  if (existsSync(join(PROJECTS_DIR, id, "project.yaml"))) return c.json({ error: `project '${id}' already exists` }, 409);
+  const yaml = yamlStringify({
+    apiVersion: "mill/v1", kind: "Project", metadata: { name: id },
+    sync: { autoSync: body.autoSync ?? true, selfHeal: body.selfHeal ?? true, prune: body.prune ?? false },
+  });
+  try {
+    await writePaths(repoState, [{ path: `${id}/project.yaml`, content: yaml }], `create project ${id}`);
+    const s = await doReconcile();
+    return c.json({ created: id, status: s });
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+  }
+});
+
 // Author/edit a workflow: Save = commit. Serializes workflow.yaml + node .js files, but
 // validates the whole workflow FIRST (Zod + build) so the editor gets a 400 with issues
 // instead of pushing a broken commit. Then writes + pushes + reconciles.
@@ -337,8 +569,83 @@ app.post("/hooks/:project/:workflow", async (c) => {
   const dir = join(PROJECTS_DIR, project);
   if (!existsSync(join(dir, "workflows", workflow, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
   const body = await c.req.json().catch(() => ({}));
-  const jobId = enqueueJob(dir, workflow, (body && body.input) ?? body ?? {});
+  const jobId = enqueueJob(dir, workflow, (body && body.input) ?? body ?? {}, "webhook");
   return c.json({ jobId, via: "webhook" });
+});
+
+// ── Tokenized ingress (REST/HTTP) ────────────────────────────────────────────
+// Trigger a workflow from an external request: GET → query params as input; other methods
+// → JSON body (`{input}` or the whole body). `?wait=1` runs synchronously and returns the
+// result (bounded); otherwise returns `{ jobId }` immediately (webhook-style).
+async function ingressTrigger(c: Parameters<Parameters<typeof app.all>[1]>[0], project: string, workflow: string): Promise<Response> {
+  const dir = join(PROJECTS_DIR, project);
+  if (!existsSync(join(dir, "workflows", workflow, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
+  const url = new URL(c.req.url);
+  const method = c.req.method;
+  const headers: Record<string, string> = {};
+  c.req.raw.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+  const query = Object.fromEntries(url.searchParams.entries());
+  const contentType = (headers["content-type"] ?? "").toLowerCase();
+
+  // Capture the RAW body (so JS can parse ANY format + verify HMAC signatures), plus a
+  // best-effort parsed `input` for convenience. Real webhooks: JSON (Stripe/GitHub),
+  // form-urlencoded (Acuity/Twilio), XML, or anything else.
+  let raw = "";
+  let input: unknown = {};
+  if (method === "GET") {
+    input = query;
+  } else {
+    raw = await c.req.text().catch(() => "");
+    if (contentType.includes("json")) {
+      try { const b = JSON.parse(raw); input = (b && typeof b === "object" && "input" in b) ? b.input : b; } catch { input = {}; }
+    } else if (contentType.includes("form-urlencoded")) {
+      input = Object.fromEntries(new URLSearchParams(raw));
+    } else {
+      try { input = raw ? JSON.parse(raw) : {}; } catch { input = raw ? { raw } : {}; } // best-effort JSON, else raw text
+    }
+  }
+  const request = { method, contentType, headers, query, raw }; // → ctx.request in the workflow
+  const jobId = enqueueJob(dir, workflow, input, "webhook", request);
+  q.metricInc("ingress_total:ok").catch(() => {});
+  const wait = url.searchParams.get("wait");
+  if (wait === "1" || wait === "true") {
+    for (let i = 0; i < 150; i++) { // up to ~30s
+      await Bun.sleep(200);
+      const j = await q.getJob(jobId);
+      if (j.status === "succeeded" || j.status === "failed") {
+        return c.json({ jobId, status: j.status, result: j.result ? JSON.parse(j.result) : null, error: j.error || undefined }, j.status === "failed" ? 500 : 200);
+      }
+    }
+    return c.json({ jobId, status: "running", poll: `/api/jobs/${jobId}` }, 202);
+  }
+  return c.json({ jobId, status: "queued" }, 202);
+}
+
+// Per-workflow endpoint: the-mill.example.com/p/w/<workflow>/<path>  (path = project id, or a custom webhook token)
+app.all("/p/w/:workflow/:path", async (c) => {
+  const { workflow, path } = c.req.param();
+  const route = wfRoutes.get(`${workflow}/${path}`);
+  if (!route) return c.json({ error: `no workflow endpoint '/p/w/${workflow}/${path}'` }, 404);
+  const bad = bearerGuard(c, route.project); if (bad) return bad; // per-project token
+  return ingressTrigger(c, route.project, route.workflow);
+});
+
+// Per-project endpoint: GET lists exposed workflow URLs; POST triggers the sole/only workflow.
+app.get("/p/:path", (c) => {
+  const project = projRoutes.get(c.req.param("path"));
+  if (!project) return c.json({ error: "no such project endpoint" }, 404);
+  const bad = bearerGuard(c, project); if (bad) return bad;
+  const origin = new URL(c.req.url).origin;
+  const workflows = listWorkflows(join(PROJECTS_DIR, project)).map((w) => ({ workflow: w, url: `${origin}/p/w/${w}/${project}` }));
+  return c.json({ project, url: `${origin}/p/${project}`, workflows });
+});
+app.post("/p/:path", async (c) => {
+  const project = projRoutes.get(c.req.param("path"));
+  if (!project) return c.json({ error: "no such project endpoint" }, 404);
+  const bad = bearerGuard(c, project); if (bad) return bad;
+  const wfs = listWorkflows(join(PROJECTS_DIR, project));
+  if (wfs.length === 1) return ingressTrigger(c, project, wfs[0]);
+  return c.json({ error: "project exposes multiple workflows — POST to /p/w/<workflow>/" + project, workflows: wfs }, 400);
 });
 
 // ── static UIs (built on the host, copied into the image) ────────────────────
@@ -366,5 +673,5 @@ if (liveIndex) {
   app.get("/", (c) => c.html(consoleHtml)); // UI not built (dev) → raw console
 }
 
-console.log(`mill-api on :${PORT} · projects=${PROJECTS_DIR} · redis=${process.env.REDIS_URL ?? "redis://localhost:6379"} · ui=${liveIndex ? "live+prototype" : "console"}`);
+log.info("mill-api listening", { port: PORT, projects: PROJECTS_DIR, redis: process.env.REDIS_URL ?? "redis://localhost:6379", ui: liveIndex ? "live+prototype" : "console" });
 export default { port: PORT, fetch: app.fetch };

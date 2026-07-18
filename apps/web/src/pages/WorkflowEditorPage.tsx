@@ -16,7 +16,7 @@ import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
 import { JsEditor } from "../components/JsEditor";
 import { InfoTip, Tip } from "../components/InfoTip";
 import { Modal, DiffRow, Spec, useToast, Toast } from "../components/Kit";
-import { LIVE, triggerRun, streamEvents, getJob, getWorkflowGraph, saveWorkflow, testNode, type LiveGraph, type NodeTestResult } from "../lib/api";
+import { LIVE, triggerRun, streamEvents, getJob, getWorkflowGraph, saveWorkflow, testNode, getRuns, retryRun, getTimeline, getStatus, getFleet, type LiveGraph, type NodeTestResult, type LiveRun } from "../lib/api";
 
 const capW = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 type EditorProject = { id: string; name: string; branch: string; revision?: string; workflows?: Workflow[] };
@@ -51,6 +51,29 @@ function liveToWorkflow(name: string, g: LiveGraph): Workflow {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const DND_MIME = "application/mill-node-kind";
+function relTime(ms: number): string {
+  if (!ms) return "—";
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+function toRunRecord(r: LiveRun): RunRecord {
+  const st = (["queued", "running", "succeeded", "failed"].includes(r.status) ? r.status : "idle") as NodeStatus;
+  return {
+    id: r.id,
+    status: st,
+    trigger: ((r.trigger as RunRecord["trigger"]) || "manual"),
+    revision: (r.revision || "").slice(0, 7) || "—",
+    startedAt: relTime(Number(r.createdAt || 0)),
+    durationMs: Number(r.ms || 0),
+    nodeTimings: [],
+    error: r.error ? { node: "", message: r.error } : undefined,
+  };
+}
+
 const DEFAULT_JS = `export default async function step(input, ctx) {
   // input = upstream output · ctx = Mill SDK (ctx.log, ctx.secrets, …)
   return input;
@@ -108,6 +131,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
   const [input, setInput] = useState('{ "since": "2026-07-01" }');
   const [showCommit, setShowCommit] = useState(false);
   const [selectedRun, setSelectedRun] = useState<string | null>(workflow?.runs?.[0]?.id ?? null);
+  const [liveRuns, setLiveRuns] = useState<RunRecord[]>([]);
   const [rf, setRf] = useState<ReactFlowInstance | null>(null);
   const dropCounter = useRef(0);
   const { toast, flash } = useToast();
@@ -119,7 +143,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
         id: n.key,
         type: "mill",
         position: n.position,
-        data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, status: "idle" as NodeStatus },
+        data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, inputSchema: n.inputSchema, outputSchema: n.outputSchema, status: "idle" as NodeStatus },
       })),
     [workflow],
   );
@@ -150,6 +174,33 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [logs]);
+
+  // Live Run history: poll recent runs for this workflow from the controller.
+  useEffect(() => {
+    if (!LIVE) return;
+    let on = true;
+    const load = () => getRuns(project.id, workflow.id)
+      .then((r) => { if (on) setLiveRuns(r.runs.map(toRunRecord)); })
+      .catch(() => {});
+    load();
+    const t = setInterval(load, 5000);
+    return () => { on = false; clearInterval(t); };
+  }, [project.id, workflow.id]);
+
+  const runs: RunRecord[] = LIVE ? liveRuns : (workflow.runs ?? []);
+  useEffect(() => { if (LIVE && liveRuns.length && !liveRuns.some((r) => r.id === selectedRun)) setSelectedRun(liveRuns[0].id); }, [liveRuns, selectedRun]);
+
+  // When a run is selected in live mode, fetch its per-node timeline for the Run detail spans.
+  useEffect(() => {
+    if (!LIVE || !selectedRun) return;
+    let on = true;
+    getTimeline(selectedRun).then((t) => {
+      if (!on) return;
+      const timings = t.nodeTimings.map((n) => ({ key: n.key, status: (n.status === "skipped" ? "idle" : n.status) as NodeStatus, ms: n.ms }));
+      setLiveRuns((rs) => rs.map((r) => (r.id === selectedRun ? { ...r, nodeTimings: timings, error: t.error ?? r.error } : r)));
+    }).catch(() => {});
+    return () => { on = false; };
+  }, [selectedRun]);
 
   const onConnect = useCallback(
     (c: Connection) => {
@@ -207,6 +258,34 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
     [setNodes, flash],
   );
 
+  const setCall = useCallback(
+    (id: string, call: WorkflowNode["call"]) => {
+      setNodes((nds) => nds.map((n) => (n.id === id ? { ...n, data: { ...n.data, call } } : n)));
+      flash("Call target updated (draft) — Save to commit");
+    },
+    [setNodes, flash],
+  );
+
+  const setSchema = useCallback(
+    (id: string, which: "inputSchema" | "outputSchema", value: string) => {
+      setNodes((nds) => nds.map((n) => (n.id === id ? { ...n, data: { ...n.data, [which]: value || undefined } } : n)));
+    },
+    [setNodes],
+  );
+
+  // Live: the other workflows in this project — the in-project call targets.
+  const [callTargets, setCallTargets] = useState<{ id: string; name: string }[]>([]);
+  useEffect(() => {
+    if (!LIVE) return;
+    let on = true;
+    getStatus().then((s) => {
+      if (!on) return;
+      const proj = s.projects?.find((p) => p.id === project.id);
+      setCallTargets((proj?.workflows ?? []).map((w) => ({ id: w.name, name: capW(w.name) })).filter((w) => w.id !== workflow.id));
+    }).catch(() => {});
+    return () => { on = false; };
+  }, [project.id, workflow.id]);
+
   const [saving, setSaving] = useState(false);
   const [commitMsg, setCommitMsg] = useState(`Update ${workflow.id}`);
 
@@ -221,6 +300,8 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       if (kind === "callScript") node.call = d.call;
       if (kind === "loop") { node.each = (d.each as string) || "input"; if (d.filename) node.file = d.filename; else if (d.call) node.call = d.call; }
       if (d.deps && Object.keys(d.deps as object).length) node.deps = d.deps; // external npm deps
+      if (d.inputSchema) node.inputSchema = d.inputSchema; // enforced JS predicates
+      if (d.outputSchema) node.outputSchema = d.outputSchema;
       return node;
     });
     const defEdges = edges.map((e) => {
@@ -264,7 +345,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
 
   const addLog = (line: string) => setLogs((l) => [...l, line]);
   // The node designated to fail on a Degraded run (the last failed run's offending node).
-  const failNodeKey = workflow.runs?.find((r) => r.status === "failed")?.error?.node;
+  const failNodeKey = runs.find((r) => r.status === "failed")?.error?.node;
 
   async function run() {
     if (running || !workflow) return;
@@ -340,7 +421,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
     );
   }
 
-  const activeRun = workflow.runs?.find((r) => r.id === selectedRun) ?? null;
+  const activeRun = runs.find((r) => r.id === selectedRun) ?? null;
 
   return (
     <div className="space-y-4" data-testid="workflow-editor">
@@ -429,9 +510,12 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               workflow={workflow}
               projectId={project.id}
               projectWorkflows={project.workflows ?? []}
+              callTargets={callTargets}
               onEdit={flash}
               onApplyCode={applyCode}
               onSetDeps={setDeps}
+              onSetCall={setCall}
+              onSetSchema={setSchema}
             />
           </div>
         }
@@ -494,7 +578,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
 
       {/* triggers + observability */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <TriggersPanel workflow={workflow} onCopy={() => flash("Webhook URL copied")} />
+        <TriggersPanel workflow={workflow} projectId={project.id} onCopy={(url) => { navigator.clipboard?.writeText(url).catch(() => {}); flash("Webhook URL copied"); }} />
         <ObservabilityPanel onOpen={(dest) => flash(`Opening ${dest} …`)} />
       </div>
 
@@ -507,7 +591,8 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
         </h2>
         <div className="mt-3 grid grid-cols-1 gap-4 lg:grid-cols-2">
           <div className="space-y-1.5">
-            {(workflow.runs ?? []).map((r) => (
+            {runs.length === 0 && <p className="text-xs text-slate-500" data-testid="no-runs">No runs yet — hit Run to execute this workflow.</p>}
+            {runs.map((r) => (
               <button
                 key={r.id}
                 data-testid={`run-row-${r.id}`}
@@ -526,7 +611,11 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               </button>
             ))}
           </div>
-          {activeRun && <RunDetail run={activeRun} onRetry={(node) => flash(`Retry queued from “${node}” · journaling skips completed nodes`)} />}
+          {activeRun && <RunDetail run={activeRun} onRetry={async () => {
+            if (!LIVE) { flash("Retry queued · journaling skips completed nodes"); return; }
+            try { const { jobId } = await retryRun(activeRun.id); flash(`Retrying → ${jobId}`); setTimeout(() => getRuns(project.id, workflow.id).then((r) => setLiveRuns(r.runs.map(toRunRecord))).catch(() => {}), 800); }
+            catch (e) { flash(`Retry failed: ${e instanceof Error ? e.message : String(e)}`); }
+          }} />}
         </div>
       </div>
 
@@ -678,12 +767,15 @@ type InspectorProps = {
   workflow: Workflow;
   projectId: string;
   projectWorkflows: Workflow[];
+  callTargets: { id: string; name: string }[];
   onEdit: (msg: string) => void;
   onApplyCode: (id: string, code: string) => void;
   onSetDeps: (id: string, deps: Record<string, string>) => void;
+  onSetCall: (id: string, call: WorkflowNode["call"]) => void;
+  onSetSchema: (id: string, which: "inputSchema" | "outputSchema", value: string) => void;
 };
 
-function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkflows, onEdit, onApplyCode, onSetDeps }: InspectorProps) {
+function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkflows, callTargets, onEdit, onApplyCode, onSetDeps, onSetCall, onSetSchema }: InspectorProps) {
   const [tab, setTab] = useState<JsTab>("code");
   if (!selected) return <p className="mt-3 text-sm text-slate-500">Select a node in the graph.</p>;
   const mock = workflow.nodes.find((n) => n.key === selected);
@@ -707,8 +799,9 @@ function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkfl
         {kind === "start" && <StartPanel node={mock} />}
         {kind === "end" && <EndPanel node={mock} />}
         {kind === "if" && <IfPanel node={mock} onEdit={onEdit} />}
-        {kind === "callScript" && <CallPanel node={mock} workflow={workflow} projectWorkflows={projectWorkflows} onEdit={onEdit} />}
-        {kind === "jscode" && <JsPanel node={mock} file={jsFile} code={jsCode} tab={tab} setTab={setTab} onApply={(c) => onApplyCode(selected, c)} />}
+        {kind === "callScript" && <CallPanel node={mock} liveCall={liveData.call as WorkflowNode["call"]} workflow={workflow} projectWorkflows={projectWorkflows} callTargets={callTargets} onSetCall={(call) => onSetCall(selected, call)} onEdit={onEdit} />}
+        {kind === "jscode" && <JsPanel node={mock} file={jsFile} code={jsCode} tab={tab} setTab={setTab} onApply={(c) => onApplyCode(selected, c)}
+          inputSchema={(liveData.inputSchema as string) ?? mock?.inputSchema ?? ""} outputSchema={(liveData.outputSchema as string) ?? mock?.outputSchema ?? ""} onSetSchema={(w, v) => onSetSchema(selected, w, v)} />}
         {kind === "loop" && (
           <LoopPanel
             node={mock}
@@ -719,9 +812,12 @@ function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkfl
             hasFile={!!(mock?.file ?? liveData.filename)}
             workflow={workflow}
             projectWorkflows={projectWorkflows}
+            callTargets={callTargets}
             tab={tab}
             setTab={setTab}
             onApply={(c) => onApplyCode(selected, c)}
+            onSetCall={(call) => onSetCall(selected, call)}
+            onSetSchema={(w, v) => onSetSchema(selected, w, v)}
             onEdit={onEdit}
           />
         )}
@@ -916,28 +1012,49 @@ function IfPanel({ node, onEdit }: { node?: WorkflowNode; onEdit: (m: string) =>
   );
 }
 
-function CallPanel({ node, workflow, projectWorkflows, onEdit }: { node?: WorkflowNode; workflow: Workflow; projectWorkflows: Workflow[]; onEdit: (m: string) => void }) {
-  const call = node?.call;
-  const siblings = projectWorkflows.filter((w) => w.id !== workflow.id);
+function CallPanel({ node, liveCall, workflow, projectWorkflows, callTargets, onSetCall, onEdit }: { node?: WorkflowNode; liveCall?: WorkflowNode["call"]; workflow: Workflow; projectWorkflows: Workflow[]; callTargets: { id: string; name: string }[]; onSetCall: (call: WorkflowNode["call"]) => void; onEdit: (m: string) => void }) {
+  const call = liveCall ?? node?.call; // prefer live (edited) data so a new selection renders immediately
+  // In-project targets: the live list (other workflows in this project), or the mock siblings.
+  const siblings = callTargets.length ? callTargets : projectWorkflows.filter((w) => w.id !== workflow.id).map((w) => ({ id: w.id, name: w.name }));
+  const currentValue = call?.standalone ? "__standalone__" : call?.workflow ? call.workflow : "";
+  const onChange = (v: string) => {
+    if (v === "__standalone__") onSetCall({ workflow: "", ref: "", standalone: true });
+    else if (v) onSetCall({ workflow: v, ref: `workflows/${v}` }); // in-project call
+    onEdit("Call target updated (draft) — Save to commit");
+  };
   return (
     <div className="space-y-3 text-xs" data-testid="panel-callscript">
       <p className="text-slate-400">Invoke another script as a step. It runs like any other node — its output becomes this step’s output.</p>
       <label className="block">
         <div className="mb-1 flex items-center gap-1.5 text-slate-400">Target script <InfoTip text="Pick a workflow in this project, or reference a standalone/remote script. This is how you compose scripts and pull in remote components." /></div>
-        <select className="inp" defaultValue={call?.standalone ? "__standalone__" : call?.project && call.project !== workflow.id ? `__ext__${call.workflow}` : call?.workflow ?? "__standalone__"} onChange={() => onEdit("Call target updated (draft)")} data-testid="call-target">
+        <select className="inp" value={currentValue} onChange={(e) => onChange(e.target.value)} data-testid="call-target">
+          <option value="" disabled>Select a workflow…</option>
           <optgroup label="This project">
-            {siblings.map((w) => <option key={w.id} value={w.name}>{w.name}</option>)}
+            {siblings.length ? siblings.map((w) => <option key={w.id} value={w.id}>{w.name}</option>) : <option value="" disabled>(no other workflows)</option>}
           </optgroup>
           <optgroup label="Other / remote">
-            {call?.project && call.project !== workflow.id && <option value={`__ext__${call.workflow}`}>{call.workflow} · {call.project}</option>}
             <option value="__standalone__">Standalone / remote script…</option>
           </optgroup>
         </select>
       </label>
-      {call && (
-        <div className="rounded-lg border border-white/5 bg-ink-950/50 p-2">
+      {call?.standalone && (
+        <div className="space-y-2 rounded-lg border border-cyan-400/20 bg-cyan-500/[0.04] p-2" data-testid="standalone-fields">
+          <label className="block">
+            <div className="mb-1 text-[11px] text-slate-400">Bundle ref <InfoTip text="A Mill export bundle: an https:// URL to a .tgz, or std://<path>@<version> resolved against MILL_STD_REGISTRY. It's fetched, cached, and run (run.sh installs its deps)." /></div>
+            <input data-testid="call-ref" className="inp font-mono text-[11px]" placeholder="std://acme/notify@v2  or  https://…/bundle.tgz" value={call.ref ?? ""}
+              onChange={(e) => onSetCall({ workflow: call.workflow ?? "", ref: e.target.value, standalone: true })} />
+          </label>
+          <label className="block">
+            <div className="mb-1 text-[11px] text-slate-400">Workflow in the bundle</div>
+            <input data-testid="call-workflow" className="inp font-mono text-[11px]" placeholder="e.g. notify" value={call.workflow ?? ""}
+              onChange={(e) => onSetCall({ workflow: e.target.value, ref: call.ref ?? "", standalone: true })} />
+          </label>
+        </div>
+      )}
+      {call && (call.workflow || call.standalone) && (
+        <div className="rounded-lg border border-white/5 bg-ink-950/50 p-2" data-testid="call-summary">
           <div className="flex items-center gap-2">
-            <span className="font-mono text-cyanx">{call.workflow || "(unset)"}</span>
+            <span className="font-mono text-cyanx">{call.workflow || "(pick a workflow)"}</span>
             <span className={`chip px-1.5 py-0 text-[10px] ${call.standalone ? "bg-cyan-500/15 text-cyanx" : "bg-white/5 text-slate-400"}`}>
               {call.standalone ? "standalone / remote" : call.project ? `project: ${call.project}` : "in-project"}
             </span>
@@ -951,7 +1068,7 @@ function CallPanel({ node, workflow, projectWorkflows, onEdit }: { node?: Workfl
 }
 
 type JsTab = "code" | "schema" | "context" | "isolation";
-function JsPanel({ node, file, code, tab, setTab, onApply }: { node?: WorkflowNode; file: string; code: string; tab: JsTab; setTab: (t: JsTab) => void; onApply: (code: string) => void }) {
+function JsPanel({ node, file, code, tab, setTab, onApply, inputSchema, outputSchema, onSetSchema }: { node?: WorkflowNode; file: string; code: string; tab: JsTab; setTab: (t: JsTab) => void; onApply: (code: string) => void; inputSchema: string; outputSchema: string; onSetSchema: (which: "inputSchema" | "outputSchema", value: string) => void }) {
   return (
     <div>
       <div className="mt-1 flex flex-wrap gap-1" data-testid="inspector-tabs">
@@ -969,8 +1086,9 @@ function JsPanel({ node, file, code, tab, setTab, onApply }: { node?: WorkflowNo
         )}
         {tab === "schema" && (
           <div className="space-y-3 text-xs" data-testid="tab-panel-schema">
-            <SchemaBox label="input" value={node?.inputSchema ?? "any"} tip="Validated inputs (Kestra-style). The compiler checks every edge feeds a real node — stronger than FK integrity." />
-            <SchemaBox label="output" value={node?.outputSchema ?? "any"} tip="Becomes the `input` of the downstream node." />
+            <p className="text-[11px] text-slate-500">A JS boolean expression, <strong>enforced at runtime</strong>. Input checked before the node runs (over <span className="font-mono">input</span>); output after (over <span className="font-mono">output</span>). A falsy result fails the node. Leave blank to skip.</p>
+            <SchemaEdit label="inputSchema" placeholder="e.g. Array.isArray(input.items)" value={inputSchema} onChange={(v) => onSetSchema("inputSchema", v)} />
+            <SchemaEdit label="outputSchema" placeholder="e.g. typeof output.total === 'number'" value={outputSchema} onChange={(v) => onSetSchema("outputSchema", v)} />
             <div className="rounded-lg border border-white/5 bg-ink-950/40 p-2 text-slate-500"><span className="font-medium text-slate-400">Fan-in:</span> a node with multiple parents reads <span className="font-mono text-slate-300">ctx.inputs[nodeKey]</span>.</div>
           </div>
         )}
@@ -1015,9 +1133,9 @@ function JsPanel({ node, file, code, tab, setTab, onApply }: { node?: WorkflowNo
   );
 }
 
-function LoopPanel({ node, each, call, file, code, hasFile, workflow, projectWorkflows, tab, setTab, onApply, onEdit }: {
+function LoopPanel({ node, each, call, file, code, hasFile, workflow, projectWorkflows, callTargets, tab, setTab, onApply, onSetCall, onSetSchema, onEdit }: {
   node?: WorkflowNode; each: string; call?: WorkflowNode["call"]; file: string; code: string; hasFile: boolean;
-  workflow: Workflow; projectWorkflows: Workflow[]; tab: JsTab; setTab: (t: JsTab) => void; onApply: (code: string) => void; onEdit: (m: string) => void;
+  workflow: Workflow; projectWorkflows: Workflow[]; callTargets: { id: string; name: string }[]; tab: JsTab; setTab: (t: JsTab) => void; onApply: (code: string) => void; onSetCall: (call: WorkflowNode["call"]) => void; onSetSchema: (which: "inputSchema" | "outputSchema", value: string) => void; onEdit: (m: string) => void;
 }) {
   // A loop body is a per-item JS Code file (hasFile) OR a per-item Call Script.
   const isCall = !hasFile && !!call?.workflow;
@@ -1043,8 +1161,9 @@ function LoopPanel({ node, each, call, file, code, hasFile, workflow, projectWor
       </div>
 
       {isCall
-        ? <CallPanel node={node} workflow={workflow} projectWorkflows={projectWorkflows} onEdit={onEdit} />
-        : <JsPanel node={node} file={file} code={code} tab={tab} setTab={setTab} onApply={onApply} />}
+        ? <CallPanel node={node} liveCall={call} workflow={workflow} projectWorkflows={projectWorkflows} callTargets={callTargets} onSetCall={onSetCall} onEdit={onEdit} />
+        : <JsPanel node={node} file={file} code={code} tab={tab} setTab={setTab} onApply={onApply}
+            inputSchema={node?.inputSchema ?? ""} outputSchema={node?.outputSchema ?? ""} onSetSchema={onSetSchema} />}
     </div>
   );
 }
@@ -1061,6 +1180,21 @@ function SchemaBox({ label, value, tip }: { label: string; value: string; tip: s
       <div className="mb-1 flex items-center gap-1.5 text-slate-400">{label} <InfoTip text={tip} /></div>
       <pre className="overflow-x-auto rounded-lg border border-white/5 bg-ink-950/60 p-2 font-mono text-[11px] text-slate-300">{value}</pre>
     </div>
+  );
+}
+function SchemaEdit({ label, value, placeholder, onChange }: { label: string; value: string; placeholder: string; onChange: (v: string) => void }) {
+  return (
+    <label className="block">
+      <div className="mb-1 font-mono text-[11px] text-slate-400">{label}</div>
+      <input
+        data-testid={`schema-${label}`}
+        value={value}
+        placeholder={placeholder}
+        spellCheck={false}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-lg border border-white/10 bg-ink-950/70 p-2 font-mono text-[11px] text-slate-200 outline-none focus:border-brand-500/50"
+      />
+    </label>
   );
 }
 function CtxRow({ sym, desc }: { sym: string; desc: string }) {
@@ -1080,24 +1214,28 @@ function TriggerIcon({ type }: { type: string }) {
   return type === "cron" ? <Clock className="h-3.5 w-3.5" /> : type === "webhook" ? <Webhook className="h-3.5 w-3.5" /> : type === "event" ? <Zap className="h-3.5 w-3.5" /> : <Hand className="h-3.5 w-3.5" />;
 }
 
-function TriggersPanel({ workflow, onCopy }: { workflow: Workflow; onCopy: () => void }) {
+function TriggersPanel({ workflow, projectId, onCopy }: { workflow: Workflow; projectId: string; onCopy: (url: string) => void }) {
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const hookUrl = `${origin}/p/w/${workflow.id}/${projectId}`; // tokenized ingress URL (bearer required)
   return (
     <div className="card p-4" data-testid="triggers-panel">
       <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
-        Triggers <InfoTip text="How runs start. Cron (app-level BullMQ repeatable jobs by default), webhook (Ingress route), manual, or an event (e.g. called by another script)." /> <Spec doc="ARCH §8" />
+        Triggers <InfoTip text="How runs start. Cron (app-level BullMQ repeatable jobs by default), webhook (a tokenized ingress URL on this host — POST with a Bearer token), manual, or an event (called by another script)." /> <Spec doc="ARCH §8" />
       </h2>
       <div className="mt-3 space-y-2">
         {workflow.triggers.map((t, i) => (
           <div key={i} className="flex items-center justify-between gap-2 rounded-lg border border-white/5 bg-ink-950/40 px-3 py-2 text-xs">
-            <span className="flex items-center gap-2 text-slate-300">
+            <span className="flex min-w-0 items-center gap-2 text-slate-300">
               <TriggerIcon type={t.type} />
               <span className="font-medium capitalize">{t.type}</span>
-              {t.detail && <span className="font-mono text-slate-400">{t.detail}</span>}
+              {t.type === "webhook"
+                ? <span className="truncate font-mono text-[10px] text-slate-500">{hookUrl}</span>
+                : t.detail && <span className="font-mono text-slate-400">{t.detail}</span>}
             </span>
-            <span className="flex items-center gap-2 text-slate-500">
+            <span className="flex shrink-0 items-center gap-2 text-slate-500">
               {t.type === "cron" && t.nextRun && <span className="chip bg-white/5 text-slate-400">next {t.nextRun}</span>}
               {t.type === "webhook" && (
-                <button className="chip bg-white/5 text-slate-400 hover:text-slate-200" onClick={onCopy} data-testid="copy-webhook"><Copy className="h-3 w-3" /> copy URL</button>
+                <button className="chip bg-white/5 text-slate-400 hover:text-slate-200" onClick={() => onCopy(hookUrl)} data-testid="copy-webhook"><Copy className="h-3 w-3" /> copy URL</button>
               )}
               {t.concurrencyPolicy && <span className="font-mono text-[10px] text-slate-600">{t.concurrencyPolicy}</span>}
             </span>
@@ -1110,29 +1248,46 @@ function TriggersPanel({ workflow, onCopy }: { workflow: Workflow; onCopy: () =>
 
 // ── Observability panel ──────────────────────────────────────────────────────
 function ObservabilityPanel({ onOpen }: { onOpen: (dest: string) => void }) {
+  const [m, setM] = useState<import("../lib/api").FleetData | null>(null);
+  useEffect(() => {
+    if (!LIVE) return;
+    let on = true;
+    const load = () => getFleet().then((d) => { if (on) setM(d); }).catch(() => {});
+    load(); const t = setInterval(load, 5000);
+    return () => { on = false; clearInterval(t); };
+  }, []);
+  const stat = (label: string, value: string) => (
+    <div className="rounded-lg border border-white/5 bg-ink-950/40 p-2">
+      <div className="text-[10px] text-slate-500">{label}</div>
+      <div className="mt-0.5 font-mono text-sm text-slate-200">{value}</div>
+    </div>
+  );
   return (
     <div className="card p-4" data-testid="observability-panel">
       <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
         <AreaChart className="h-4 w-4 text-slate-400" /> Observability
-        <InfoTip text="Mill stores no history itself — everything historical is logged/traced. Logs → Loki, metrics → Prometheus, traces → Tempo, all via Alloy, visualized in Grafana." />
+        {LIVE && m && <span className="chip bg-emerald-500/15 text-[10px] text-emerald-300">live metrics</span>}
+        <InfoTip text="Live metrics come from GET /api/metrics (Prometheus format). Logs are structured JSON (Loki-ready). In production Alloy scrapes /metrics + tails logs → Prometheus/Loki/Tempo, visualized in Grafana." />
         <Spec doc="ARCH §3.6" />
       </h2>
+      {LIVE && m ? (
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3" data-testid="obs-metrics">
+          {stat("queue depth", String(m.queueDepth))}
+          {stat("throughput/min", String(m.stats.throughputPerMin))}
+          {stat("p50 / p95", `${m.stats.p50Ms} / ${m.stats.p95Ms}ms`)}
+          {stat("success", `${m.stats.successRatePct}%`)}
+          {stat("completed/hr", String(m.stats.completedLastHour))}
+          {stat("workers", String(m.workers.length))}
+        </div>
+      ) : (
+        <div className="mt-3 flex flex-wrap gap-1.5 text-[10px]">
+          {["queue depth", "job rate", "p95 duration", "workers", "sync rate"].map((x) => <span key={x} className="chip bg-white/5 text-slate-400">{x}</span>)}
+        </div>
+      )}
       <div className="mt-3 flex flex-wrap gap-2">
+        <a className="btn-ghost text-xs" href="/api/metrics" target="_blank" rel="noreferrer" data-testid="open-metrics">Raw /metrics</a>
         {["Grafana", "Loki logs", "Tempo trace"].map((d) => (
           <button key={d} className="btn-ghost text-xs" onClick={() => onOpen(d)} data-testid={`open-${d.split(" ")[0].toLowerCase()}`}>{d}</button>
-        ))}
-      </div>
-      <div className="mt-3 rounded-lg border border-white/5 bg-ink-950/40 p-3">
-        <div className="mb-2 text-xs text-slate-400">Trace — a run is one trace, each node a span</div>
-        <div className="space-y-1">
-          <SpanBar label="fetch" w="45%" ml="0%" />
-          <SpanBar label="transform" w="12%" ml="45%" />
-          <SpanBar label="load" w="40%" ml="57%" />
-        </div>
-      </div>
-      <div className="mt-3 flex flex-wrap gap-1.5 text-[10px]">
-        {["queue depth", "job rate", "p95 duration", "per-job mem/cpu", "sync rate"].map((m) => (
-          <span key={m} className="chip bg-white/5 text-slate-400">{m}</span>
         ))}
       </div>
     </div>
@@ -1156,7 +1311,12 @@ function RunDetail({ run, onRetry }: { run: RunRecord; onRetry: (node: string) =
     <div className="rounded-lg border border-white/5 bg-ink-950/40 p-3" data-testid="run-detail">
       <div className="flex items-center justify-between text-xs">
         <span className="flex items-center gap-2"><StatusPill status={run.status} /><span className="font-mono text-slate-400">{run.id}</span></span>
-        <span className="text-slate-500">{run.durationMs ? `${(run.durationMs / 1000).toFixed(1)}s` : "—"}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-slate-500">{run.durationMs ? `${(run.durationMs / 1000).toFixed(1)}s` : "—"}</span>
+          <button className="btn-ghost !py-1 text-xs" data-testid="rerun-btn" onClick={() => onRetry(run.error?.node ?? "")}>
+            <RotateCcw className="h-3.5 w-3.5" /> Re-run
+          </button>
+        </div>
       </div>
       <div className="mt-3 space-y-1.5">
         {run.nodeTimings.map((t) => (

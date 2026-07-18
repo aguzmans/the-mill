@@ -1,0 +1,11 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: send-confirmation }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: send, kind: jscode, name: send-confirmation, file: nodes/send.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: send }
+  - { from: send, to: end }

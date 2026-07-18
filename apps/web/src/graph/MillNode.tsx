@@ -1,5 +1,5 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import { Play, Flag, Split, Code2, ExternalLink, Repeat, Loader2, CheckCircle2, XCircle } from "lucide-react";
+import { Play, Flag, Split, Code2, ExternalLink, Repeat, GitFork, Loader2, CheckCircle2, XCircle } from "lucide-react";
 import type { NodeStatus, NodeKind } from "../lib/mock";
 
 const statusRing: Record<NodeStatus, string> = {
@@ -17,6 +17,7 @@ export const kindAccent: Record<NodeKind, { text: string; border: string; bg: st
   if: { text: "text-amber-300", border: "border-amber-400/40", bg: "bg-amber-500/10", dot: "!bg-amber-400" },
   callScript: { text: "text-cyanx", border: "border-cyan-400/40", bg: "bg-cyan-500/10", dot: "!bg-cyanx" },
   loop: { text: "text-fuchsia-300", border: "border-fuchsia-400/40", bg: "bg-fuchsia-500/10", dot: "!bg-fuchsia-400" },
+  fanout: { text: "text-sky-300", border: "border-sky-400/40", bg: "bg-sky-500/10", dot: "!bg-sky-400" },
   end: { text: "text-slate-300", border: "border-slate-400/30", bg: "bg-slate-500/10", dot: "!bg-slate-400" },
 };
 
@@ -28,6 +29,7 @@ export function KindIcon({ kind, className }: { kind: NodeKind; className?: stri
     case "if": return <Split className={cls} />;
     case "callScript": return <ExternalLink className={cls} />;
     case "loop": return <Repeat className={cls} />;
+    case "fanout": return <GitFork className={cls} />;
     case "end": return <Flag className={cls} />;
   }
 }
@@ -125,6 +127,9 @@ export function MillNode({ data, selected }: NodeProps) {
             → {data.filename ? (data.filename as string) : call?.workflow ? `call ${call.workflow}` : "pick a body"}
           </div>
         </div>
+      ) : null}
+      {kind === "fanout" ? (
+        <div className="mt-1 truncate font-mono text-[10px] text-sky-200/80">→ dispatch ({(data.each as string) || "input"}) · parallel</div>
       ) : null}
       {sourceHandle}
     </div>

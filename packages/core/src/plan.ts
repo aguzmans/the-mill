@@ -17,6 +17,9 @@ export interface PlanNode {
   condition?: string; // if: the compiled boolean expression
   call?: CallTarget; // callScript (or loop-with-callScript-body): the invocation target
   each?: string; // loop: JS expression selecting the array to iterate (over `input`/`ctx`)
+  retry?: { maxAttempts: number; backoffMs?: number; jitter?: boolean }; // per-node retry policy
+  inputSchema?: string; // JS boolean expr over `input` — enforced before the node runs
+  outputSchema?: string; // JS boolean expr over `output` — enforced after the node runs
   secrets?: string[]; // declared secret refs exposed to this node's sandbox
   parents: string[]; // upstream node keys
   children: PlanEdge[]; // downstream edges

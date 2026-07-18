@@ -4,11 +4,22 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
 export type LogFields = Record<string, unknown>;
 
+/** The originating HTTP request for a webhook-triggered run — so a node can parse ANY body
+ *  format (JSON/form/XML/raw) and verify provider signatures (HMAC over `raw` + `headers`). */
+export interface RequestCtx {
+  method: string;
+  contentType: string;
+  headers: Record<string, string>; // lowercased header names
+  query: Record<string, string>;
+  raw: string; // the exact raw body (needed for signature verification)
+}
+
 export interface Ctx {
   log: Record<LogLevel, (message: string, fields?: LogFields) => void>;
   secrets: Record<string, string>;
   inputs: Record<string, unknown>;
   state: Record<string, unknown>;
+  request?: RequestCtx; // present on webhook-triggered runs
 }
 
 export type RunEvent =
@@ -25,6 +36,8 @@ export interface MakeCtxOpts {
   /** Shared state store (survives retries; scoped to the run). */
   state: Record<string, unknown>;
   onEvent?: (e: RunEvent) => void;
+  /** The originating HTTP request (webhook runs only). */
+  request?: RequestCtx;
 }
 
 /**
@@ -44,5 +57,6 @@ export function makeCtx(opts: MakeCtxOpts): Ctx {
     secrets,
     inputs: opts.inputs,
     state: opts.state,
+    ...(opts.request ? { request: opts.request } : {}),
   };
 }

@@ -28,6 +28,9 @@ export const Git = {
   add: (dir: string) => git(["add", "-A"], dir),
   commit: (dir: string, message: string) => git(["-c", "user.email=mill@local", "-c", "user.name=Mill", "commit", "-q", "-m", message], dir),
   push: (dir: string, branch: string) => git(["push", "-q", "origin", branch], dir),
+  /** name-status diff between two revisions, optionally scoped to a subpath. */
+  diffNameStatus: (dir: string, from: string, to: string, subpath?: string) =>
+    git(["diff", "--name-status", `${from}..${to}`, ...(subpath ? ["--", subpath] : [])], dir),
   worktreeAdd: (dir: string, path: string, sha: string) => git(["worktree", "add", "--quiet", "--detach", path, sha], dir),
   worktreeRemove: (dir: string, path: string) => git(["worktree", "remove", "--force", path], dir).catch(() => {}),
   short: (sha: string) => sha.slice(0, 7),

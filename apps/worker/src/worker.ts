@@ -2,6 +2,9 @@ import Redis from "ioredis";
 import os from "node:os";
 import { MillQueue, type JobSpec, type RunningJob } from "@mill/queue";
 import { runWorkflow, DockerExecutor, type Executor } from "@mill/executor";
+import { createLogger } from "@mill/telemetry";
+
+const log = createLogger("worker");
 
 // Stateless worker (ARCHITECTURE §3.5): register + heartbeat, pull jobs (never more than
 // it can carry), execute via the shared executor, stream per-node status/logs to Redis.
@@ -17,7 +20,13 @@ const concMax = Number(process.env.MILL_CONC_MAX ?? process.env.MILL_CONCURRENCY
 const memMaxMB = Number(process.env.MILL_MEM_MAX_MB ?? 1024);
 const pausePct = Number(process.env.MILL_PAUSE_PCT ?? 85);
 const resumePct = Number(process.env.MILL_RESUME_PCT ?? 70);
-const secrets: Record<string, string> = process.env.MILL_SECRETS ? JSON.parse(process.env.MILL_SECRETS) : {};
+// Node secrets can be supplied two ways (both work in k8s): the MILL_SECRETS JSON blob, OR
+// individual env vars (e.g. `envFrom` a k8s Secret). A node only ever sees the refs it
+// declares (makeCtx scrubs to `secrets: [...]`), so exposing the process env here is safe.
+const secrets: Record<string, string> = {
+  ...(process.env as Record<string, string>),
+  ...(process.env.MILL_SECRETS ? JSON.parse(process.env.MILL_SECRETS) : {}),
+};
 
 // Isolation: MILL_EXECUTOR=docker runs each job in its own hardened container.
 const isolate: Executor | null = process.env.MILL_EXECUTOR === "docker"
@@ -41,14 +50,21 @@ setInterval(() => beat().catch(() => {}), 3000);
 async function handle(spec: JobSpec, raw: string) {
   running.set(spec.id, { id: spec.id, workflow: spec.workflow, startedAt: Date.now() });
   await q.markRunning(spec.id, workerId);
-  const job = { projectDir: spec.projectDir, workflow: spec.workflow, input: spec.input, secrets, revision: spec.revision };
+  const job = { projectDir: spec.projectDir, workflow: spec.workflow, input: spec.input, secrets, revision: spec.revision, request: spec.request as import("@mill/sdk").RequestCtx | undefined };
   let res;
   if (isolate) {
     // Isolated in a container; replay the run's events to Redis once it finishes.
     res = await isolate.execute(job);
     for (const e of res.events ?? []) await q.publishEvent(spec.id, e as any).catch(() => {});
   } else {
-    res = await runWorkflow(job, (e) => { q.publishEvent(spec.id, e).catch(() => {}); });
+    // In-process: journal completed nodes so a requeued job (after a worker crash) resumes
+    // where it left off instead of re-doing finished work.
+    const journal = await q.journalGet(spec.id).catch(() => ({}));
+    res = await runWorkflow(job, (e) => { q.publishEvent(spec.id, e).catch(() => {}); }, {
+      journal,
+      onNodeDone: (k, o) => { q.journalSet(spec.id, k, o).catch(() => {}); },
+    });
+    if (res.status === "succeeded") await q.journalClear(spec.id).catch(() => {}); // done — drop the journal
   }
   await q.markDone(spec.id, res.status, {
     result: JSON.stringify(res.result ?? null),
@@ -59,10 +75,11 @@ async function handle(spec: JobSpec, raw: string) {
   });
   await q.publishEvent(spec.id, { type: "done", status: res.status, result: res.result ?? null, error: res.error ?? null });
   await q.ack(workerId, raw); // remove from processing only after it's done + recorded
+  log[res.status === "failed" ? "warn" : "info"]("job " + res.status, { job: spec.id, workflow: spec.workflow, ms: res.ms, executor: executorTier, error: res.error || undefined });
 }
 
 async function loop() {
-  console.log(`mill-worker ${workerId} online · concurrency ${concMin}-${concMax} · executor=${isolate ? "docker (isolated)" : "in-process"} · redis=${process.env.REDIS_URL ?? "redis://localhost:6379"}`);
+  log.info("worker online", { workerId, concMin, concMax, executor: executorTier, redis: process.env.REDIS_URL ?? "redis://localhost:6379" });
   await beat();
   while (true) {
     // Reactive gate: pause pulling above the memory threshold (never below min).
@@ -75,7 +92,7 @@ async function loop() {
     if (!job) continue;
     inFlight++;
     handle(job.spec, job.raw)
-      .catch((e) => console.error(`job ${job.spec.id} errored:`, e))
+      .catch((e) => log.error("job errored", { job: job.spec.id, error: e instanceof Error ? e.message : String(e) }))
       .finally(() => { inFlight--; running.delete(job.spec.id); });
   }
 }

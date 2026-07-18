@@ -7,7 +7,7 @@ import { SyncBadge, HealthBadge } from "../components/Badges";
 import { InfoTip, Tip } from "../components/InfoTip";
 import { Modal, Toggle, Spec, useToast, Toast } from "../components/Kit";
 import { useLiveStatus } from "../lib/useLive";
-import { deleteProject } from "../lib/api";
+import { LIVE, deleteProject, createProject } from "../lib/api";
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
@@ -24,6 +24,24 @@ export function WorkspacePage() {
     flash(`Deleting ${id}…`);
     try { await deleteProject(id); await reload(); flash(`Deleted ${id}`); }
     catch (e) { flash(`Delete failed: ${e instanceof Error ? e.message : String(e)}`); }
+  }
+
+  const [npId, setNpId] = useState("");
+  const [creating, setCreating] = useState(false);
+  async function onCreateProject() {
+    if (!LIVE) { setShowNew(false); flash("Project registered · reconciler will clone + index it"); return; }
+    const id = npId.trim().toLowerCase();
+    if (!id) { flash("Enter a project name"); return; }
+    setCreating(true);
+    flash(`Creating ${id}…`);
+    try {
+      await createProject(id, { autoSync, selfHeal, prune });
+      await reload();
+      setShowNew(false); setNpId("");
+      flash(`Created ${id} · committed to git + reconciled`);
+    } catch (e) {
+      flash(`Create failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally { setCreating(false); }
   }
 
   // In Live mode, render real projects from /api/status; otherwise the mock catalogue.
@@ -132,32 +150,45 @@ export function WorkspacePage() {
             <button
               className="btn-primary"
               data-testid="new-project-submit"
-              onClick={() => {
-                setShowNew(false);
-                flash("Project registered · reconciler will clone + index it");
-              }}
+              onClick={onCreateProject}
+              disabled={creating}
             >
-              Register
+              {creating ? "Creating…" : LIVE ? "Create" : "Register"}
             </button>
           </>
         }
       >
         <div className="space-y-4">
-          <p className="text-xs text-slate-400">
-            Point Mill at a git repo. There is no database — the repo <em>is</em> the source of truth. The reconciler
-            clones it, validates + compiles every workflow, and starts driving running state toward it.
-          </p>
-          <Field label="Git remote" hint="SSH or HTTPS URL of the project repo">
-            <input className="inp" defaultValue="git@github.com:acme/mill-payments.git" data-testid="np-repo" />
-          </Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Tracked branch" hint="Or pin a tag/commit">
-              <input className="inp" defaultValue="main" />
-            </Field>
-            <Field label="Credential ref" hint="k8s Secret name — never a value">
-              <input className="inp font-mono" defaultValue="mill-payments-deploy-key" />
-            </Field>
-          </div>
+          {LIVE ? (
+            <>
+              <p className="text-xs text-slate-400">
+                v1 is a single repo with a <strong>folder per project</strong>. Creating a project writes
+                <span className="font-mono"> &lt;name&gt;/project.yaml</span>, commits it to git, and reconciles — it then
+                appears here. Add workflows inside it from its page.
+              </p>
+              <Field label="Project name" hint="lowercase letters, digits, hyphens">
+                <input className="inp font-mono" placeholder="e.g. payments" data-testid="np-id" value={npId} onChange={(e) => setNpId(e.target.value)} autoFocus />
+              </Field>
+            </>
+          ) : (
+            <>
+              <p className="text-xs text-slate-400">
+                Point Mill at a git repo. There is no database — the repo <em>is</em> the source of truth. The reconciler
+                clones it, validates + compiles every workflow, and starts driving running state toward it.
+              </p>
+              <Field label="Git remote" hint="SSH or HTTPS URL of the project repo">
+                <input className="inp" defaultValue="git@github.com:acme/mill-payments.git" data-testid="np-repo" />
+              </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Tracked branch" hint="Or pin a tag/commit">
+                  <input className="inp" defaultValue="main" />
+                </Field>
+                <Field label="Credential ref" hint="k8s Secret name — never a value">
+                  <input className="inp font-mono" defaultValue="mill-payments-deploy-key" />
+                </Field>
+              </div>
+            </>
+          )}
           <div className="rounded-xl border border-white/10 bg-ink-950/50 p-3">
             <div className="mb-2 text-xs font-medium text-slate-300">Sync policy <InfoTip text="Written to project.yaml. Drives how the reconcile loop applies new revisions." /></div>
             <PolicyRow label="autoSync" desc="Apply new revisions automatically (vs a manual Sync click)." checked={autoSync} onChange={setAutoSync} testid="np-autosync" />

@@ -3,6 +3,10 @@
 Two things live in this repo: the **runtime stack** (controller + queue + worker — the real
 backend) and the **web prototype** (UI on mock data). This covers the runtime stack.
 
+> **Deploying to EKS?** See **[DEPLOYMENT.md](DEPLOYMENT.md)** — components, every env var +
+> secret, how to feed secrets from k8s, and copy-paste manifests. Metrics/alerts:
+> **[OBSERVABILITY.md](OBSERVABILITY.md)**.
+
 ## The local stack (Gate 2)
 
 ```
@@ -103,6 +107,111 @@ generated `package.json` are kept out of git (`.git/info/exclude`), never commit
 **export** bundle lists the deps in its `package.json`, so `bun install && bun run index.js`
 downloads them and runs anywhere. See `examples/deps-demo`.
 
+### Security posture (deployment)
+
+- **Control plane (`/api/*`) auth**: terminated at the Ingress (SSO/OIDC) per ARCHITECTURE.
+  As defense-in-depth, set **`MILL_ADMIN_TOKEN`** — then every `/api/*` route requires
+  `Authorization: Bearer <token>` **except** `/api/health` (liveness) and `/api/metrics`
+  (scrape). Note: enabling it also locks the browser UI's API calls, so use it for
+  headless/API deployments, or leave it unset and rely on Ingress SSO. **Never expose
+  `/api/*` unauthenticated on an untrusted network.**
+- **CORS** is same-origin only by default (the UI is served by the controller). Allow specific
+  cross-origin browsers via `MILL_CORS_ORIGINS` (comma-separated). Webhook/REST callers are
+  server-to-server and unaffected.
+- **Ingress (`/p/*`) is bearer-authenticated** (global `MILL_INGRESS_TOKEN` or per-project
+  `ingress.tokenEnv`), constant-time compared, closed by default (503 until configured).
+- Save/Delete write to git; secrets are k8s Secret refs (never in git); `node_modules` are
+  git-excluded. Path traversal in Save is rejected.
+
+### Telemetry
+
+- **Metrics**: `GET /api/metrics` — Prometheus counters + histograms + gauges. Full catalog,
+  recommended **alerts** (PromQL) and **dashboard** panels are in **[OBSERVABILITY.md](OBSERVABILITY.md)**.
+  The editor's **Observability** panel renders a live subset.
+- **Logs**: api + worker emit **structured JSON** (`{ts, level, component, msg, …fields}`,
+  token-redacted) — Loki-ready via Alloy. `MILL_LOG_FORMAT=json` forces JSON in a TTY;
+  `MILL_LOG_LEVEL` sets the floor. (`packages/telemetry`.)
+- Traces (run = trace, node = span) via OpenTelemetry/Tempo are the next increment behind
+  the same surface; the metrics endpoint + structured logs are the production-ready pieces today.
+
+### Tokenized ingress (webhook / REST URLs)
+
+Every project and workflow gets a stable URL on the same host, secured by a **bearer token**
+(`MILL_INGRESS_TOKEN`). REST/HTTP works today; WebSocket is designed-for (same routing) but
+not yet implemented.
+
+```
+POST  https://the-mill.example.com/p/w/<workflow>/<project>     # trigger a workflow
+GET   https://the-mill.example.com/p/<project>                  # list a project's endpoints
+```
+
+```bash
+export TOK=…              # = MILL_INGRESS_TOKEN
+curl -XPOST localhost:8787/p/w/math/demos          -H "Authorization: Bearer $TOK" -d '{"input":{"a":[1,2,3]}}'   # → { jobId } (async)
+curl -XPOST "localhost:8787/p/w/math/demos?wait=1" -H "Authorization: Bearer $TOK" -d '{"input":{}}'             # → { status, result } (sync, bounded)
+curl        localhost:8787/p/demos                 -H "Authorization: Bearer $TOK"                                # → project + workflow URLs
+```
+
+- **Auth**: `Authorization: Bearer <MILL_INGRESS_TOKEN>` (constant-time compared). If the token
+  isn't configured the `/p` routes return `503` (disabled) — code-triggering endpoints are never
+  open by default. Wrong/missing token → `401`.
+- **Any payload format**: the ingress accepts **anything** (JSON, `x-www-form-urlencoded`,
+  multipart, XML, raw) — it best-effort parses the body into `input` **and** hands the workflow
+  the raw request on **`ctx.request`** = `{ method, contentType, headers, query, raw }`. So a
+  node can parse any format itself and **verify the provider's HMAC signature** over `raw`:
+  ```js
+  export default function verify(input, ctx) {
+    const { raw, headers } = ctx.request;
+    const mac = crypto.createHmac("sha256", ctx.secrets.WEBHOOK_SECRET).update(raw).digest("hex");
+    if (headers["x-signature"] !== mac) throw new Error("bad signature");
+    return input;   // JSON/form already parsed; for XML/etc parse `raw` here
+  }
+  ```
+  This is how you onboard many different webhook sources behind one entrypoint. See
+  `examples/acuity` (Acuity appointment → enrich → route to 1–N downstream workloads).
+- **Input**: `GET` → query params; other methods → best-effort parsed body (raw always on `ctx.request.raw`).
+- **Custom path**: a workflow's `triggers: [{ type: webhook, path: <token> }]` also exposes
+  `/p/w/<workflow>/<token>` (an unguessable capability URL).
+- The **Endpoints** card on each project page shows + copies these URLs; the editor's webhook
+  trigger shows the workflow's URL.
+
+### Remote / standalone callScript
+
+A Call Script node can target a **remote Mill export bundle** instead of an in-project
+workflow — the export format *is* the remote-package format:
+
+```yaml
+- key: notify
+  kind: callScript
+  call: { ref: "std://acme/notify@v2", workflow: send }   # or an https://…/bundle.tgz URL
+```
+
+The executor fetches the bundle, caches it, and runs it (its `run.sh` installs the bundle's
+own deps), passing the node's input and returning the result. `std://<path>@<ver>` resolves
+against `MILL_STD_REGISTRY`; `http(s)://` URLs are used directly. (Remote code runs at the
+same trust level as a local node — untrusted remote execution belongs on the microVM
+isolation tier.) Set the ref + workflow in the Call Script inspector's *standalone* option.
+
+### Retries, durability & schemas
+
+Per-node knobs in `workflow.yaml`:
+
+```yaml
+- key: flaky
+  kind: jscode
+  file: nodes/flaky.js
+  retry: { maxAttempts: 3, backoffMs: 30 }              # linear backoff + jitter
+  inputSchema: "Array.isArray(input.items)"             # JS predicate, enforced before the node runs
+  outputSchema: "typeof output.total === 'number'"      # enforced after — violation fails the node
+```
+
+- **Retry**: a transiently-failing node retries up to `maxAttempts`; a run-level retry
+  (`POST /api/jobs/:id/retry`, or the **Re-run** button in Run history) re-runs the whole job.
+- **Durability**: completed nodes are journaled to Redis, so a job requeued after a worker
+  crash **resumes** instead of re-doing finished work (the reaper requeues on a missed heartbeat).
+- **Schemas**: `inputSchema`/`outputSchema` are JS boolean expressions enforced at the node
+  boundary in real runs and in the step-tester. See `examples/pipelines/{retry,validated}`.
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -114,7 +223,14 @@ downloads them and runs anywhere. See `examples/deps-demo`.
 | POST | `/api/projects/:id/workflows/:wf/nodes/:key/test` | **test one step** in isolation with a supplied `{ input }` → `{ status, output, logs }` (no upstream nodes run) |
 | GET | `/api/jobs/:id` | status + result |
 | GET | `/api/jobs/:id/events` | live per-node status + logs (SSE) |
+| GET | `/api/jobs/:id/timeline` | per-node spans for a finished run (powers Run detail) |
+| POST | `/api/jobs/:id/retry` | re-run a job with the same input → `{ jobId }` |
+| GET | `/api/projects/:id/workflows/:wf/runs` | recent runs for a workflow (Run history) |
+| POST | `/api/projects` | **create a project**: writes `<id>/project.yaml`, commits, reconciles |
+| GET | `/api/reconcile-events` | recent reconcile activity (project-page feed) |
+| GET | `/api/projects/:id/diff` | what a Sync would apply (live-vs-target name-status diff) |
 | GET | `/api/workers` | worker registry + queue depth |
+| GET | `/api/metrics` | **Prometheus metrics** — counters (`mill_jobs_total{status}`, `mill_jobs_by_workflow_total{workflow,status}`, `mill_triggered_total{trigger}`, `mill_reconcile_total{result}`, `mill_ingress_total{outcome}`, retries, auth-failures), histograms (`mill_job_duration_seconds`, `mill_job_wait_seconds`), and gauges (workers, queue depth + oldest-wait, reconcile synced/healthy/age). See **[OBSERVABILITY.md](OBSERVABILITY.md)**. |
 | GET | `/api/fleet` | Fleet view: enriched workers (mem, executor, running jobs) + rolling execution stats (throughput, p50/p95, success rate, wait) + queue breakdown |
 | GET | `/api/status` | GitOps sync/health + per-workflow validation |
 | POST | `/api/reconcile` | reconcile now (fetch → validate → apply) |
@@ -206,6 +322,15 @@ worktree → apply (checkout) only if every workflow compiles, else keep last-kn
 Status is exposed at `/api/status` (and shown on `/console`). Locally the repo is a bare
 repo seeded into the image (`file:///app/project-repo.git`); the working copy is a shared
 named volume so workers run the reconciled code.
+
+**Sync policy.** `MILL_AUTOSYNC` (default `true`) gates auto-apply: when `false`, the
+reconciler still *fetches + validates* new revisions but **holds** them (`OutOfSync`, with
+"validated but held") until a manual **Sync** — `POST /api/reconcile` always applies (force).
+A **prune allow-empty guard** never lets a suddenly-empty tree (broken clone / bad revision)
+deregister every trigger. `selfHeal` is inherent — running state is derived from the git
+checkout, so there's no out-of-band drift to correct. (v1 is single-repo, so autoSync is a
+workspace-level gate; per-project sync policy in `project.yaml` is declarative for the coming
+multi-repo model.)
 
 Try the last-known-good safety (push a broken commit → it's rejected, the good version
 keeps running; push a fix → it recovers):

@@ -26,6 +26,7 @@
         "@mill/projectfs": "*",
         "@mill/queue": "*",
         "@mill/sdk": "*",
+        "@mill/telemetry": "*",
         "croner": "^8.1.2",
         "hono": "^4.6.14",
         "ioredis": "^5.4.2",
@@ -77,6 +78,7 @@
       "dependencies": {
         "@mill/executor": "*",
         "@mill/queue": "*",
+        "@mill/telemetry": "*",
         "ioredis": "^5.4.2",
       },
     },
@@ -135,6 +137,10 @@
         "@mill/core": "*",
       },
     },
+    "packages/telemetry": {
+      "name": "@mill/telemetry",
+      "version": "0.0.0",
+    },
   },
   "packages": {
     "@alloc/quick-lru": ["@alloc/quick-lru@5.2.0", "", {}, "sha512-UrcABB+4bUrFABwbluTIBErXwvbsU/V7TZWfmbgJfbkwiBuziS9gxdODUyuiecfdGQ85jglMW6juS3+z5TsKLw=="],
@@ -182,6 +188,8 @@
     "@mill/queue": ["@mill/queue@workspace:packages/queue"],
 
     "@mill/sdk": ["@mill/sdk@workspace:packages/sdk"],
+
+    "@mill/telemetry": ["@mill/telemetry@workspace:packages/telemetry"],
 
     "@mill/web": ["@mill/web@workspace:apps/web"],
 

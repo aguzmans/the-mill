@@ -1,0 +1,11 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: crm-upsert }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: crm, kind: jscode, name: crm-upsert, file: nodes/crm.js }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: crm }
+  - { from: crm, to: end }

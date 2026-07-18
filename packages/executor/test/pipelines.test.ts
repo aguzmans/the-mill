@@ -68,4 +68,17 @@ describe("pipelines — step input/output continuity", () => {
     expect(r.status).toBe("succeeded");
     expect(r.result).toEqual({ doubled: 2 });
   });
+
+  test("retry: a transiently-failing node retries and succeeds (per-node retry policy)", async () => {
+    const r = await run("retry");
+    expect(r.status).toBe("succeeded");
+    expect(r.result).toEqual({ ok: true, tries: 3 });
+    expect(r.events.some((e) => e.type === "log" && /attempt 1\/3 failed/.test((e as { message?: string }).message ?? ""))).toBe(true);
+  });
+
+  test("validated: input/output schemas are enforced (passes when satisfied)", async () => {
+    const r = await run("validated");
+    expect(r.status).toBe("succeeded");
+    expect(r.result).toEqual({ total: 3, sum: 60 });
+  });
 });

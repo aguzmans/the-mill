@@ -54,8 +54,9 @@ async function main() {
     if (!projectDir || !workflow) { console.error("usage: mill run <projectDir> <workflow> [--input '<json>'] [--json]"); process.exit(2); }
     const input = flags.input ? JSON.parse(String(flags.input)) : {};
     const secrets = process.env.MILL_SECRETS ? JSON.parse(process.env.MILL_SECRETS) : {};
+    const request = process.env.MILL_REQUEST ? JSON.parse(process.env.MILL_REQUEST) : undefined; // webhook envelope (isolated path)
     const asJson = flags.json === true;
-    const res: ExecResult = await runWorkflow({ projectDir, workflow, input, secrets }, asJson ? undefined : printEvent);
+    const res: ExecResult = await runWorkflow({ projectDir, workflow, input, secrets, request }, asJson ? undefined : printEvent);
     if (asJson) {
       console.log(JSON.stringify(res));
     } else {

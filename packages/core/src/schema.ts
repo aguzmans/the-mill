@@ -3,7 +3,7 @@ import { z } from "zod";
 // The Mill project/workflow file format — the single source of truth (no DB).
 // Types are inferred from these schemas so the schema and the types never drift.
 
-export const nodeKind = z.enum(["start", "jscode", "if", "callScript", "loop", "end"]);
+export const nodeKind = z.enum(["start", "jscode", "if", "callScript", "loop", "fanout", "end"]);
 
 export const ifClause = z.object({
   connector: z.enum(["and", "or"]).optional(), // undefined on the first clause
@@ -40,6 +40,8 @@ export const workflowNode = z.object({
   conditions: z.array(ifClause).optional(),
   // callScript (also the per-item body of a loop, when the loop calls a script):
   call: callTarget.optional(),
+  // retry: per-node retry policy — attempt up to maxAttempts with linear backoff + jitter.
+  retry: z.object({ maxAttempts: z.number().int().positive(), backoffMs: z.number().int().nonnegative().optional(), jitter: z.boolean().optional() }).optional(),
   // loop (forEach): iterate an array and run a body per item, collecting results.
   //   `each` is a JS expression over the upstream output (`input`) + `ctx` that yields the
   //   array to iterate (defaults to `input` when omitted). The body is this same node's
@@ -82,6 +84,10 @@ export const projectDef = z.object({
       prune: z.boolean().default(false),
     })
     .default({}),
+  // Per-project ingress auth: the bearer token for this project's /p endpoints is read from
+  // the named env var (a k8s Secret ref) — never the value in git. Falls back to the global
+  // MILL_INGRESS_TOKEN when unset.
+  ingress: z.object({ tokenEnv: z.string().min(1) }).optional(),
 });
 
 export type NodeKind = z.infer<typeof nodeKind>;

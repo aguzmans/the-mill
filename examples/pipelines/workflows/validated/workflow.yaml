@@ -1,0 +1,13 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: validated }
+triggers: [{ type: manual }]
+nodes:
+  - { key: start, kind: start,  name: Start }
+  - { key: make,  kind: jscode, name: Make items, file: nodes/make.js, outputSchema: "Array.isArray(output.items) && output.items.length > 0" }
+  - { key: count, kind: jscode, name: Count, file: nodes/count.js, inputSchema: "Array.isArray(input.items)", outputSchema: "typeof output.total === 'number' && output.total >= 0" }
+  - { key: end,   kind: end,    name: End }
+edges:
+  - { from: start, to: make }
+  - { from: make,  to: count }
+  - { from: count, to: end }

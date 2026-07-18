@@ -6,6 +6,7 @@
   "dependencies": {
     "@mill/executor": "*",
     "@mill/queue": "*",
-    "ioredis": "^5.4.2"
+    "ioredis": "^5.4.2",
+    "@mill/telemetry": "*"
   }
 }

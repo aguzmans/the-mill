@@ -62,7 +62,8 @@ export function validateTree(root: string): { ok: boolean; projects: ProjectStat
  *   apply (checkout) ONLY if the whole tree compiles, else keep last-known-good.
  * Mutates state.syncedRevision when it advances.
  */
-export async function reconcile(state: RepoState): Promise<ReconcileStatus> {
+export async function reconcile(state: RepoState, opts: { apply?: boolean } = {}): Promise<ReconcileStatus> {
+  const apply = opts.apply !== false; // default: auto-apply. autoSync=false → validate only (manual Sync applies).
   try {
     await Git.fetch(state.dir);
     const target = await Git.revParse(state.dir, `origin/${state.branch}`);
@@ -78,7 +79,9 @@ export async function reconcile(state: RepoState): Promise<ReconcileStatus> {
       await Git.worktreeRemove(state.dir, candidate);
     }
 
-    if (v.ok) {
+    // Apply only if it validates AND auto-apply is on (or this is a manual sync).
+    const pending = v.ok && apply === false && state.syncedRevision !== target;
+    if (v.ok && apply) {
       await Git.checkoutDetach(state.dir, target); // advance the serving copy
       state.syncedRevision = target;
     }
@@ -89,7 +92,11 @@ export async function reconcile(state: RepoState): Promise<ReconcileStatus> {
       sync: v.ok && state.syncedRevision === target ? "Synced" : "OutOfSync",
       health: v.ok ? "Healthy" : "Degraded",
       projects: v.projects,
-      error: v.ok ? undefined : `revision ${Git.short(target)} failed to validate — keeping last-known-good ${Git.short(state.syncedRevision)}`,
+      error: !v.ok
+        ? `revision ${Git.short(target)} failed to validate — keeping last-known-good ${Git.short(state.syncedRevision)}`
+        : pending
+          ? `new revision ${Git.short(target)} validated but held — autoSync is off; click Sync to apply`
+          : undefined,
     };
   } catch (e) {
     return {
@@ -142,6 +149,20 @@ export async function writePaths(state: RepoState, files: { path: string; conten
   await Git.add(state.dir);
   await Git.commit(state.dir, message);
   await Git.push(state.dir, state.branch);
+}
+
+export interface DiffEntry { change: "added" | "modified" | "deleted" | "renamed"; path: string }
+
+/** What a Sync would apply: name-status diff between the live and target revisions. */
+export async function diffToApply(state: RepoState, target: string, subpath?: string): Promise<DiffEntry[]> {
+  if (!state.syncedRevision || !target || state.syncedRevision === target) return [];
+  const raw = await Git.diffNameStatus(state.dir, state.syncedRevision, target, subpath).catch(() => "");
+  return raw.split("\n").filter(Boolean).map((line) => {
+    const [status, ...rest] = line.split("\t");
+    const c = status[0];
+    const change = c === "A" ? "added" : c === "D" ? "deleted" : c === "R" ? "renamed" : "modified";
+    return { change, path: rest[rest.length - 1] };
+  });
 }
 
 /** Clone (or open an existing) working copy and record the initial revision. */

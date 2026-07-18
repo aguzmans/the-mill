@@ -35,6 +35,11 @@ services:
       - RECONCILE_INTERVAL_MS=${RECONCILE_INTERVAL_MS:-15000}
       - REDIS_URL=redis://redis:6379
       - PORT=8080
+      - MILL_INGRESS_TOKEN=${MILL_INGRESS_TOKEN:-}   # bearer token for the /p tokenized ingress
+      - MILL_ADMIN_TOKEN=${MILL_ADMIN_TOKEN:-}   # when set, /api/* requires this bearer (except /health, /metrics)
+      - MILL_CORS_ORIGINS=${MILL_CORS_ORIGINS:-}
+      - DEPS_TOKEN=${DEPS_TOKEN:-}   # per-project ingress token (demo)
+      - MILL_AUTOSYNC=${MILL_AUTOSYNC:-true}   # false → validate but hold new revisions (manual Sync applies)
     volumes:
       - workdir:/app/workdir   # shared working copy (PVC-equivalent) so workers see reconciled code
     ports:
@@ -51,7 +56,7 @@ services:
       - MILL_CONC_MIN=1
       - MILL_CONC_MAX=8
       # Flat secrets, as k8s Secrets would be injected on EKS (each node still sees only its declared refs).
-      - MILL_SECRETS={"WAREHOUSE_DSN":"postgres://demo","SMTP_URL":"smtp://demo","API_URL":"https://demo"}
+      - MILL_SECRETS={"WAREHOUSE_DSN":"postgres://demo","SMTP_URL":"smtp://demo","API_URL":"https://demo","WEBHOOK_SECRET":"whsec_test_123"}
     volumes:
       - workdir:/app/workdir   # reads the same reconciled working copy the controller checks out
     depends_on:

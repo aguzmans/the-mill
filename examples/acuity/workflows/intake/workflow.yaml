@@ -1,0 +1,21 @@
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: intake }
+triggers: [{ type: manual }, { type: webhook }]
+nodes:
+  - { key: start,          kind: start,  name: Start }
+  - { key: verify,         kind: jscode, name: Verify + parse (any format), file: nodes/verify.js, secrets: [ WEBHOOK_SECRET ] }
+  - { key: fetch-acuity,   kind: jscode, name: Fetch appt (Acuity),  file: nodes/fetch-acuity.js }
+  - { key: fetch-internal, kind: jscode, name: Lookup patient (EHR), file: nodes/fetch-internal.js }
+  - { key: consolidate,    kind: jscode, name: Consolidate + route,  file: nodes/consolidate.js }
+  - { key: dispatch,       kind: fanout, name: Call workloads (parallel), each: "input.calls" }
+  - { key: summarize,      kind: jscode, name: Summarize, file: nodes/summarize.js }
+  - { key: end,            kind: end,    name: End }
+edges:
+  - { from: start,          to: verify }
+  - { from: verify,         to: fetch-acuity }
+  - { from: fetch-acuity,   to: fetch-internal }
+  - { from: fetch-internal, to: consolidate }
+  - { from: consolidate,    to: dispatch }
+  - { from: dispatch,       to: summarize }
+  - { from: summarize,      to: end }

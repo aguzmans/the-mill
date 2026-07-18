@@ -37,9 +37,9 @@ rough and assume a small team.
   job trigger endpoint; WS live-log relay; worker-registry view.
 - `packages/queue`: BullMQ producer/consumer + worker registry/heartbeats in Redis.
 - `apps/worker`: pull → execute bundle-in-payload → stream status/logs to Redis → emit telemetry.
-- **Retries/durability:** node-boundary journaling (retry skips completed nodes) + two
-  tiers — per-node backoff+jitter+condition **and** a run-level retry surviving worker death;
-  heartbeats + timeout taxonomy for long nodes. (No CRIU checkpointing in v1.)
+- **Retries/durability** — **DONE**: node-boundary journaling (a requeued job resumes,
+  skipping completed nodes) + two tiers — per-node backoff+jitter (`retry:` policy) **and** a
+  run-level retry surviving worker death (reaper requeue). (No CRIU checkpointing in v1.)
 - Triggers: **manual** + **webhook**.
 - **Exit:** `POST /trigger` → live status + logs over WS; result + `recent:{workflow}` in Redis; logs land in Loki; kill a worker mid-job ⇒ job requeues.
 
@@ -75,6 +75,11 @@ rough and assume a small team.
   from the trash icon → the controller commits + pushes the removal to the tracked branch,
   then reconciles. Guarded to a git-backed workspace.
 - **Run panel**: trigger, live per-node status, streaming logs, failure inspection, retry.
+- **Live read-only feeds** — **DONE**: Run history (`/…/runs` + per-node timeline), the
+  reconcile activity feed (`/reconcile-events`), and the Sync diff (`/…/diff`) all render real
+  controller/Redis data. **New Project** creates a real project (`POST /api/projects`).
+- **Node input/output schemas enforced** at the boundary (JS predicates), a per-node **`retry`**
+  policy, an editable **Dependencies** panel, and a **Test this step** runner — all live.
 - **Fleet page runs on real data** (`/api/fleet`): live workers (memory, executor tier,
   heartbeat age, jobs running now), fleet-wide throughput/p50/p95/success/wait from a
   rolling completion window, and the pending-queue breakdown — mock catalogue only as a
