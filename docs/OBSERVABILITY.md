@@ -46,10 +46,17 @@ worker registry from Redis), so you scrape the controller, not each worker.
 |---|---|
 | `mill_workers` | Workers registered (heartbeating). |
 | `mill_workers_inflight` | Jobs executing across the fleet. |
-| `mill_queue_depth` | Jobs waiting. |
-| `mill_queue_oldest_wait_seconds` | Age of the head-of-line job — **backlog signal**. |
+| `mill_worker_capacity` | Total concurrent job slots (Σ per-worker `concMax`) — fleet ceiling. |
+| `mill_worker_saturation_ratio` | Busy fraction `inflight / capacity` (0..1). |
+| `mill_queue_depth` | Jobs waiting — **primary autoscaling signal** (= `LLEN mill:queue`). |
+| `mill_queue_oldest_wait_seconds` | Age of the head-of-line job — **backlog / SLA signal**. |
 | `mill_reconcile_synced` / `mill_reconcile_healthy` | 1/0 — GitOps state. |
 | `mill_reconcile_age_seconds` | Seconds since the last reconcile — **liveness of the loop**. |
+
+> **Autoscaling the worker fleet:** drive HPA/KEDA off `mill_queue_depth` (and
+> `mill_queue_oldest_wait_seconds` as a latency guard) rather than CPU/memory — a pull queue
+> only looks busy *after* work is claimed, so resource metrics lag the backlog. See
+> **[DEPLOYMENT.md → Autoscale on queue depth](DEPLOYMENT.md#autoscale-on-queue-depth-custom-metrics--recommended)**.
 
 ## Recommended alerts (PromQL)
 

@@ -22,6 +22,7 @@ describe("computeStats", () => {
   test("empty window → zeros but 100% success and no NaN", () => {
     const s = computeStats([], NOW);
     expect(s.completedLastHour).toBe(0);
+    expect(s.failedLastHour).toBe(0);
     expect(s.successRatePct).toBe(100);
     expect(s.p50Ms).toBe(0);
     expect(s.avgWaitMs).toBe(0);
@@ -33,6 +34,7 @@ describe("computeStats", () => {
     const window = [rec({ ok: 1, wait: 100 }), rec({ ok: 0, wait: 200 }), rec({ ok: 1, wait: 300 }), rec({ ok: 1, wait: 400 })];
     const s = computeStats(window, NOW);
     expect(s.completedLastHour).toBe(4);
+    expect(s.failedLastHour).toBe(1); // one ok:0 in the window
     expect(s.successRatePct).toBe(75); // 3/4
     expect(s.avgWaitMs).toBe(250); // (100+200+300+400)/4
   });

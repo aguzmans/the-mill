@@ -26,9 +26,13 @@ test.describe("new project", () => {
 test.describe("fleet isolation", () => {
   test("fleet shows the isolation ladder and autoscaling", async ({ page }) => {
     await page.goto("/fleet");
-    await expect(page.getByTestId("isolation-ladder")).toContainText("NsjailProcessExecutor");
+    // EKS model: the pod is the isolation boundary (default rung); docker is local-only; roadmap below.
+    await expect(page.getByTestId("isolation-ladder")).toContainText("Hardened worker pod");
+    await expect(page.getByTestId("isolation-ladder")).not.toContainText("NsjailProcessExecutor");
     await expect(page.getByTestId("ladder-firecracker")).toBeVisible();
+    await expect(page.getByTestId("ladder-container")).toContainText("local");
     await expect(page.getByTestId("autoscaling-panel")).toContainText("HPA");
+    await expect(page.getByTestId("autoscaling-panel")).toContainText("KEDA"); // queue-depth autoscaling
     await expect(page.getByTestId("autoscaling-panel")).toContainText("min–max");
   });
 });

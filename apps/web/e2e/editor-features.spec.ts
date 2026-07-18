@@ -32,9 +32,15 @@ test.describe("editor feature coverage", () => {
     await expect(page.getByTestId("toast")).toContainText("Retry queued");
   });
 
-  test("observability panel links out and shows a trace", async ({ page }) => {
+  test("observability panel shows metrics and links out to Grafana/Loki/Tempo", async ({ page }) => {
     await page.goto("/projects/billing/workflows/invoices");
-    await expect(page.getByTestId("observability-panel")).toContainText("Trace");
+    const panel = page.getByTestId("observability-panel");
+    await expect(panel).toContainText("Observability");
+    await expect(panel).toContainText("queue depth");
+    // outbound links exist
+    await expect(page.getByTestId("open-metrics")).toHaveAttribute("href", "/api/metrics");
+    await expect(page.getByTestId("open-tempo")).toBeVisible();
+    // clicking a destination flashes a toast
     await page.getByTestId("open-grafana").click();
     await expect(page.getByTestId("toast")).toContainText("Grafana");
   });

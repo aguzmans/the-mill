@@ -35,19 +35,27 @@ const isolate: Executor | null = process.env.MILL_EXECUTOR === "docker"
 
 let inFlight = 0;
 let paused = false;
+let exclusiveActive = false; // dedicated to an exclusive job → pull nothing else until done
 const executorTier = isolate ? "docker" : "in-process";
 const running = new Map<string, RunningJob>(); // jobs executing right now (for the Fleet view)
 
 const memMB = () => Math.round(process.memoryUsage().rss / (1024 * 1024));
 const memPct = () => Math.round((memMB() / memMaxMB) * 100);
 const beat = () => q.heartbeat({
-  id: workerId, host, inFlight, concMin, concMax, paused,
+  id: workerId, host, inFlight, concMin, concMax, paused, exclusive: exclusiveActive,
   beatAt: Date.now(), memMB: memMB(), memMaxMB, executor: executorTier,
   jobs: Array.from(running.values()),
 });
 setInterval(() => beat().catch(() => {}), 3000);
 
 async function handle(spec: JobSpec, raw: string) {
+  // Replace concurrency policy: a run superseded while still queued must not execute.
+  const pre = await q.getJob(spec.id).then((j) => j.status).catch(() => undefined);
+  if (pre === "superseded") {
+    log.info("skip superseded job (Replace policy)", { job: spec.id, workflow: spec.workflow });
+    await q.ack(workerId, raw).catch(() => {});
+    return;
+  }
   running.set(spec.id, { id: spec.id, workflow: spec.workflow, startedAt: Date.now() });
   await q.markRunning(spec.id, workerId);
   const job = { projectDir: spec.projectDir, workflow: spec.workflow, input: spec.input, secrets, revision: spec.revision, request: spec.request as import("@mill/sdk").RequestCtx | undefined };
@@ -84,16 +92,30 @@ async function loop() {
   while (true) {
     // Reactive gate: pause pulling above the memory threshold (never below min).
     paused = inFlight >= concMin && memPct() > (paused ? resumePct : pausePct);
-    if (inFlight >= concMax || (paused && inFlight >= concMin)) {
+    // While dedicated to an exclusive job, take nothing else until it finishes.
+    if (exclusiveActive || inFlight >= concMax || (paused && inFlight >= concMin)) {
       await Bun.sleep(50);
       continue;
     }
     const job = await q.pull(workerId, 5);
     if (!job) continue;
+
+    // Exclusive job wants the whole worker/pod. If we're already busy, hand it back so an
+    // idle worker (or a fresh autoscaled pod) can dedicate itself; otherwise claim exclusivity.
+    if (job.spec.exclusive) {
+      if (inFlight > 0) {
+        await q.requeue(workerId, job.raw);
+        await Bun.sleep(200); // back off so we don't hot-loop re-pulling the same job
+        continue;
+      }
+      exclusiveActive = true;
+      log.info("exclusive claim", { job: job.spec.id, workflow: job.spec.workflow });
+    }
+
     inFlight++;
     handle(job.spec, job.raw)
       .catch((e) => log.error("job errored", { job: job.spec.id, error: e instanceof Error ? e.message : String(e) }))
-      .finally(() => { inFlight--; running.delete(job.spec.id); });
+      .finally(() => { inFlight--; if (job.spec.exclusive) exclusiveActive = false; running.delete(job.spec.id); });
   }
 }
 

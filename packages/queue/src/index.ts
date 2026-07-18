@@ -6,7 +6,7 @@ import Redis from "ioredis";
 // end. The production swap is BullMQ (retries/backoff, repeatable-cron, stalled-job
 // recovery) behind this same seam — see ARCHITECTURE §3.4 / ROADMAP M2.
 
-export type JobStatus = "queued" | "running" | "succeeded" | "failed";
+export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "superseded";
 
 export interface JobSpec {
   id: string;
@@ -15,6 +15,7 @@ export interface JobSpec {
   input: unknown;
   revision?: string; // git SHA the job was enqueued at (cache-busts node imports)
   request?: unknown; // webhook envelope (raw body + headers + query) → ctx.request
+  exclusive?: boolean; // run alone on a worker/pod until done (no co-tenant jobs)
 }
 
 export interface RunningJob {
@@ -35,6 +36,7 @@ export interface WorkerInfo {
   memMB?: number; // live RSS
   memMaxMB?: number; // admission ceiling this worker sizes against
   executor?: string; // "docker" (isolated) | "in-process"
+  exclusive?: boolean; // currently dedicated to an exclusive job (taking no co-tenants)
   jobs?: RunningJob[]; // jobs currently executing on this worker
 }
 
@@ -54,9 +56,19 @@ export interface QueueEvent {
 
 export class MillQueue {
   private blocking?: Redis; // dedicated connection for BRPOP (blocking)
-  private ttl = 3600;
 
-  constructor(private redis: Redis, private prefix = "mill") {}
+  /**
+   * @param ttl seconds a job's keys (hash/events/journal/runs index) live after creation.
+   *   Default 7 days (604800). Override via MILL_JOB_TTL_SECONDS — sizes Redis memory (see
+   *   docs/DEPLOYMENT.md § Redis sizing). @param completedMax rolling cap on the global
+   *   completed-runs list that feeds the dashboard (MILL_COMPLETED_MAX).
+   */
+  constructor(
+    private redis: Redis,
+    private prefix = "mill",
+    private ttl = Number(process.env.MILL_JOB_TTL_SECONDS ?? 604800),
+    private completedMax = Number(process.env.MILL_COMPLETED_MAX ?? 5000),
+  ) {}
 
   private key(...parts: (string | number)[]) {
     return [this.prefix, ...parts].join(":");
@@ -84,6 +96,25 @@ export class MillQueue {
     await this.redis.lpush(this.key("queue"), JSON.stringify(spec));
   }
 
+  /**
+   * In-progress runs for a workflow (status queued or running), newest first. Used to enforce
+   * a cron workflow's concurrencyPolicy (Forbid/Replace) before enqueuing another run.
+   */
+  async activeRuns(runKey: string): Promise<{ id: string; status: string }[]> {
+    const ids = await this.redis.lrange(this.key("runs", runKey), 0, 49);
+    const out: { id: string; status: string }[] = [];
+    for (const id of ids) {
+      const status = await this.redis.hget(this.key("job", id), "status");
+      if (status === "queued" || status === "running") out.push({ id, status });
+    }
+    return out;
+  }
+
+  /** Mark a still-queued job superseded so the worker skips it when pulled (Replace policy). */
+  async supersede(id: string): Promise<void> {
+    await this.setStatus(id, "superseded", { supersededAt: Date.now().toString() });
+  }
+
   /** Recent runs for a workflow (newest first), each enriched with its job hash. */
   async recentRuns(runKey: string, limit = 20): Promise<Record<string, string>[]> {
     const ids = await this.redis.lrange(this.key("runs", runKey), 0, limit - 1);
@@ -109,6 +140,18 @@ export class MillQueue {
   /** Remove a finished job from the worker's processing list. */
   async ack(workerId: string, raw: string): Promise<void> {
     await this.redis.lrem(this.key("processing", workerId), 1, raw);
+  }
+
+  /**
+   * Return a just-pulled job to the queue's pull end so another (idle) worker takes it next.
+   * Used when a busy worker pulls an `exclusive` job it can't run alone right now. Atomic so
+   * the job is never lost between the two lists.
+   */
+  async requeue(workerId: string, raw: string): Promise<void> {
+    const p = this.redis.multi();
+    p.lrem(this.key("processing", workerId), 1, raw); // remove from my processing list
+    p.rpush(this.key("queue"), raw);                  // back to the RIGHT (pull) end → picked next
+    await p.exec();
   }
 
   /**
@@ -179,7 +222,7 @@ export class MillQueue {
       };
       const wkey = this.key("completed");
       await this.redis.rpush(wkey, JSON.stringify(rec));
-      await this.redis.ltrim(wkey, -2000, -1); // keep the last 2000 completions
+      await this.redis.ltrim(wkey, -this.completedMax, -1); // keep the last N completions (MILL_COMPLETED_MAX)
       await this.redis.expire(wkey, this.ttl);
       // Monotonic counters + latency/wait histograms for Prometheus.
       await this.metricInc(`jobs_total:${status}`);

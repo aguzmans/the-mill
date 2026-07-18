@@ -6,6 +6,7 @@ import type { CompletionRecord, JobSpec } from "@mill/queue";
 export interface FleetStats {
   throughputPerMin: number; // recent rate (mean of the 12×1-min trend)
   completedLastHour: number;
+  failedLastHour: number; // failures in the rolling window — surfaced prominently for operators
   p50Ms: number;
   p95Ms: number;
   successRatePct: number;
@@ -39,6 +40,7 @@ export function computeStats(window: CompletionRecord[], now: number): FleetStat
   return {
     throughputPerMin: Math.round(trend.reduce((a, b) => a + b, 0) / 12),
     completedLastHour: window.length,
+    failedLastHour: window.length - oks,
     p50Ms: percentile(durs, 50),
     p95Ms: percentile(durs, 95),
     successRatePct: window.length ? Math.round((oks / window.length) * 100) : 100,

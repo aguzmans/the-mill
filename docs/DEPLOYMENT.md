@@ -65,6 +65,11 @@ have no safe default.
 > isolation + resource limits are the boundary; a per-workflow `K8sJobExecutor`
 > (pod-per-run, gVisor/Kata RuntimeClass) is the future opt-in for untrusted code. The
 > `MILL_EXECUTOR=docker` mode needs a Docker socket and is **not** for k8s.
+>
+> The local `docker-compose.yml` **mirrors this**: `api` and `worker` are separate services
+> (workers never colocate with the api), the `worker` runs in-process and is hardened like a
+> locked-down pod (`read_only`, `cap_drop: [ALL]`, `no-new-privileges`, mem/cpu limits) and
+> scaled via `deploy.replicas` to stand in for the HPA-managed pod fleet.
 
 ---
 
@@ -222,6 +227,133 @@ spec:
     - type: Resource
       resource: { name: cpu,    target: { type: Utilization, averageUtilization: 70 } }
 ```
+
+### Autoscale on queue depth (custom metrics — recommended)
+
+CPU/memory HPA is **lagging** for a queue workload: pods only look busy *after* they pick up
+work, so a backlog builds before the fleet scales. Scale on the **queue** instead. The
+controller already exports the signals at `GET /api/metrics` (Prometheus text):
+
+| Metric | Use for scaling |
+|---|---|
+| `mill_queue_depth` | jobs waiting — the primary backlog signal |
+| `mill_queue_oldest_wait_seconds` | head-of-line latency — a SLA guard |
+| `mill_worker_capacity` / `mill_worker_saturation_ratio` | fleet slots and busy fraction (0..1) |
+| `mill_workers`, `mill_workers_inflight` | fleet size and live in-flight |
+
+**Option A — KEDA (best fit; scales straight off the Redis queue).** KEDA creates/manages
+the HPA for you and can scale to/from zero:
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: mill-worker, namespace: mill }
+spec:
+  scaleTargetRef: { name: mill-worker }        # the worker Deployment
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 120
+  triggers:
+    # (a) backlog — target ≤5 pending jobs per replica, read from the Redis list directly
+    - type: redis
+      metadata: { address: redis.mill.svc:6379, listName: "mill:queue", listLength: "5" }
+    # (b) latency guard — add pods if the oldest queued job waits > 30s
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        query: max(mill_queue_oldest_wait_seconds)
+        threshold: "30"
+    # (c) keep CPU/mem as a floor (optional)
+    - type: cpu
+      metadata: { type: Utilization, value: "70" }
+```
+`mill:queue` is the Redis list the queue uses (`LLEN mill:queue` = `mill_queue_depth`), so the
+`redis` trigger needs no Prometheus at all. **Exclusive jobs compose naturally:** an
+`exclusive: true` job sitting in the queue raises `mill_queue_depth`, KEDA adds a pod, and
+that fresh pod dedicates itself to the job (takes no co-tenants) until it finishes.
+
+**Option B — prometheus-adapter (plain HPA `External` metric).** If you already run
+prometheus-adapter, expose `mill_queue_depth` as an external metric and target it:
+```yaml
+# HPA (autoscaling/v2) — add alongside the Resource metrics above
+- type: External
+  external:
+    metric: { name: mill_queue_depth }
+    target: { type: AverageValue, averageValue: "5" }   # ≈5 pending jobs per replica
+```
+Either way, scrape the controller with a `ServiceMonitor` on `/api/metrics` (see below).
+
+### Dedicated-pod (exclusive) workloads
+
+A workflow may set **`exclusive: true`** in its `workflow.yaml` (authoring reference:
+[RUNNING.md → Exclusive execution](RUNNING.md#exclusive-execution-dedicate-a-whole-workerpod-to-a-run)).
+A worker that picks up such a run **takes no other jobs until it finishes** — the whole pod is
+dedicated to it. Operational implications for capacity planning:
+
+- An exclusive run reduces that pod's effective concurrency to **1** for its duration, so size
+  pod `resources.limits` for a *single* heavy run (not `concMax` concurrent ones). Consider a
+  **separate worker Deployment** with a higher-memory profile (and its own `ScaledObject`) if
+  exclusive jobs are much larger than normal ones.
+- Queue-depth autoscaling handles the elasticity: a queued exclusive job raises
+  `mill_queue_depth` → KEDA/HPA adds a pod → that fresh pod dedicates itself. No special
+  routing is needed, but ensure `maxReplicaCount` is high enough to absorb bursts of them.
+- Exclusive jobs never co-tenant, so they are unaffected by (and do not interfere with) a
+  worker's `MILL_CONC_MAX`.
+
+### Redis — persistence, retention & sizing
+
+Redis holds the queue, worker registry, per-job state, live-log events, the resume journal,
+and the rolling completed-runs list. Configure it deliberately.
+
+**Persistence (survive restarts).** Run Redis with **AOF** and a real volume:
+```
+redis-server --appendonly yes --appendfsync everysec \
+  --maxmemory <see table> --maxmemory-policy volatile-ttl
+# mount a PVC at /data
+```
+`volatile-ttl` evicts the **nearest-to-expire job keys first** if `maxmemory` is hit; the
+queue/registry keys carry no TTL, so they are never evicted (jobs are not silently dropped).
+The local `docker-compose.yml` already does this (`redis-data` volume). `everysec` fsync ≈ ≤1s
+of loss on a hard crash; use `appendfsync always` only if you can't tolerate any loss.
+
+**Retention (config).**
+
+| Env var | Default | What it controls |
+|---|---|---|
+| `MILL_JOB_TTL_SECONDS` | `604800` (7 days) | TTL on each job's hash, events (logs), journal, and per-workflow runs index. Set on **both api and worker**. |
+| `MILL_COMPLETED_MAX` | `5000` | Rolling cap on the global completed-runs list that feeds the dashboard/run-history. |
+| `MILL_REDIS_MAXMEMORY` | `1gb` | Redis `maxmemory` (compose passes it through). Size from the table below. |
+
+**Memory sizing.** Measured footprint (calibrated on a running stack): a job hash ≈ **0.4–2 KB**,
+each live-log event ≈ **~90 B**, and the **journal is deleted on success** (only failed/requeued
+runs keep it). So per-job memory is dominated by **log-event volume**. Model:
+
+```
+bytes/job ≈ hash(~0.5KB + input + result) + events(N × ~0.1KB) + (failed ? nodes × ~0.2KB : 0)
+peak_bytes ≈ jobs_per_day × (MILL_JOB_TTL_SECONDS / 86400) × bytes_per_job × 1.4   (1.4 = Redis overhead)
+```
+
+At a **7-day** TTL, size `maxmemory` (and the PVC) from your throughput and how chatty jobs are:
+
+| Jobs/day | Jobs retained (7d) | Light ~1 KB/job | Typical ~3 KB/job | Heavy ~20 KB/job |
+|---:|---:|---:|---:|---:|
+| 1,000 | 7 K | ~10 MB | ~29 MB | ~196 MB |
+| 10,000 | 70 K | ~98 MB | ~294 MB | ~1.9 GB |
+| 100,000 | 700 K | ~980 MB | ~2.9 GB | ~19 GB |
+| 1,000,000 | 7 M | ~9.6 GB | ~29 GB | ~192 GB |
+
+*Light* = few nodes, little logging; *Typical* = ~10 nodes + modest logging; *Heavy* = many nodes,
+verbose logs, large payloads. If a cell exceeds your Redis budget: **shorten `MILL_JOB_TTL_SECONDS`**,
+reduce per-node logging, or offload history to Postgres/Loki (the documented upgrade path) and keep
+Redis for hot state only. Watch `used_memory` and alert well below `maxmemory`.
+
+### Concurrency policy (overlap control)
+
+A cron workflow can set **`concurrencyPolicy: Allow | Forbid | Replace`** (k8s CronJob semantics;
+authoring: [RUNNING.md](RUNNING.md#concurrency-policy-cron-overlap)). It is **enforced for cron
+triggers only** — webhook/manual/event runs always fire. `Forbid` skips a new run while one is in
+progress; `Replace` is **best-effort**: it drops a still-*queued* prior run (newest wins) but lets
+an already-*executing* run finish (degrades to Forbid). Observability:
+`mill_concurrency_skipped_total{policy}` and `mill_concurrency_replaced_total{policy}`.
 
 ### Ingress (UI + webhooks + TLS + SSO)
 ```yaml

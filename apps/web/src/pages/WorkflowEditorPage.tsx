@@ -46,11 +46,14 @@ function liveToWorkflow(name: string, g: LiveGraph): Workflow {
     id: name, name: capW(name), description: "Live from the git working copy.",
     sync: "Synced", health: "Healthy", lastRun: "idle",
     triggers: triggers as Workflow["triggers"], nodes, edges: g.edges as WorkflowEdge[], runs: [],
+    exclusive: g.exclusive ?? false,
   };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const DND_MIME = "application/mill-node-kind";
+type EditTrigger = { type: "manual" | "cron" | "webhook" | "event"; schedule?: string; path?: string; concurrencyPolicy?: "Allow" | "Forbid" | "Replace" };
+
 function relTime(ms: number): string {
   if (!ms) return "—";
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -133,6 +136,16 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
   const [selectedRun, setSelectedRun] = useState<string | null>(workflow?.runs?.[0]?.id ?? null);
   const [liveRuns, setLiveRuns] = useState<RunRecord[]>([]);
   const [rf, setRf] = useState<ReactFlowInstance | null>(null);
+  // Editable triggers (scheduling). Recover schedule/path from the loaded trigger detail.
+  const [triggers, setTriggers] = useState<EditTrigger[]>(() =>
+    (workflow.triggers ?? []).map((t) => ({
+      type: t.type,
+      schedule: t.type === "cron" ? (t.detail || "") : "",
+      path: t.type === "webhook" ? (t.detail || "") : "",
+      concurrencyPolicy: t.concurrencyPolicy,
+    })),
+  );
+  const [exclusive, setExclusive] = useState<boolean>(workflow.exclusive ?? false);
   const dropCounter = useRef(0);
   const { toast, flash } = useToast();
   const logRef = useRef<HTMLDivElement>(null);
@@ -309,14 +322,17 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       if (e.sourceHandle) edge.branch = e.sourceHandle;
       return edge;
     });
-    // Live triggers (from the controller) carry schedule/path; the mock type only knows `type`.
-    const triggers = (workflow.triggers ?? []).map((raw) => {
-      const t = raw as unknown as { type: string; schedule?: string; path?: string };
-      return { type: t.type, ...(t.schedule ? { schedule: t.schedule } : {}), ...(t.path ? { path: t.path } : {}) };
-    });
+    // Editable triggers → workflow.yaml (cron carries schedule; webhook may carry a custom path).
+    const trig = triggers.map((t) => ({
+      type: t.type,
+      ...(t.type === "cron" && t.schedule ? { schedule: t.schedule } : {}),
+      ...(t.type === "webhook" && t.path ? { path: t.path } : {}),
+      ...(t.concurrencyPolicy ? { concurrencyPolicy: t.concurrencyPolicy } : {}),
+    }));
     const def = {
       apiVersion: "mill/v1", kind: "Workflow", metadata: { name: workflow.id },
-      triggers: triggers.length ? triggers : [{ type: "manual" }], nodes: defNodes, edges: defEdges,
+      triggers: trig.length ? trig : [{ type: "manual" }], nodes: defNodes, edges: defEdges,
+      ...(exclusive ? { exclusive: true } : {}),
     };
     const files: Record<string, string> = {};
     for (const rn of nodes) {
@@ -325,7 +341,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       if (file && (d.kind === "jscode" || d.kind === "loop")) files[file] = (d.code as string) ?? DEFAULT_JS;
     }
     return { def, files };
-  }, [nodes, edges, workflow]);
+  }, [nodes, edges, workflow, triggers, exclusive]);
 
   const doSave = useCallback(async () => {
     if (!LIVE) { setShowCommit(false); flash(`Committed to ${project.branch} · reconcile queued`); return; }
@@ -578,7 +594,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
 
       {/* triggers + observability */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <TriggersPanel workflow={workflow} projectId={project.id} onCopy={(url) => { navigator.clipboard?.writeText(url).catch(() => {}); flash("Webhook URL copied"); }} />
+        <TriggersPanel triggers={triggers} setTriggers={setTriggers} exclusive={exclusive} setExclusive={setExclusive} workflow={workflow.id} projectId={project.id} onCopy={(url) => { navigator.clipboard?.writeText(url).catch(() => {}); flash("Webhook URL copied"); }} />
         <ObservabilityPanel onOpen={(dest) => flash(`Opening ${dest} …`)} />
       </div>
 
@@ -1114,8 +1130,8 @@ function JsPanel({ node, file, code, tab, setTab, onApply, inputSchema, outputSc
           <div className="space-y-3 text-xs" data-testid="tab-panel-isolation">
             <div className="flex items-center gap-2">
               <ShieldCheck className="h-4 w-4 text-emerald-300" />
-              <span className="font-mono text-slate-200">{exLabel(node?.executor ?? "nsjail")}</span>
-              <InfoTip text="OS-level isolation, ON by default. The compiler emits pure per-node functions so swapping executor rungs is a drop-in." />
+              <span className="font-mono text-slate-200">{exLabel(node?.executor ?? "container")}</span>
+              <InfoTip text="OS-level isolation, ON by default (the hardened Docker container executor today). The compiler emits pure per-node functions so swapping executor rungs is a drop-in." />
             </div>
             {node?.limits && (
               <div className="grid grid-cols-2 gap-2">
@@ -1172,7 +1188,11 @@ function Note({ icon, children }: { icon: React.ReactNode; children: React.React
   return <div className="flex items-start gap-2 rounded-lg border border-white/5 bg-ink-950/40 p-2 text-[11px] text-slate-400">{icon}<span>{children}</span></div>;
 }
 function exLabel(e: string) {
-  return { nsjail: "NsjailProcessExecutor", gvisor: "GvisorExecutor", firecracker: "FirecrackerExecutor", k8sjob: "K8sJobExecutor" }[e] ?? e;
+  return {
+    "in-process": "InProcessExecutor", inprocess: "InProcessExecutor",
+    container: "DockerExecutor (container)", docker: "DockerExecutor (container)",
+    nsjail: "NsjailProcessExecutor", gvisor: "GvisorExecutor", firecracker: "FirecrackerExecutor", k8sjob: "K8sJobExecutor",
+  }[e] ?? e;
 }
 function SchemaBox({ label, value, tip }: { label: string; value: string; tip: string }) {
   return (
@@ -1214,34 +1234,58 @@ function TriggerIcon({ type }: { type: string }) {
   return type === "cron" ? <Clock className="h-3.5 w-3.5" /> : type === "webhook" ? <Webhook className="h-3.5 w-3.5" /> : type === "event" ? <Zap className="h-3.5 w-3.5" /> : <Hand className="h-3.5 w-3.5" />;
 }
 
-function TriggersPanel({ workflow, projectId, onCopy }: { workflow: Workflow; projectId: string; onCopy: (url: string) => void }) {
+function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, workflow, projectId, onCopy }: { triggers: EditTrigger[]; setTriggers: (t: EditTrigger[]) => void; exclusive: boolean; setExclusive: (v: boolean) => void; workflow: string; projectId: string; onCopy: (url: string) => void }) {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const hookUrl = `${origin}/p/w/${workflow.id}/${projectId}`; // tokenized ingress URL (bearer required)
+  const hookUrl = `${origin}/p/w/${workflow}/${projectId}`; // tokenized ingress URL (bearer required)
+  const update = (i: number, patch: Partial<EditTrigger>) => setTriggers(triggers.map((t, j) => (j === i ? { ...t, ...patch } : t)));
+  const remove = (i: number) => setTriggers(triggers.filter((_, j) => j !== i));
+  const add = () => setTriggers([...triggers, { type: "manual" }]);
   return (
     <div className="card p-4" data-testid="triggers-panel">
       <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
-        Triggers <InfoTip text="How runs start. Cron (app-level BullMQ repeatable jobs by default), webhook (a tokenized ingress URL on this host — POST with a Bearer token), manual, or an event (called by another script)." /> <Spec doc="ARCH §8" />
+        Triggers <InfoTip text="How runs start. Change a trigger's type, add a cron schedule, or a webhook path. Save commits it to workflow.yaml and the reconciler registers it (a cron then fires on schedule)." /> <Spec doc="ARCH §8" />
       </h2>
-      <div className="mt-3 space-y-2">
-        {workflow.triggers.map((t, i) => (
-          <div key={i} className="flex items-center justify-between gap-2 rounded-lg border border-white/5 bg-ink-950/40 px-3 py-2 text-xs">
-            <span className="flex min-w-0 items-center gap-2 text-slate-300">
+      <div className="mt-3 space-y-2" data-testid="triggers-list">
+        {triggers.map((t, i) => (
+          <div key={i} className="rounded-lg border border-white/5 bg-ink-950/40 p-2 text-xs" data-testid={`trigger-${i}`}>
+            <div className="flex items-center gap-2">
               <TriggerIcon type={t.type} />
-              <span className="font-medium capitalize">{t.type}</span>
-              {t.type === "webhook"
-                ? <span className="truncate font-mono text-[10px] text-slate-500">{hookUrl}</span>
-                : t.detail && <span className="font-mono text-slate-400">{t.detail}</span>}
-            </span>
-            <span className="flex shrink-0 items-center gap-2 text-slate-500">
-              {t.type === "cron" && t.nextRun && <span className="chip bg-white/5 text-slate-400">next {t.nextRun}</span>}
-              {t.type === "webhook" && (
-                <button className="chip bg-white/5 text-slate-400 hover:text-slate-200" onClick={() => onCopy(hookUrl)} data-testid="copy-webhook"><Copy className="h-3 w-3" /> copy URL</button>
+              <select className="inp !w-auto !py-1 text-xs" data-testid={`trigger-type-${i}`} value={t.type} onChange={(e) => update(i, { type: e.target.value as EditTrigger["type"] })}>
+                <option value="manual">manual</option>
+                <option value="cron">cron</option>
+                <option value="webhook">webhook</option>
+                <option value="event">event</option>
+              </select>
+              {t.type === "cron" && (
+                <>
+                  <input className="inp !py-1 flex-1 font-mono text-[11px]" data-testid={`trigger-schedule-${i}`} placeholder="* * * * *  (e.g. 0 9 * * 1-5)" value={t.schedule ?? ""} onChange={(e) => update(i, { schedule: e.target.value })} />
+                  <InfoTip text="Standard cron (min hour dom mon dow), or a 6-field with seconds. e.g. '*/30 * * * * *' = every 30s." />
+                </>
               )}
-              {t.concurrencyPolicy && <span className="font-mono text-[10px] text-slate-600">{t.concurrencyPolicy}</span>}
-            </span>
+              {t.type === "webhook" && (
+                <input className="inp !py-1 flex-1 font-mono text-[11px]" data-testid={`trigger-path-${i}`} placeholder="custom path (optional)" value={t.path ?? ""} onChange={(e) => update(i, { path: e.target.value })} />
+              )}
+              <button type="button" className="rounded p-1 text-slate-500 hover:text-rose-300" data-testid={`trigger-remove-${i}`} onClick={() => remove(i)} title="Remove trigger"><Trash2 className="h-3.5 w-3.5" /></button>
+            </div>
+            {t.type === "webhook" && (
+              <div className="mt-1.5 flex items-center gap-2 pl-6">
+                <span className="truncate font-mono text-[10px] text-slate-500">{hookUrl}</span>
+                <button className="chip shrink-0 bg-white/5 text-slate-400 hover:text-slate-200" onClick={() => onCopy(hookUrl)} data-testid="copy-webhook"><Copy className="h-3 w-3" /> copy URL</button>
+              </div>
+            )}
           </div>
         ))}
+        <button type="button" className="btn-ghost text-xs" data-testid="add-trigger" onClick={add}><Plus className="h-3.5 w-3.5" /> Add trigger</button>
+        <p className="text-[11px] text-slate-500">Changes commit on <strong>Save</strong>; the reconciler then (de)registers cron/webhook triggers.</p>
       </div>
+      <label className="mt-3 flex cursor-pointer items-start gap-2 border-t border-white/5 pt-3 text-xs" data-testid="exclusive-toggle">
+        <input type="checkbox" className="mt-0.5" checked={exclusive} onChange={(e) => setExclusive(e.target.checked)} data-testid="exclusive-checkbox" />
+        <span>
+          <span className="font-medium text-slate-200">Run exclusively</span>
+          <InfoTip text="The worker/pod that picks up this run takes NO other jobs until it finishes — the whole pod is dedicated to it. Best for heavy or CPU/memory-hungry runs. With queue-depth autoscaling, an exclusive job pulls up a fresh pod that dedicates itself." />
+          <span className="block text-[11px] text-slate-500">Dedicate a whole worker pod to each run (no co-tenant jobs).</span>
+        </span>
+      </label>
     </div>
   );
 }

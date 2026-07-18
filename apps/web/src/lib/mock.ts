@@ -12,8 +12,9 @@ export type NodeStatus = "idle" | "queued" | "running" | "succeeded" | "failed";
 export type TriggerType = "cron" | "webhook" | "manual" | "event";
 export type ConcurrencyPolicy = "Allow" | "Forbid" | "Replace";
 
-/** The isolation ladder from ARCHITECTURE §6 — nsjail is the ON-by-default hot path. */
-export type ExecutorTier = "nsjail" | "gvisor" | "firecracker" | "k8sjob";
+/** Executor tiers (ARCHITECTURE §6). Implemented today: in-process (the EKS default, the pod
+ *  is the boundary) and container (local-only per-job docker). The rest are roadmap. */
+export type ExecutorTier = "in-process" | "container" | "nsjail" | "gvisor" | "firecracker" | "k8sjob";
 
 /**
  * A workflow is a real program drawn as a flow graph. Each node is one of five
@@ -129,6 +130,7 @@ export interface Workflow {
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   concurrencyPolicy?: ConcurrencyPolicy;
+  exclusive?: boolean; // run alone on a worker/pod until done
   activeRevision?: string; // the reconciled version actually dispatching
   runs?: RunRecord[];
 }
@@ -268,7 +270,7 @@ const invoices: Workflow = {
       outputSchema: "Array<{ id, status, lines: {amount}[] }>",
       secrets: ["API_URL", "API_TOKEN"],
       limits: { memMB: 256, cpuMs: 15_000, wallMs: 30_000, network: "egress-allowlist" },
-      executor: "nsjail",
+      executor: "container",
     },
     {
       key: "gate", kind: "if", name: "Any open invoices?", position: { x: 360, y: 150 },
@@ -280,7 +282,7 @@ const invoices: Workflow = {
       position: { x: 545, y: 40 },
       inputSchema: "Array<{ id, status, lines: {amount}[] }>",
       outputSchema: "Array<{ id, total: number }>",
-      limits: defaultLimits, executor: "nsjail",
+      limits: defaultLimits, executor: "container",
     },
     {
       key: "load", kind: "jscode", name: "Load Warehouse", file: "nodes/load.js", code: loadCode,
@@ -350,12 +352,12 @@ const reconcile: Workflow = {
     {
       key: "pull", kind: "jscode", name: "Pull Payments", file: "nodes/pull.js", code: pullCode, position: { x: 170, y: 130 },
       inputSchema: "{ since: string }", outputSchema: "Array<Payment>", secrets: ["PSP_URL", "PSP_KEY"],
-      limits: defaultLimits, executor: "nsjail",
+      limits: defaultLimits, executor: "container",
     },
     {
       key: "match", kind: "jscode", name: "Match", file: "nodes/match.js", code: matchCode, position: { x: 350, y: 130 },
       inputSchema: "Array<Payment>", outputSchema: "{ matched: number, flagged: number }",
-      limits: defaultLimits, executor: "nsjail",
+      limits: defaultLimits, executor: "container",
     },
     {
       key: "decide", kind: "if", name: "Any unmatched?", position: { x: 535, y: 130 },
@@ -405,13 +407,13 @@ const dunning: Workflow = {
     {
       key: "query", kind: "jscode", name: "Query Overdue", file: "nodes/query.js", code: queryCode, position: { x: 170, y: 130 },
       inputSchema: "{}", outputSchema: "Array<Invoice>", secrets: ["WAREHOUSE_DSN"],
-      limits: defaultLimits, executor: "nsjail",
+      limits: defaultLimits, executor: "container",
     },
     { key: "gate", kind: "if", name: "Anything overdue?", position: { x: 355, y: 130 }, condition: "overdue.length > 0" },
     {
       key: "send", kind: "jscode", name: "Send Email", file: "nodes/send.js", code: sendCode, position: { x: 540, y: 40 },
       inputSchema: "Array<Invoice>", outputSchema: "{ sent: number }", secrets: ["SMTP_URL"],
-      limits: defaultLimits, executor: "nsjail",
+      limits: defaultLimits, executor: "container",
     },
     { key: "end", kind: "end", name: "End", position: { x: 540, y: 240 } },
   ],
@@ -513,7 +515,7 @@ export const workspace = {
 
 export const workers: Worker[] = [
   {
-    id: "w-7f3a", host: "mill-worker-7f3a", status: "online", inFlight: 12, concMin: 1, concMax: 32, paused: false, memMB: 540, memMaxMB: 1024, executor: "nsjail", heartbeatAgeS: 2, leaseTtlS: 15,
+    id: "w-7f3a", host: "mill-worker-7f3a", status: "online", inFlight: 12, concMin: 1, concMax: 32, paused: false, memMB: 540, memMaxMB: 1024, executor: "in-process", heartbeatAgeS: 2, leaseTtlS: 15,
     jobs: [
       { id: "job_a1c9", workflow: "Nightly Invoices", project: "billing", node: "Load Warehouse", elapsedMs: 2100, memMB: 96 },
       { id: "job_a2f0", workflow: "Payment Reconcile", project: "billing", node: "Match", elapsedMs: 800, memMB: 64 },
@@ -522,14 +524,14 @@ export const workers: Worker[] = [
   },
   // Only 6 in-flight but its jobs turned heavy → memory 89% > 85% → paused (won't pull more).
   {
-    id: "w-2b91", host: "mill-worker-2b91", status: "online", inFlight: 6, concMin: 1, concMax: 64, paused: true, memMB: 910, memMaxMB: 1024, executor: "nsjail", heartbeatAgeS: 1, leaseTtlS: 15,
+    id: "w-2b91", host: "mill-worker-2b91", status: "online", inFlight: 6, concMin: 1, concMax: 64, paused: true, memMB: 910, memMaxMB: 1024, executor: "in-process", heartbeatAgeS: 1, leaseTtlS: 15,
     jobs: [
       { id: "job_b0d2", workflow: "Nightly Invoices", project: "billing", node: "Load Warehouse", elapsedMs: 12300, memMB: 512 },
       { id: "job_b1a4", workflow: "Payment Reconcile", project: "billing", node: "Pull Payments", elapsedMs: 8100, memMB: 210 },
     ],
   },
   {
-    id: "w-c04d", host: "mill-worker-c04d", status: "draining", inFlight: 1, concMin: 1, concMax: 8, paused: false, memMB: 220, memMaxMB: 1024, executor: "gvisor", heartbeatAgeS: 4, leaseTtlS: 15,
+    id: "w-c04d", host: "mill-worker-c04d", status: "draining", inFlight: 1, concMin: 1, concMax: 8, paused: false, memMB: 220, memMaxMB: 1024, executor: "in-process", heartbeatAgeS: 4, leaseTtlS: 15,
     jobs: [
       { id: "job_c7e1", workflow: "Dunning Emails", project: "billing", node: "Query Overdue", elapsedMs: 600, memMB: 48 },
     ],
@@ -553,6 +555,7 @@ export const queue = {
 export const fleetStats = {
   throughputPerMin: 47, // jobs completed / minute across the fleet
   completedLastHour: 2810,
+  failedLastHour: 39, // ~1.4% — surfaced prominently on the dashboard
   p50Ms: 1200,
   p95Ms: 4800,
   successRatePct: 98.6,
@@ -576,18 +579,21 @@ export const exportBundle = [
 
 /** The isolation ladder for the Executor seam — ARCHITECTURE §6. */
 export const isolationLadder: {
-  tier: ExecutorTier;
+  tier: string;
   name: string;
   trust: string;
   coldStart: string;
   boundary: string;
-  status: "default" | "next" | "later" | "optin";
+  status: "default" | "dev" | "local" | "next" | "later" | "optin";
+  executor: string | null; // matches a worker's live `executor` value when implemented
   note: string;
 }[] = [
-  { tier: "nsjail", name: "NsjailProcessExecutor", trust: "internal-trusted", coldStart: "~ms", boundary: "userns + seccomp-bpf + cgroups", status: "default", note: "ON by default — the warm-pool hot path (what Windmill ships for hardened workers)." },
-  { tier: "gvisor", name: "GvisorExecutor", trust: "semi-trusted", coldStart: "sub-VM", boundary: "user-space kernel (runsc)", status: "next", note: "Syscall interception at container density." },
-  { tier: "firecracker", name: "FirecrackerExecutor", trust: "untrusted", coldStart: "~125ms", boundary: "hardware KVM microVM", status: "later", note: "<5 MiB/VM; the hardest multi-tenant tier." },
-  { tier: "k8sjob", name: "K8sJobExecutor", trust: "heavy / opt-in", coldStart: "seconds", boundary: "pod-per-run (gVisor/Kata RuntimeClass)", status: "optin", note: "Per-workflow choice for heavy/long jobs — never the default hot path." },
+  { tier: "dev", name: "InProcessExecutor (dev / CLI)", trust: "local dev", coldStart: "~0", boundary: "none — same process, no pod", status: "dev", executor: null, note: "Local `mill run` and the step-tester. No isolation — never used in the cluster." },
+  { tier: "pod", name: "Hardened worker pod (in-process)", trust: "internal-trusted", coldStart: "~0 (warm pod)", boundary: "pod securityContext: non-root · read-only rootfs · cap-drop ALL · no-new-privileges · seccomp + mem/CPU limits", status: "default", executor: "in-process", note: "The EKS hot path: HPA-scaled worker pods each run nodes IN-PROCESS inside a locked-down pod — the pod IS the sandbox. This is what the live workers report." },
+  { tier: "container", name: "DockerExecutor (container-per-job)", trust: "local only", coldStart: "~100–300ms", boundary: "a fresh hardened container per job (docker run --rm)", status: "local", executor: "docker", note: "Local-only convenience to demo per-job isolation without k8s (needs a Docker socket). NOT how EKS runs — see DEPLOYMENT.md." },
+  { tier: "gvisor", name: "GvisorExecutor", trust: "semi-trusted", coldStart: "sub-VM", boundary: "user-space kernel (runsc) on the pod", status: "next", executor: null, note: "Roadmap — hardens the pod boundary via syscall interception at container density." },
+  { tier: "firecracker", name: "FirecrackerExecutor", trust: "untrusted", coldStart: "~125ms", boundary: "hardware KVM microVM", status: "later", executor: null, note: "Roadmap — <5 MiB/VM; the hardest multi-tenant tier." },
+  { tier: "k8sjob", name: "K8sJobExecutor (pod-per-run)", trust: "heavy / opt-in", coldStart: "seconds", boundary: "one K8s Job/Pod per run (gVisor/Kata RuntimeClass)", status: "optin", executor: null, note: "Roadmap opt-in — per-workflow pod-per-run for untrusted/heavy jobs; never the default hot path." },
 ];
 
 export function findProject(id?: string) {

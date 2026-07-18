@@ -50,7 +50,7 @@ export async function getWorkers(): Promise<{ workers: LiveWorker[]; queueDepth:
 }
 
 export interface FleetStats {
-  throughputPerMin: number; completedLastHour: number; p50Ms: number; p95Ms: number;
+  throughputPerMin: number; completedLastHour: number; failedLastHour: number; p50Ms: number; p95Ms: number;
   successRatePct: number; avgWaitMs: number; throughputTrend: number[];
 }
 export interface FleetData {
@@ -89,6 +89,7 @@ export interface LiveGraph {
   edges: { from: string; to: string; branch?: "true" | "false" }[];
   order: string[];
   triggers: any[];
+  exclusive?: boolean;
 }
 export async function getWorkflowGraph(projectId: string, wf: string): Promise<LiveGraph> {
   const r = await fetch(`${BASE}/projects/${projectId}/workflows/${wf}`);

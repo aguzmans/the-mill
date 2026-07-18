@@ -7,18 +7,25 @@ export type Health = "Healthy" | "Degraded";
 export type Sync = "Synced" | "OutOfSync";
 
 export interface WorkflowStatus { name: string; ok: boolean; error?: string }
-export interface ProjectStatus { id: string; health: Health; workflows: WorkflowStatus[] }
+export interface ProjectStatus {
+  id: string;
+  health: Health;
+  workflows: WorkflowStatus[];
+  sync?: Sync; // per-project: Synced if this project is applied to target, else OutOfSync (held)
+  appliedRevision?: string; // the revision this project's live state is at
+  autoSync?: boolean; // this project's declared sync.autoSync
+}
 
 export interface ReconcileStatus {
   targetRevision: string; // desired: origin/<branch> HEAD
-  syncedRevision: string; // live: last-known-good actually checked out
+  syncedRevision: string; // live: overall (= target only when every project is applied)
   sync: Sync;
   health: Health;
   projects: ProjectStatus[];
   error?: string;
 }
 
-/** Repo the controller reconciles. syncedRevision advances only on a clean revision. */
+/** Repo the controller reconciles. syncedRevision advances only on a clean, applied revision. */
 export interface RepoState {
   dir: string; // working copy
   branch: string;
@@ -57,30 +64,23 @@ export function validateTree(root: string): { ok: boolean; projects: ProjectStat
 }
 
 /**
- * One reconcile pass (level-triggered, idempotent):
- *   fetch → resolve origin/<branch> → validate that revision in a throwaway worktree →
- *   apply (checkout) ONLY if the whole tree compiles, else keep last-known-good.
- * Mutates state.syncedRevision when it advances.
+ * One reconcile pass (level-triggered, idempotent): fetch → validate the target in a throwaway
+ * worktree → apply (checkout) ONLY if it compiles AND `opts.apply` is on. When apply is off
+ * (autoSync disabled) a validated new revision is HELD (OutOfSync) until a manual Sync.
  */
 export async function reconcile(state: RepoState, opts: { apply?: boolean } = {}): Promise<ReconcileStatus> {
-  const apply = opts.apply !== false; // default: auto-apply. autoSync=false → validate only (manual Sync applies).
+  const apply = opts.apply !== false; // default: auto-apply
   try {
     await Git.fetch(state.dir);
     const target = await Git.revParse(state.dir, `origin/${state.branch}`);
 
-    // Fetch/apply split: validate the candidate revision without disturbing the live copy.
     const candidate = `${state.dir}.candidate`;
     await Git.worktreeRemove(state.dir, candidate);
     await Git.worktreeAdd(state.dir, candidate, target);
     let v: { ok: boolean; projects: ProjectStatus[] };
-    try {
-      v = validateTree(candidate);
-    } finally {
-      await Git.worktreeRemove(state.dir, candidate);
-    }
+    try { v = validateTree(candidate); } finally { await Git.worktreeRemove(state.dir, candidate); }
 
-    // Apply only if it validates AND auto-apply is on (or this is a manual sync).
-    const pending = v.ok && apply === false && state.syncedRevision !== target;
+    const pending = v.ok && !apply && state.syncedRevision !== target;
     if (v.ok && apply) {
       await Git.checkoutDetach(state.dir, target); // advance the serving copy
       state.syncedRevision = target;
@@ -153,7 +153,7 @@ export async function writePaths(state: RepoState, files: { path: string; conten
 
 export interface DiffEntry { change: "added" | "modified" | "deleted" | "renamed"; path: string }
 
-/** What a Sync would apply: name-status diff between the live and target revisions. */
+/** What a Sync would apply: name-status diff between the live (synced) and target revisions. */
 export async function diffToApply(state: RepoState, target: string, subpath?: string): Promise<DiffEntry[]> {
   if (!state.syncedRevision || !target || state.syncedRevision === target) return [];
   const raw = await Git.diffNameStatus(state.dir, state.syncedRevision, target, subpath).catch(() => "");

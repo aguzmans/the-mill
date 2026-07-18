@@ -22,9 +22,13 @@ export const Git = {
   fetch: (dir: string) => git(["fetch", "--quiet", "--all", "--prune"], dir),
   revParse: (dir: string, ref: string) => git(["rev-parse", ref], dir),
   headSha: (dir: string) => git(["rev-parse", "HEAD"], dir),
-  checkoutDetach: (dir: string, sha: string) => git(["checkout", "--quiet", "--detach", sha], dir),
+  // --force so a clean target checkout discards any per-project pins staged by a prior pass
+  // (otherwise git preserves them as "local changes" and a held pin would never release).
+  checkoutDetach: (dir: string, sha: string) => git(["checkout", "--quiet", "--force", "--detach", sha], dir),
+  /** Restore one path in the working tree from a specific revision (per-project pinning). */
+  checkoutPath: (dir: string, sha: string, path: string) => git(["checkout", sha, "--", path], dir),
   // ── write side (UI edits → commits, ARCHITECTURE §5) ──────────────────────
-  checkoutBranch: (dir: string, branch: string) => git(["checkout", "-q", "-B", branch, `origin/${branch}`], dir),
+  checkoutBranch: (dir: string, branch: string) => git(["checkout", "-q", "-f", "-B", branch, `origin/${branch}`], dir),
   add: (dir: string) => git(["add", "-A"], dir),
   commit: (dir: string, message: string) => git(["-c", "user.email=mill@local", "-c", "user.name=Mill", "commit", "-q", "-m", message], dir),
   push: (dir: string, branch: string) => git(["push", "-q", "origin", branch], dir),

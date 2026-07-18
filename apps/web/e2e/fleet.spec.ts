@@ -14,6 +14,18 @@ test.describe("worker fleet", () => {
     await expect(page.getByTestId("worker-w-7f3a")).toContainText("MB");
   });
 
+  test("surfaces failures prominently (banner + red stat) so operators notice", async ({ page }) => {
+    await page.goto("/fleet");
+    // mock fleet has failures → a red banner and a highlighted Failed stat card
+    const banner = page.getByTestId("failures-banner");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("failed run");
+    const failed = page.getByTestId("stat-failed");
+    await expect(failed).toBeVisible();
+    await expect(failed).toContainText("Failed");
+    await expect(failed).toHaveAttribute("data-danger", "true");
+  });
+
   test("shows dynamic min–max concurrency and a paused (load-shedding) worker", async ({ page }) => {
     await page.goto("/fleet");
     // per-worker band + fleet-level HPA in the autoscaling panel
@@ -40,5 +52,20 @@ test.describe("worker fleet", () => {
     await expect(jobs).toContainText("Running now");
     await expect(jobs).toContainText("Load Warehouse");
     await expect(jobs).toContainText("more in flight");
+  });
+
+  test("isolation ladder reflects the EKS model (pod = boundary) + roadmap tiers", async ({ page }) => {
+    await page.goto("/fleet");
+    const ladder = page.getByTestId("isolation-ladder");
+    await expect(ladder).toBeVisible();
+    // dev + the EKS default (hardened worker pod, in-process)
+    await expect(page.getByTestId("ladder-dev")).toContainText("InProcessExecutor");
+    await expect(page.getByTestId("ladder-pod")).toContainText("Hardened worker pod");
+    // docker is a local-only demo, not the k8s path
+    await expect(page.getByTestId("ladder-container")).toContainText("local");
+    // roadmap rungs
+    await expect(page.getByTestId("ladder-gvisor")).toContainText("GvisorExecutor");
+    await expect(page.getByTestId("ladder-firecracker")).toContainText("FirecrackerExecutor");
+    await expect(page.getByTestId("ladder-k8sjob")).toContainText("K8sJobExecutor");
   });
 });

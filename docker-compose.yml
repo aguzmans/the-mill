@@ -15,6 +15,18 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # Persistence: AOF (appendfsync everysec) + the default RDB snapshots, so a restart keeps
+    # jobs/history/journal. maxmemory-policy volatile-ttl evicts the nearest-to-expire job keys
+    # first if MILL_REDIS_MAXMEMORY is hit (the queue/registry keys have no TTL, so they're never
+    # evicted). Size MILL_REDIS_MAXMEMORY from docs/DEPLOYMENT.md § Redis sizing.
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory ${MILL_REDIS_MAXMEMORY:-1gb}
+      --maxmemory-policy volatile-ttl
+    volumes:
+      - redis-data:/data   # mount a real volume in prod so persistence survives restarts
     ports:
       - "6379:6379"
 
@@ -40,6 +52,8 @@ services:
       - MILL_CORS_ORIGINS=${MILL_CORS_ORIGINS:-}
       - DEPS_TOKEN=${DEPS_TOKEN:-}   # per-project ingress token (demo)
       - MILL_AUTOSYNC=${MILL_AUTOSYNC:-true}   # false → validate but hold new revisions (manual Sync applies)
+      - MILL_JOB_TTL_SECONDS=${MILL_JOB_TTL_SECONDS:-604800}   # job/event/journal retention (default 7 days)
+      - MILL_COMPLETED_MAX=${MILL_COMPLETED_MAX:-5000}         # rolling cap on the dashboard completed-runs list
     volumes:
       - workdir:/app/workdir   # shared working copy (PVC-equivalent) so workers see reconciled code
     ports:
@@ -47,18 +61,40 @@ services:
     depends_on:
       - redis
 
+  # Mirrors an EKS *worker Deployment*: a separate, HPA-scaled set of pods that pull jobs
+  # from the queue and run each node IN-PROCESS. The pod itself is the isolation boundary —
+  # so this container is hardened like a locked-down pod (non-root, read-only rootfs, all
+  # caps dropped, no-new-privileges) with resource limits standing in for the pod requests/
+  # limits. It never runs alongside the api. (MILL_EXECUTOR is intentionally unset — docker
+  # mode is a local-only trick and is NOT how k8s runs; see docs/DEPLOYMENT.md §Isolation.)
   worker:
     image: mill-backend
     command: bun /app/apps/worker/src/worker.ts
     restart: unless-stopped
+    read_only: true               # pod securityContext.readOnlyRootFilesystem
+    tmpfs:
+      - /tmp                       # the only writable path the runtime needs
+    cap_drop:
+      - ALL                        # pod securityContext.capabilities.drop: [ALL]
+    security_opt:
+      - no-new-privileges:true     # pod securityContext.allowPrivilegeEscalation: false
     environment:
+      - HOME=/tmp                  # keep any runtime cache writes on the tmpfs
       - REDIS_URL=redis://redis:6379
       - MILL_CONC_MIN=1
       - MILL_CONC_MAX=8
+      - MILL_MEM_MAX_MB=1024       # match the memory limit below (pod memory limit)
+      - MILL_JOB_TTL_SECONDS=${MILL_JOB_TTL_SECONDS:-604800}   # must match the api (job key TTL)
       # Flat secrets, as k8s Secrets would be injected on EKS (each node still sees only its declared refs).
       - MILL_SECRETS={"WAREHOUSE_DSN":"postgres://demo","SMTP_URL":"smtp://demo","API_URL":"https://demo","WEBHOOK_SECRET":"whsec_test_123"}
     volumes:
-      - workdir:/app/workdir   # reads the same reconciled working copy the controller checks out
+      - workdir:/app/workdir:ro    # reads (read-only) the reconciled working copy the controller checks out
+    deploy:
+      replicas: 2                  # a small worker fleet (HPA scales this on EKS)
+      resources:
+        limits:
+          memory: 1024M
+          cpus: "1.0"
     depends_on:
       - redis
 
@@ -66,9 +102,16 @@ services:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
+      args:
+        # live = dynamic UI wired to the api (nginx proxies /api). Set to "mock"
+        # for the standalone static prototype with no backend.
+        MILL_MODE: ${MILL_WEB_MODE:-live}
     image: mill-web
+    restart: unless-stopped
     ports:
       - "8080:80"
+    depends_on:
+      - api
 
   e2e:
     build:
@@ -80,3 +123,4 @@ services:
 
 volumes:
   workdir: {}
+  redis-data: {}   # Redis AOF/RDB persistence (jobs, history, journal survive restarts)

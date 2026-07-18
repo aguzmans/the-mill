@@ -169,3 +169,20 @@ describe("topoSort", () => {
     expect(hasCycle(wf)).toBe(false);
   });
 });
+
+describe("workflow-level exclusive flag", () => {
+  test("defaults to undefined when omitted", () => {
+    const r = parseWorkflow(validWorkflow());
+    expect(r.ok).toBe(true);
+    expect(r.value?.exclusive).toBeUndefined();
+  });
+  test("accepts exclusive: true and carries it onto the parsed value", () => {
+    const r = parseWorkflow({ ...validWorkflow(), exclusive: true });
+    expect(r.ok).toBe(true);
+    expect(r.value?.exclusive).toBe(true);
+  });
+  test("rejects a non-boolean exclusive", () => {
+    const r = parseWorkflow({ ...validWorkflow(), exclusive: "yes" });
+    expect(r.ok).toBe(false);
+  });
+});

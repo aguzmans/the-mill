@@ -29,4 +29,17 @@ test.describe("editor tooling", () => {
     await page.getByTestId("palette-if").click();
     await expect(page.getByTestId("node-if-1")).toBeVisible();
   });
+
+  test("a JS Code node has a dependencies editor that adds and removes npm deps", async ({ page }) => {
+    await page.getByTestId("node-transform").click();
+    const deps = page.getByTestId("deps-editor");
+    await expect(deps).toBeVisible();
+    await page.getByTestId("dep-name").fill("nanoid");
+    await page.getByTestId("dep-version").fill("^5.0.0");
+    await page.getByTestId("dep-add").click();
+    await expect(page.getByTestId("deps-list")).toContainText("nanoid@^5.0.0");
+    // remove it again (deps-list may disappear if it was the only dep → assert on the panel)
+    await page.getByTestId("dep-remove-nanoid").click();
+    await expect(deps).not.toContainText("nanoid");
+  });
 });

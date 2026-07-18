@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Cpu, Layers, Activity, MemoryStick, HeartPulse, Gauge, ShieldCheck, Zap, Timer, CheckCircle2, Hourglass, Clock, Loader2 } from "lucide-react";
+import { Cpu, Layers, Activity, MemoryStick, HeartPulse, Gauge, ShieldCheck, Zap, Timer, CheckCircle2, Hourglass, Clock, Loader2, AlertTriangle } from "lucide-react";
 import { workers as mockWorkers, queue as mockQueue, fleetStats as mockStats, isolationLadder } from "../lib/mock";
 import { InfoTip } from "../components/InfoTip";
 import { Spec } from "../components/Kit";
@@ -28,6 +28,8 @@ function Meter({ value, max, warn }: { value: number; max: number; warn?: boolea
 
 const statusBadge: Record<string, string> = {
   default: "bg-emerald-500/15 text-emerald-300",
+  dev: "bg-violet-500/15 text-violet-300",
+  local: "bg-cyan-500/15 text-cyan-300",
   next: "bg-sky-500/15 text-sky-300",
   later: "bg-slate-500/15 text-slate-300",
   optin: "bg-amber-500/15 text-amber-300",
@@ -54,21 +56,25 @@ export function FleetPage() {
       }));
   const fleetStats: FleetStats = ready ? fleet!.stats : {
     throughputPerMin: mockStats.throughputPerMin, completedLastHour: mockStats.completedLastHour,
+    failedLastHour: mockStats.failedLastHour,
     p50Ms: mockStats.p50Ms, p95Ms: mockStats.p95Ms, successRatePct: mockStats.successRatePct,
     avgWaitMs: mockStats.avgWaitMs, throughputTrend: mockStats.throughputTrend,
   };
+  const failed = fleetStats.failedLastHour ?? 0;
   const queue: ViewQueue = ready ? fleet!.queue
     : { depth: mockQueue.depth, oldestWaitMs: mockQueue.oldestWaitMs, byWorkflow: mockQueue.byWorkflow };
 
   const online = workers.filter((w) => w.status === "online").length;
   const inFlight = workers.reduce((s, w) => s + w.inFlight, 0);
+  // Which isolation rung is actually serving right now = the executor(s) the live workers report.
+  const activeExecutors = new Set(workers.filter((w) => w.status === "online").map((w) => w.executor));
 
   return (
     <div className="space-y-6" data-testid="fleet-page">
       <div>
         <h1 className="flex items-center gap-2 text-2xl font-semibold text-white">
           Worker Fleet
-          <InfoTip text="Stateless Bun workers pull jobs from the queue and run each node in an isolated OS-level (container) process. They register in Redis on startup with a heartbeat TTL." />
+          <InfoTip text="Stateless Bun workers pull jobs from the queue and run each node in-process inside their own hardened, HPA-scaled pod (the pod is the isolation boundary). They register in Redis on startup with a heartbeat TTL and never run alongside the api." />
           {LIVE && (
             <span className={`chip text-[10px] ${ready ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/15 text-slate-400"}`} data-testid="fleet-source">
               {ready ? "live" : "connecting…"}
@@ -76,22 +82,34 @@ export function FleetPage() {
           )}
         </h1>
         <p className="mt-1 flex items-center gap-2 text-sm text-slate-400">
-          Fleet scaled by the HPA on memory/CPU (no KEDA); each worker runs a dynamic min–max concurrency band. <Spec doc="ARCH §9" />
+          Fleet scaled by the HPA on memory/CPU, or on queue depth via KEDA/custom metrics; each worker runs a dynamic min–max concurrency band. <Spec doc="ARCH §9" />
         </p>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+      {/* Failures banner — impossible to miss when runs are failing. */}
+      {failed > 0 && (
+        <div className="flex items-center gap-3 rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200" data-testid="failures-banner" role="alert">
+          <AlertTriangle className="h-5 w-5 shrink-0 text-rose-400" />
+          <span>
+            <strong className="font-semibold text-rose-100">{failed.toLocaleString()} failed run{failed === 1 ? "" : "s"}</strong> in the last hour
+            {fleetStats.completedLastHour > 0 && <> · success rate {fleetStats.successRatePct}%</>}. Check Run history for the failing workflows.
+          </span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {[
-          { icon: <Cpu className="h-4 w-4" />, label: "Workers online", value: online, tip: "Live workers pulling jobs. A missed heartbeat expires the registry lease and requeues their in-flight jobs.", testid: "stat-workers" },
-          { icon: <Layers className="h-4 w-4" />, label: "Queue depth", value: queue.depth, tip: "Jobs waiting in the Redis queue. Workers pull from here as capacity frees up; the fleet scales on worker memory/CPU (HPA), not on this number.", testid: "stat-queue" },
-          { icon: <Activity className="h-4 w-4" />, label: "Jobs in flight", value: inFlight, tip: "Jobs currently executing across the fleet.", testid: "stat-inflight" },
+          { icon: <Cpu className="h-4 w-4" />, label: "Workers online", value: online, tip: "Live workers pulling jobs. A missed heartbeat expires the registry lease and requeues their in-flight jobs.", testid: "stat-workers", danger: false },
+          { icon: <Layers className="h-4 w-4" />, label: "Queue depth", value: queue.depth, tip: "Jobs waiting in the Redis queue. Workers pull from here as capacity frees up; the fleet scales on worker memory/CPU (HPA), not on this number.", testid: "stat-queue", danger: false },
+          { icon: <Activity className="h-4 w-4" />, label: "Jobs in flight", value: inFlight, tip: "Jobs currently executing across the fleet.", testid: "stat-inflight", danger: false },
+          { icon: <AlertTriangle className="h-4 w-4" />, label: "Failed (1h)", value: failed, tip: "Runs that finished failed in the last hour. Red = attention needed — open Run history to see which workflows and why. Alerting: mill_jobs_total{status=\"failed\"}.", testid: "stat-failed", danger: failed > 0 },
         ].map((s, i) => (
-          <motion.div key={s.label} className="card p-4" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} data-testid={s.testid}>
-            <div className="flex items-center gap-2 text-sm text-slate-400">
+          <motion.div key={s.label} className={`card p-4 ${s.danger ? "border-rose-500/40 bg-rose-500/5" : ""}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }} data-testid={s.testid} data-danger={s.danger ? "true" : undefined}>
+            <div className={`flex items-center gap-2 text-sm ${s.danger ? "text-rose-300" : "text-slate-400"}`}>
               {s.icon} {s.label}
               <InfoTip text={s.tip} />
             </div>
-            <div className="mt-1 text-3xl font-semibold text-white">{s.value}</div>
+            <div className={`mt-1 text-3xl font-semibold ${s.danger ? "text-rose-300" : "text-white"}`}>{s.value}</div>
           </motion.div>
         ))}
       </div>
@@ -117,7 +135,7 @@ export function FleetPage() {
           <div className="rounded-lg border border-white/5 bg-ink-950/40 p-3">
             <div className="mb-2 text-xs font-medium text-slate-200">Fleet size</div>
             <div className="grid grid-cols-1 gap-2 text-[11px] sm:grid-cols-2">
-              <ScaleCard title="HPA" sub="scale pods on memory/CPU" note="no KEDA — resource pressure, not queue depth" />
+              <ScaleCard title="HPA / KEDA" sub="scale pods on memory/CPU or queue depth" note="queue-depth autoscaling via mill_queue_depth (KEDA/adapter)" />
               <ScaleCard title="Cluster Autoscaler" sub="provision nodes" note="right-sizes the cluster" />
             </div>
           </div>
@@ -252,8 +270,13 @@ export function FleetPage() {
       <div className="card p-4" data-testid="isolation-ladder">
         <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
           <ShieldCheck className="h-4 w-4 text-emerald-300" /> Isolation ladder
-          <InfoTip text="One Executor seam; the rung is a swap, not a rewrite. In-process isolates are impossible on Bun, so isolation is OS-level and ON by default." />
+          <InfoTip text="How each node is sandboxed. On EKS the worker runs nodes in-process INSIDE a locked-down, HPA-scaled pod — the pod is the boundary (the 'default' rung). One Executor seam means a stronger rung is a config swap, not a rewrite. The 'live' rung is highlighted from what the online workers actually report; DockerExecutor is a local-only demo and the lower rungs are roadmap." />
           <Spec doc="ARCH §6" />
+          {ready && activeExecutors.size > 0 && (
+            <span className="chip bg-emerald-500/15 text-[10px] text-emerald-300" data-testid="ladder-active-executor">
+              live: {[...activeExecutors].join(", ")}
+            </span>
+          )}
         </h2>
         <div className="mt-3 overflow-x-auto">
           <table className="w-full min-w-[640px] text-left text-xs">
@@ -267,18 +290,25 @@ export function FleetPage() {
               </tr>
             </thead>
             <tbody>
-              {isolationLadder.map((r) => (
-                <tr key={r.tier} className="border-b border-white/5 last:border-0" data-testid={`ladder-${r.tier}`}>
-                  <td className="py-2 pr-3 font-mono text-slate-200">{r.name}</td>
+              {isolationLadder.map((r) => {
+                const live = ready && r.executor != null && activeExecutors.has(r.executor);
+                return (
+                <tr key={r.tier} className={`border-b border-white/5 last:border-0 ${live ? "bg-emerald-500/[0.06]" : ""}`} data-testid={`ladder-${r.tier}`} data-live={live ? "true" : undefined}>
+                  <td className="py-2 pr-3 font-mono text-slate-200">
+                    {live && <span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 align-middle" title="A live worker is running this tier" />}
+                    {r.name}
+                  </td>
                   <td className="py-2 pr-3 text-slate-400">{r.trust}</td>
                   <td className="py-2 pr-3 font-mono text-slate-400">{r.coldStart}</td>
                   <td className="py-2 pr-3 text-slate-400">{r.boundary}</td>
-                  <td className="py-2 pr-3">
+                  <td className="py-2 pr-3 whitespace-nowrap">
+                    {live && <span className="chip mr-1 bg-emerald-500/20 text-emerald-200" data-testid={`ladder-live-${r.tier}`}>live</span>}
                     <span className={`chip ${statusBadge[r.status]}`}>{r.status === "default" ? "default" : r.status === "optin" ? "opt-in" : r.status}</span>
                     <InfoTip text={r.note} />
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

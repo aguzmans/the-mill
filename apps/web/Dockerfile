@@ -8,6 +8,10 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install
 COPY . .
+# MILL_MODE=live builds the dynamic UI (talks to the api via nginx's /api proxy).
+# Build with --build-arg MILL_MODE=mock for the standalone static prototype.
+ARG MILL_MODE=live
+ENV VITE_MILL_MODE=$MILL_MODE
 RUN npm run build
 
 # ---- serve ----

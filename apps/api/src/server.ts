@@ -4,6 +4,7 @@ import { streamSSE } from "hono/streaming";
 import { serveStatic } from "hono/bun";
 import Redis from "ioredis";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
 import { join, resolve } from "node:path";
 import { MillQueue } from "@mill/queue";
 import { computeStats, computeQueueView } from "./fleet";
@@ -56,14 +57,40 @@ let repoState: RepoState | null = null;
 function enqueueJob(projectDir: string, workflow: string, input: unknown, trigger = "manual", request?: unknown): string {
   const jobId = "job_" + crypto.randomUUID().slice(0, 8);
   const projectId = projectDir.split("/").filter(Boolean).pop() ?? projectDir;
-  q.enqueue({ id: jobId, projectDir, workflow, input, revision: lastStatus?.syncedRevision, trigger, runKey: `${projectId}/${workflow}`, request })
+  // Carry the workflow's `exclusive` flag onto the job so the worker can dedicate a pod to it.
+  let exclusive: boolean | undefined;
+  try { exclusive = loadWorkflow(projectDir, workflow).def.exclusive; } catch { /* leave undefined */ }
+  q.enqueue({ id: jobId, projectDir, workflow, input, revision: lastStatus?.syncedRevision, trigger, runKey: `${projectId}/${workflow}`, request, exclusive })
     .catch((e) => console.error("enqueue failed:", e));
   q.metricInc(`triggered:${trigger}`).catch(() => {});
   return jobId;
 }
 
 // Cron + webhook triggers, rebuilt from the reconciled workflows on every reconcile.
-const triggerEngine = new TriggerEngine((t, input) => {
+const triggerEngine = new TriggerEngine(async (t, input) => {
+  // concurrencyPolicy enforcement — CRON only (k8s CronJob semantics). Webhook/manual/event
+  // runs are intentional and always fire. Replace is best-effort: drop a still-queued prior
+  // run; if one is already executing, let it finish and skip this one (degrades to Forbid).
+  const policy = t.concurrencyPolicy;
+  if (t.type === "cron" && policy && policy !== "Allow") {
+    const active = await q.activeRuns(`${t.project}/${t.workflow}`).catch(() => []);
+    const running = active.filter((a) => a.status === "running");
+    if (policy === "Forbid" && active.length > 0) {
+      q.metricInc("concurrency_skipped:Forbid").catch(() => {});
+      log.info("concurrency: skipped run (Forbid — a run is already in progress)", { project: t.project, workflow: t.workflow, active: active.length });
+      return;
+    }
+    if (policy === "Replace") {
+      if (running.length > 0) {
+        q.metricInc("concurrency_skipped:Replace").catch(() => {});
+        log.info("concurrency: skipped run (Replace — a run is already executing)", { project: t.project, workflow: t.workflow });
+        return;
+      }
+      const queued = active.filter((a) => a.status === "queued");
+      for (const j of queued) await q.supersede(j.id).catch(() => {}); // drop pending; newest wins
+      if (queued.length) { q.metricInc("concurrency_replaced:Replace", queued.length).catch(() => {}); log.info("concurrency: superseded queued run(s) (Replace)", { project: t.project, workflow: t.workflow, replaced: queued.length }); }
+    }
+  }
   const jobId = enqueueJob(join(PROJECTS_DIR, t.project), t.workflow, input, t.type);
   log.info("trigger", { type: t.type, project: t.project, workflow: t.workflow, job: jobId });
 });
@@ -115,7 +142,8 @@ function syncTriggers() {
       try {
         const { def } = loadWorkflow(join(PROJECTS_DIR, pid), wname);
         for (const t of def.triggers) {
-          triggers.push({ project: pid, workflow: wname, type: t.type, schedule: t.schedule, path: t.path, concurrencyPolicy: t.concurrencyPolicy });
+          // effective policy: the trigger's own, else the workflow-level default.
+          triggers.push({ project: pid, workflow: wname, type: t.type, schedule: t.schedule, path: t.path, concurrencyPolicy: t.concurrencyPolicy ?? def.concurrencyPolicy });
           if (t.type === "webhook" && t.path) wfRoutes.set(`${wname}/${t.path}`, { project: pid, workflow: wname }); // custom token path
         }
       } catch { /* skip invalid workflow */ }
@@ -173,9 +201,9 @@ let lastLoggedRev = "";
 // but holds them (OutOfSync) until a manual Sync. A manual `POST /api/reconcile` always applies.
 const AUTOSYNC = (process.env.MILL_AUTOSYNC ?? "true") !== "false";
 
-async function doReconcile(apply: boolean = AUTOSYNC): Promise<(ReconcileStatus & { at: number }) | null> {
+async function doReconcile(opts: { force?: boolean } = {}): Promise<(ReconcileStatus & { at: number }) | null> {
   if (!repoState) return null;
-  const s = await reconcile(repoState, { apply });
+  const s = await reconcile(repoState, { apply: opts.force ? true : AUTOSYNC }); // force = manual Sync applies now
   lastStatus = { ...s, at: Date.now() };
   // Log an activity entry when something changed (new target, applied revision, or an error).
   const sig = `${s.targetRevision}|${s.syncedRevision}|${s.error ?? ""}`;
@@ -253,7 +281,7 @@ api.get("/projects/:id/workflows/:wf", (c) => {
     const plan = buildPlan(def);
     // Include node code so the editor can render + inspect a workflow it doesn't have mocked.
     const nodes = def.nodes.map((n) => (n.kind === "jscode" && n.file ? { ...n, code: readFileSafe(join(dir, n.file)) } : n));
-    return c.json({ workflow: def.metadata.name, nodes, edges: def.edges, triggers: def.triggers, order: plan.order });
+    return c.json({ workflow: def.metadata.name, nodes, edges: def.edges, triggers: def.triggers, order: plan.order, exclusive: def.exclusive ?? false });
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
   }
@@ -352,6 +380,7 @@ api.get("/metrics", async (c) => {
   const now = Date.now();
   const [workers, queueDepth, counters, oldestCreatedAt] = await Promise.all([q.workers(), q.queueDepth(), q.metricAll(), q.oldestQueuedCreatedAt()]);
   const inFlight = workers.reduce((n, w) => n + (w.inFlight ?? 0), 0);
+  const capacity = workers.reduce((n, w) => n + (w.concMax ?? 0), 0); // total concurrent slots
   const num = (v: string | undefined) => Number(v ?? 0);
   const lines: string[] = [];
   const help = (name: string, h: string, type: string) => lines.push(`# HELP ${name} ${h}`, `# TYPE ${name} ${type}`);
@@ -360,6 +389,8 @@ api.get("/metrics", async (c) => {
   // ── gauges (current state) ──
   g("mill_workers", "Workers currently registered", workers.length);
   g("mill_workers_inflight", "Jobs executing across the fleet", inFlight);
+  g("mill_worker_capacity", "Total concurrent job slots across the fleet (Σ concMax)", capacity);
+  g("mill_worker_saturation_ratio", "Fleet busy fraction: inflight / capacity (0..1)", capacity > 0 ? inFlight / capacity : 0);
   g("mill_queue_depth", "Jobs waiting in the queue", queueDepth);
   g("mill_queue_oldest_wait_seconds", "Age of the head-of-line queued job", oldestCreatedAt ? Math.max(0, (now - oldestCreatedAt) / 1000) : 0);
   g("mill_reconcile_synced", "1 if the repo is Synced", lastStatus?.sync === "Synced" ? 1 : 0);
@@ -387,6 +418,8 @@ api.get("/metrics", async (c) => {
   counterFamily("mill_triggered_total", "Jobs enqueued by trigger type", "triggered:", "trigger", (k) => k.slice("triggered:".length));
   counterFamily("mill_reconcile_total", "Reconcile passes by result", "reconcile_total:", "result", (k) => k.slice("reconcile_total:".length));
   counterFamily("mill_ingress_total", "Ingress requests by outcome", "ingress_total:", "outcome", (k) => k.slice("ingress_total:".length));
+  counterFamily("mill_concurrency_skipped_total", "Cron runs skipped by concurrencyPolicy", "concurrency_skipped:", "policy", (k) => k.slice("concurrency_skipped:".length));
+  counterFamily("mill_concurrency_replaced_total", "Queued runs superseded by Replace policy", "concurrency_replaced:", "policy", (k) => k.slice("concurrency_replaced:".length));
   if (counters["retries_total"]) { help("mill_retries_total", "Run-level retries", "counter"); lines.push(`mill_retries_total ${num(counters["retries_total"])}`); }
   if (counters["ingress_auth_failures_total"]) { help("mill_ingress_auth_failures_total", "Ingress bearer auth failures", "counter"); lines.push(`mill_ingress_auth_failures_total ${num(counters["ingress_auth_failures_total"])}`); }
 
@@ -426,8 +459,15 @@ api.get("/fleet", async (c) => {
 // GitOps: current sync/health for the reconciled repo, and a manual reconcile trigger.
 api.get("/status", (c) => c.json(lastStatus ?? { pending: true, repo: PROJECT_REPO ?? null, source: PROJECT_REPO ? "git" : "dir" }));
 api.post("/reconcile", async (c) => {
-  const s = await doReconcile(true); // a manual Sync always applies (force), regardless of autoSync
+  const s = await doReconcile({ force: true }); // a manual Sync always applies everything, regardless of autoSync
   return s ? c.json(s) : c.json({ error: "no PROJECT_REPO configured — reading from a mounted dir" }, 400);
+});
+
+// Manual Sync (applies the pending revision). v1 is single-repo, so this applies the whole
+// workspace; per-project selective apply is a documented follow-up (needs an assembled live dir).
+api.post("/projects/:id/sync", async (c) => {
+  const s = await doReconcile({ force: true });
+  return s ? c.json(s) : c.json({ error: "no PROJECT_REPO configured" }, 400);
 });
 
 api.get("/triggers", (c) => c.json(triggerEngine.summary()));
@@ -482,7 +522,7 @@ api.post("/projects", async (c) => {
   });
   try {
     await writePaths(repoState, [{ path: `${id}/project.yaml`, content: yaml }], `create project ${id}`);
-    const s = await doReconcile();
+    const s = await doReconcile({ force: true });
     return c.json({ created: id, status: s });
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
@@ -517,7 +557,7 @@ api.post("/projects/:id/workflows/:wf", async (c) => {
 
   try {
     await writePaths(repoState, writes, payload.message?.trim() || `save workflow ${id}/${wf}`);
-    const s = await doReconcile();
+    const s = await doReconcile({ force: true });
     return c.json({ saved: `${id}/${wf}`, files: writes.map((w) => w.path), status: s });
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
@@ -529,7 +569,7 @@ api.delete("/projects/:id/workflows/:wf", async (c) => {
   if (!repoState) return c.json({ error: "delete requires a git-backed workspace (PROJECT_REPO)" }, 400);
   try {
     await deletePaths(repoState, [`${id}/workflows/${wf}`], `delete workflow ${id}/${wf}`);
-    const s = await doReconcile();
+    const s = await doReconcile({ force: true });
     return c.json({ deleted: `${id}/${wf}`, status: s });
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
@@ -542,7 +582,7 @@ api.delete("/projects/:id", async (c) => {
   if (!repoState) return c.json({ error: "delete requires a git-backed workspace (PROJECT_REPO)" }, 400);
   try {
     await deletePaths(repoState, [id], `delete project ${id}`);
-    const s = await doReconcile();
+    const s = await doReconcile({ force: true });
     return c.json({ deleted: id, status: s });
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
@@ -564,6 +604,24 @@ api.get("/projects/:id/export", async (c) => {
 app.route("/api", api);
 
 // Webhook trigger: an external POST kicks off a run (input = request body).
+// Git push webhook → reconcile IMMEDIATELY (instead of waiting for the ~15s poll). Point your
+// GitHub/GitLab repo webhook here. If MILL_GIT_WEBHOOK_SECRET is set, the GitHub HMAC
+// (X-Hub-Signature-256 over the raw body) is verified.
+app.post("/git/webhook", async (c) => {
+  const raw = await c.req.text().catch(() => "");
+  const secret = process.env.MILL_GIT_WEBHOOK_SECRET;
+  if (secret) {
+    const sig = c.req.header("x-hub-signature-256") ?? "";
+    const expected = "sha256=" + createHmac("sha256", secret).update(raw).digest("hex");
+    if (!safeEq(sig, expected)) { q.metricInc("git_webhook:unauthorized").catch(() => {}); return c.json({ error: "invalid signature" }, 401); }
+  }
+  if (!repoState) return c.json({ error: "no PROJECT_REPO configured" }, 400);
+  q.metricInc("git_webhook:ok").catch(() => {});
+  const s = await doReconcile(); // honors MILL_AUTOSYNC (auto-applies or holds as configured)
+  log.info("git webhook → reconcile", { sync: s?.sync, rev: s?.syncedRevision?.slice(0, 7) });
+  return c.json({ reconciled: true, sync: s?.sync, syncedRevision: s?.syncedRevision, targetRevision: s?.targetRevision });
+});
+
 app.post("/hooks/:project/:workflow", async (c) => {
   const { project, workflow } = c.req.param();
   const dir = join(PROJECTS_DIR, project);

@@ -71,6 +71,11 @@ export const workflowDef = z.object({
   nodes: z.array(workflowNode).min(1),
   edges: z.array(workflowEdge).default([]),
   concurrencyPolicy: z.enum(["Allow", "Forbid", "Replace"]).optional(),
+  // exclusive: run this workflow ALONE on its worker/pod until it finishes — the worker
+  // takes no co-tenant jobs for the duration (heavy/CPU-hungry/memory-hungry runs get the
+  // whole pod). Combined with queue-depth autoscaling, an exclusive job in the queue pulls
+  // up a fresh pod that dedicates itself to it.
+  exclusive: z.boolean().optional(),
 });
 
 export const projectDef = z.object({

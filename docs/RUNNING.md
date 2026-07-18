@@ -88,6 +88,29 @@ over every data type (numbers, strings, objects, mixed arrays), plus `if`-branch
 `callScript` continuity — each node throws if its input arrived wrong, so a green run *is*
 the proof.
 
+## Frontend tests (Playwright)
+
+Two tiers. The **mock suite** builds the prototype and runs against it — no backend needed:
+
+```bash
+docker compose build e2e && docker compose run --rm e2e     # all specs (mock mode)
+# or locally:  cd apps/web && npm install && npx playwright test
+```
+
+A handful of specs are **live/deployed** (file names prefixed `deployed-`) — they exercise the
+real backend the same way a browser hits it (the api serves the SPA same-origin at `:8787`).
+They **skip** in the mock run and are gated on `DEPLOYED_BASE`. Run them against the up stack
+on the compose network:
+
+```bash
+docker compose up -d redis api worker             # stack must be running
+docker run --rm --network the-mill_default -e DEPLOYED_BASE=http://api:8080 \
+  mill-web-e2e npx playwright test deployed-fleet.spec.ts deployed-editor.spec.ts
+```
+
+These cover the dynamic isolation ladder (live executor highlighting), the exclusive-execution
+toggle, and a real **single-step run** (the step-tester executing one node against the backend).
+
 ### External dependencies (npm libraries)
 
 A JS Code / loop-body node can declare npm packages under its `deps` (in `workflow.yaml`,
@@ -211,6 +234,52 @@ Per-node knobs in `workflow.yaml`:
   crash **resumes** instead of re-doing finished work (the reaper requeues on a missed heartbeat).
 - **Schemas**: `inputSchema`/`outputSchema` are JS boolean expressions enforced at the node
   boundary in real runs and in the step-tester. See `examples/pipelines/{retry,validated}`.
+
+### Exclusive execution (dedicate a whole worker/pod to a run)
+
+A **workflow-level** flag in `workflow.yaml`:
+
+```yaml
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: heavy-report }
+exclusive: true            # run alone on a worker/pod until done — no co-tenant jobs
+triggers: [ { type: manual } ]
+nodes: [ ... ]
+```
+
+- When a worker pulls an `exclusive` job it **dedicates itself**: it takes no other jobs until
+  that run finishes, so the whole worker (on EKS, the whole **pod** — all its CPU/memory) is
+  reserved for that one run. Use it for heavy / CPU- or memory-hungry / noisy workloads.
+- If a *busy* worker pulls it, the job is atomically returned to the queue for an idle worker
+  (or a freshly autoscaled pod) to claim — so it never runs alongside other work.
+- Also settable from the editor's **Triggers** panel (the *Run exclusively* toggle).
+- **Ops impact:** an exclusive run drops that pod's effective concurrency to 1. It pairs with
+  queue-depth autoscaling — the queued exclusive job raises `mill_queue_depth`, KEDA/HPA adds
+  a pod, and that pod dedicates itself. See
+  **[DEPLOYMENT.md → Autoscale on queue depth](DEPLOYMENT.md#autoscale-on-queue-depth-custom-metrics--recommended)**.
+
+### Concurrency policy (cron overlap)
+
+A **workflow-level** (or per-trigger) knob that controls what happens when a **cron** run would
+overlap a still-in-progress one — k8s CronJob semantics:
+
+```yaml
+apiVersion: mill/v1
+kind: Workflow
+metadata: { name: nightly-rollup }
+concurrencyPolicy: Forbid        # Allow (default) | Forbid | Replace
+triggers: [ { type: cron, schedule: "*/5 * * * *" } ]
+nodes: [ ... ]
+```
+
+- **Allow** (default) — overlapping runs are fine.
+- **Forbid** — if a run is already queued or executing, **skip** the new one.
+- **Replace** — best-effort: **drop a still-queued** prior run so the newest wins; if a run is
+  already **executing**, let it finish and skip the new one (no mid-run kill).
+- **Enforced for `cron` triggers only.** Webhook / manual / event runs always fire (they're
+  intentional). A per-trigger `concurrencyPolicy` overrides the workflow-level one.
+- Metrics: `mill_concurrency_skipped_total{policy}`, `mill_concurrency_replaced_total{policy}`.
 
 ## Endpoints
 

@@ -17,7 +17,7 @@ export class TriggerEngine {
   private crons: Cron[] = [];
   private webhooks = new Set<string>();
 
-  constructor(private onFire: (t: TriggerDef, input: unknown) => void) {}
+  constructor(private onFire: (t: TriggerDef, input: unknown) => void | Promise<void>) {}
 
   /** Replace all registered triggers with the current set (idempotent). */
   sync(triggers: TriggerDef[]): void {
