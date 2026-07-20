@@ -513,8 +513,11 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               <Save className="h-4 w-4" /> Save
             </button>
           </Tip>
-          <Tip text="Export this workflow as a standalone, runnable JS bundle (.tar.gz).">
-            <button className="btn-ghost" data-testid="export-workflow-btn" onClick={() => flash("Building export bundle · index.js + package.json + run.sh")}>
+          <Tip text="Export this project as a standalone, runnable JS bundle (.tar.gz). A workflow can call its siblings, so the whole project is the unit; run.sh <workflow> runs a specific one.">
+            <button className="btn-ghost" data-testid="export-workflow-btn" onClick={() => {
+              if (LIVE) { flash("Building export bundle · index.js + package.json + run.sh"); window.location.href = `/api/projects/${project.id}/export`; }
+              else flash("Building export bundle · index.js + package.json + run.sh");
+            }}>
               <Download className="h-4 w-4" /> Export
             </button>
           </Tip>
@@ -549,6 +552,10 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               nodeTypes={nodeTypes}
               onNodeClick={(_, n) => setSelected(n.id)}
               fitView
+              // Wide graphs (7–8 nodes) need to zoom out past the default minZoom (0.5) to fit;
+              // otherwise the rightmost node renders off-screen on load. Allow deeper zoom-out.
+              minZoom={0.2}
+              fitViewOptions={{ padding: 0.15, minZoom: 0.2 }}
               proOptions={{ hideAttribution: true }}
             >
               <Background color="#233" gap={18} />

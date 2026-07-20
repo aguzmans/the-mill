@@ -6,7 +6,7 @@ import Redis from "ioredis";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createHmac } from "node:crypto";
 import { join, resolve } from "node:path";
-import { MillQueue } from "@mill/queue";
+import { MillQueue, SecretStore, validSecretName } from "@mill/queue";
 import { computeStats, computeQueueView } from "./fleet";
 import { runNode } from "@mill/executor";
 import { createLogger } from "@mill/telemetry";
@@ -39,6 +39,7 @@ let PROJECTS_DIR = PROJECT_REPO ? WORKDIR : (process.env.PROJECTS_DIR ?? "/proje
 const PORT = Number(process.env.PORT ?? 8080);
 const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
 const q = new MillQueue(redis);
+const secretStore = new SecretStore(redis); // runtime secrets (Redis), injected into ctx.secrets
 
 // Safety net: a controller must not die from a stray async error (e.g. a dropped redis
 // pub/sub connection during SSE teardown). Log it (redacted) and keep serving.
@@ -133,6 +134,11 @@ const wfRoutes = new Map<string, { project: string; workflow: string }>(); // ke
 const projRoutes = new Map<string, string>(); // key: path → project id
 const projectTokens = new Map<string, string>(); // project id → its bearer token (per-project override)
 const projWebhookWfs = new Map<string, string[]>(); // project id → workflows that OPT IN to an HTTP endpoint (declare a `webhook` trigger)
+// Capability URLs: a webhook trigger with a long, unguessable `path` authenticates BY THE PATH
+// (no Authorization header) — for header-less providers like Acuity/Twilio that can't send a
+// bearer. Keyed `${workflow}/${path}`. Short/guessable paths do NOT qualify and still need the bearer.
+const capabilityRoutes = new Set<string>();
+const CAP_MIN_LEN = 24; // a path this long is treated as an unguessable credential
 
 function safeEq(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -163,6 +169,7 @@ function syncTriggers() {
   projRoutes.clear();
   projectTokens.clear();
   projWebhookWfs.clear();
+  capabilityRoutes.clear();
   for (const pid of listProjects(PROJECTS_DIR)) {
     try {
       const proj = loadProject(join(PROJECTS_DIR, pid));
@@ -184,7 +191,11 @@ function syncTriggers() {
         for (const t of def.triggers) {
           // effective policy: the trigger's own, else the workflow-level default.
           triggers.push({ project: pid, workflow: wname, type: t.type, schedule: t.schedule, path: t.path, concurrencyPolicy: t.concurrencyPolicy ?? def.concurrencyPolicy });
-          if (t.type === "webhook" && t.path) wfRoutes.set(`${wname}/${t.path}`, { project: pid, workflow: wname }); // custom token path
+          if (t.type === "webhook" && t.path) {
+            wfRoutes.set(`${wname}/${t.path}`, { project: pid, workflow: wname }); // custom path
+            // A sufficiently long path is an unguessable credential → authenticates by itself.
+            if (t.path.length >= CAP_MIN_LEN) capabilityRoutes.add(`${wname}/${t.path}`);
+          }
         }
       } catch { /* skip invalid workflow */ }
     }
@@ -354,13 +365,35 @@ api.post("/projects/:id/workflows/:wf/nodes/:key/test", async (c) => {
   const dir = join(PROJECTS_DIR, id);
   if (!existsSync(join(dir, "workflows", wf, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
   const body = await c.req.json().catch(() => ({}));
-  const secrets = { ...ENV_SECRETS, ...(body?.secrets ?? {}) };
+  // Precedence: process env / k8s Secrets < Redis store (UI-managed) < ad-hoc test overrides.
+  const secrets = { ...ENV_SECRETS, ...(await secretStore.all().catch(() => ({}))), ...(body?.secrets ?? {}) };
   try {
     const r = await runNode(dir, wf, key, body?.input ?? {}, secrets, lastStatus?.syncedRevision);
     return c.json(r, r.status === "failed" && r.error?.startsWith("no node") ? 404 : 200);
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
   }
+});
+
+// ── Secrets (runtime, Redis-backed) ──────────────────────────────────────────
+// Values are injected into ctx.secrets at run time (a node sees only the refs it declares).
+// Write-only from the UI: names are listed, values are NEVER returned. Admin-guarded by the
+// /api/* middleware when MILL_ADMIN_TOKEN is set.
+api.get("/secrets", async (c) => {
+  return c.json({ names: await secretStore.names(), encryptedAtRest: secretStore.encryptedAtRest() });
+});
+api.put("/secrets/:name", async (c) => {
+  const name = c.req.param("name");
+  if (!validSecretName(name)) return c.json({ error: `invalid secret name '${name}' — letters, digits, underscore` }, 400);
+  const body = await c.req.json().catch(() => ({}));
+  const value = body?.value;
+  if (typeof value !== "string" || value.length === 0) return c.json({ error: "body must be { value: <non-empty string> }" }, 400);
+  await secretStore.set(name, value);
+  return c.json({ saved: name, encryptedAtRest: secretStore.encryptedAtRest() });
+});
+api.delete("/secrets/:name", async (c) => {
+  const removed = await secretStore.remove(c.req.param("name"));
+  return c.json({ removed: removed > 0 ? c.req.param("name") : null });
 });
 
 api.get("/jobs/:id", async (c) => {
@@ -750,7 +783,11 @@ app.all("/p/w/:workflow/:path", async (c) => {
   const { workflow, path } = c.req.param();
   const route = wfRoutes.get(`${workflow}/${path}`);
   if (!route) return c.json({ error: `no workflow endpoint '/p/w/${workflow}/${path}'` }, 404);
-  const bad = bearerGuard(c, route.project); if (bad) return bad; // per-project token
+  // Capability URL: the unguessable path IS the credential — no Authorization header required
+  // (this is how header-less providers like Acuity reach us). Otherwise require the bearer.
+  if (!capabilityRoutes.has(`${workflow}/${path}`)) {
+    const bad = bearerGuard(c, route.project); if (bad) return bad; // per-project token
+  }
   return ingressTrigger(c, route.project, route.workflow);
 });
 

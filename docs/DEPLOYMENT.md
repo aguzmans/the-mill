@@ -46,6 +46,7 @@ have no safe default.
 | `MILL_CORS_ORIGINS` | | — | | Comma-separated allowlist for cross-origin browsers (default: same-origin only). |
 | `MILL_STD_REGISTRY` | | — | | Base URL for `std://…@ver` remote callScript bundles. |
 | `MILL_SECRETS` | | `{}` | 🔒 | Node secrets available to the controller's step-tester (same bag as the worker). |
+| `MILL_SECRETS_KEY` | | — | 🔒 | Encrypts the Redis-backed **runtime secret store** (UI-managed) at rest (AES-256-GCM). Set the **same value on the api and every worker**. Unset → values stored plaintext in Redis (dev only). |
 | `MILL_LOG_LEVEL` / `MILL_LOG_FORMAT` | | `info` / auto | | `debug…error`; `json` forces JSON logs. |
 | _`<project ingress tokens>`_ | | — | 🔒 | Any env named by a project's `ingress.tokenEnv` (e.g. `PAYMENTS_INGRESS_TOKEN`). |
 
@@ -60,6 +61,7 @@ have no safe default.
 | `MILL_PAUSE_PCT` / `MILL_RESUME_PCT` | | `85` / `70` | | Load-shed thresholds. |
 | `MILL_WORKER_ID` | | hostname | | Registry id (default fine — use the pod name). |
 | `MILL_SECRETS` **and/or** individual secret env vars | | `{}` | 🔒 | **Node secrets** — see §3. |
+| `MILL_SECRETS_KEY` | | — | 🔒 | **Must match the controller's** so the worker can decrypt UI-managed secrets. |
 | `MILL_LOG_LEVEL` / `MILL_LOG_FORMAT` | | | | As above. |
 
 > **Isolation on k8s:** run the worker **in-process** (omit `MILL_EXECUTOR`). Pod-level
@@ -118,6 +120,23 @@ injection styles, both supported on the worker (and the controller for the step-
 Prefer **(a)** with **External Secrets Operator** pulling from AWS Secrets Manager, or IRSA
 if the value lives in SM and you fetch it in-node. Rotate by updating the Secret + rolling
 the deployment.
+
+- **Runtime store (UI-managed)** — the **Secrets** page writes values to **Redis**; the worker
+  reads them **per job** (so an edit applies to the next run without a redeploy) and the
+  controller uses them for the step-tester. Precedence: env / k8s Secrets **<** Redis store
+  (a UI value wins on a name clash). Values are **write-only** in the UI (names listed, values
+  never returned). Set **`MILL_SECRETS_KEY`** (same on api + all workers) to encrypt them at
+  rest (AES-256-GCM); without it they're plaintext in Redis — fine for dev, not shared prod.
+  Guard writes by setting `MILL_ADMIN_TOKEN`. Good for credentials you rotate from the UI
+  (e.g. `ACUITY_USER_ID`, `ACUITY_API_KEY`); k8s Secrets remain best for platform-managed ones.
+
+**d) Capability URLs (header-less webhook providers)** — providers like **Acuity**, Twilio, or
+legacy Stripe **can't send an `Authorization` header**. Give the workflow's webhook trigger an
+**unguessable `path`** (≥24 chars) — `triggers: [{ type: webhook, path: <long-random> }]` — and
+Mill authenticates **by the path itself**: `POST /p/w/<workflow>/<long-random>` needs **no
+bearer**. The default `/p/w/<workflow>/<project>` path still requires the bearer, and a wrong
+path is `404`. Treat the path like a password (rotate by editing the trigger). The editor's
+webhook trigger has a "custom path" field for this.
 
 ---
 

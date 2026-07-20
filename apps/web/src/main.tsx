@@ -8,6 +8,7 @@ import { WorkspacePage } from "./pages/WorkspacePage";
 import { ProjectPage } from "./pages/ProjectPage";
 import { WorkflowEditorPage } from "./pages/WorkflowEditorPage";
 import { FleetPage } from "./pages/FleetPage";
+import { SecretsPage } from "./pages/SecretsPage";
 import { ArchitecturePage } from "./pages/ArchitecturePage";
 
 const router = createBrowserRouter([
@@ -23,6 +24,7 @@ const router = createBrowserRouter([
         element: <WorkflowEditorPage />,
       },
       { path: "fleet", element: <FleetPage /> },
+      { path: "secrets", element: <SecretsPage /> },
       { path: "architecture", element: <ArchitecturePage /> },
     ],
   },

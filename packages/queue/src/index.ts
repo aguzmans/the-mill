@@ -329,3 +329,5 @@ export class MillQueue {
     return this.redis.llen(this.key("queue"));
   }
 }
+
+export { SecretStore, validSecretName, encryptSecret, decryptSecret } from "./secrets";

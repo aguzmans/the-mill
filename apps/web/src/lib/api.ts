@@ -171,3 +171,19 @@ export async function saveWorkflow(projectId: string, wf: string, body: SaveWork
   if (!r.ok) { const err = new Error(j.error || `save ${r.status}`) as Error & { issues?: unknown }; err.issues = j.issues; throw err; }
   return j;
 }
+
+// ── Secrets (runtime, Redis-backed) — values are write-only from the UI ──────────
+export interface SecretsInfo { names: string[]; encryptedAtRest: boolean }
+export async function getSecrets(): Promise<SecretsInfo> {
+  return (await fetch(`${BASE}/secrets`)).json();
+}
+export async function putSecret(name: string, value: string): Promise<void> {
+  const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ value }),
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `save failed (${r.status})`);
+}
+export async function deleteSecret(name: string): Promise<void> {
+  const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}`, { method: "DELETE" });
+  if (!r.ok) throw new Error(`delete failed (${r.status})`);
+}

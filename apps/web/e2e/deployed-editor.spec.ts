@@ -18,16 +18,16 @@ test.describe("deployed editor (live backend)", () => {
 
   test("step-tester runs a single node with supplied input and shows the output", async ({ page }) => {
     await page.goto(`${BASE}/projects/demos/workflows/math`);
-    // select the jscode node (identity: returns its input)
+    // select the jscode node — `compute` reduces input.numbers to {count,sum,mean,max,min}
     await page.getByTestId("node-compute").click();
     const tester = page.getByTestId("step-tester");
     await expect(tester).toBeVisible();
-    await page.getByTestId("step-input").fill('{ "a": 2, "b": 3 }');
+    await page.getByTestId("step-input").fill('{ "numbers": [10, 20, 30] }');
     await page.getByTestId("step-run").click();
-    // a result appears; the identity node succeeds and echoes the input
+    // a result appears; the node succeeds and returns the computed stats (sum = 60)
     const result = page.getByTestId("step-result");
     await expect(result).toBeVisible({ timeout: 15000 });
     await expect(result).toHaveAttribute("data-status", "succeeded");
-    await expect(page.getByTestId("step-output")).toContainText('"a": 2');
+    await expect(page.getByTestId("step-output")).toContainText('"sum": 60');
   });
 });

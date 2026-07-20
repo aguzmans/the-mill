@@ -46,11 +46,33 @@ test.describe("workflow matrix (live)", () => {
   });
 
   test("dispatch guard: a workflow whose node won't compile is rejected (not silently run)", async ({ request }) => {
-    // demos/site-check has a shell comment in check.js → JS syntax error. The trigger must be
-    // rejected at the boundary with a clear compile error, instead of enqueuing a doomed job.
-    const r = await request.post(`${BASE}/api/projects/demos/workflows/site-check/trigger`, { data: { input: {} } });
-    expect(r.status()).toBe(422);
-    expect(String((await r.json()).error)).toMatch(/compile|check/i);
+    // Self-contained: commit a workflow whose node .js has a syntax error, then trigger it.
+    // The dispatch guard must reject at the boundary with a compile error instead of enqueuing
+    // a doomed job. (We create our own broken workflow — shipped examples must stay clean.)
+    const wf = `e2e-broken-${Date.now().toString(36)}`;
+    const save = await request.post(`${BASE}/api/projects/demos/workflows/${wf}`, {
+      data: {
+        message: "e2e: broken workflow for dispatch-guard test",
+        workflow: {
+          apiVersion: "mill/v1", kind: "Workflow", metadata: { name: wf }, triggers: [{ type: "manual" }],
+          nodes: [
+            { key: "start", kind: "start", name: "Start" },
+            { key: "bad", kind: "jscode", name: "Bad", file: "nodes/bad.js" },
+            { key: "end", kind: "end", name: "End" },
+          ],
+          edges: [{ from: "start", to: "bad" }, { from: "bad", to: "end" }],
+        },
+        files: { "nodes/bad.js": "export default async () => ({ ok: true })\n# not valid javascript\n" },
+      },
+    });
+    expect(save.ok()).toBeTruthy();
+    try {
+      const r = await request.post(`${BASE}/api/projects/demos/workflows/${wf}/trigger`, { data: { input: {} } });
+      expect(r.status()).toBe(422);
+      expect(String((await r.json()).error)).toMatch(/compile|parse|won't/i);
+    } finally {
+      await request.delete(`${BASE}/api/projects/demos/workflows/${wf}`).catch(() => {});
+    }
   });
 
   test("trigger with a malformed JSON body is rejected (400), not silently run", async ({ request }) => {

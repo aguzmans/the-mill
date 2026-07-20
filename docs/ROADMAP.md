@@ -217,7 +217,13 @@ These were only ever hand-authored fixtures in the prototype and are **not** shi
   flat access (no roles) in v1; internal comms by key pair; OIDC + RBAC later.**
 - **App-of-apps granularity:** ~~one repo per project vs one workspace repo with folders~~
   — **Resolved: single repo, folder per project for v1; multi-repo soon after.**
-- Secrets model (per-workspace vault vs k8s external secrets) — decide before M3 webhooks.
+- Secrets model (per-workspace vault vs k8s external secrets) — **partly shipped**: a UI-managed
+  **runtime secret store** (Redis, AES-256-GCM at rest via `MILL_SECRETS_KEY`, write-only in the
+  UI, injected into `ctx.secrets` per job) plus k8s Secrets / `MILL_SECRETS`. **Deferred:**
+  per-project secret scoping (today the store is workspace-global) and an external-vault backend.
+- Header-less webhook auth — **shipped**: **capability URLs** (an unguessable webhook `path` ≥24
+  chars authenticates by itself, no bearer) so providers like Acuity/Twilio that can't send an
+  `Authorization` header can deliver. **Deferred:** per-provider HMAC verification helpers.
 - ~~AuthN/AuthZ depth for v1~~ — resolved: SSO at Ingress + flat access; internal key-pair comms; OIDC/RBAC later.
 - Large node outputs: kept small / in Redis TTL for v1 (Windmill offloads >2 MB) — add an object store only if needed.
 - ~~App-of-apps granularity~~ — resolved: single repo + folder-per-project for v1; multi-repo capability soon after.

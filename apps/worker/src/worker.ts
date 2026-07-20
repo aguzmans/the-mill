@@ -1,6 +1,6 @@
 import Redis from "ioredis";
 import os from "node:os";
-import { MillQueue, type JobSpec, type RunningJob } from "@mill/queue";
+import { MillQueue, SecretStore, type JobSpec, type RunningJob } from "@mill/queue";
 import { runWorkflow, DockerExecutor, type Executor } from "@mill/executor";
 import { createLogger } from "@mill/telemetry";
 
@@ -12,6 +12,7 @@ const log = createLogger("worker");
 
 const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
 const q = new MillQueue(redis);
+const secretStore = new SecretStore(redis); // UI-managed secrets, merged per job (below)
 
 const workerId = "w-" + ((process.env.MILL_WORKER_ID ?? process.env.HOSTNAME ?? crypto.randomUUID()).slice(0, 6));
 const host = os.hostname();
@@ -20,10 +21,11 @@ const concMax = Number(process.env.MILL_CONC_MAX ?? process.env.MILL_CONCURRENCY
 const memMaxMB = Number(process.env.MILL_MEM_MAX_MB ?? 1024);
 const pausePct = Number(process.env.MILL_PAUSE_PCT ?? 85);
 const resumePct = Number(process.env.MILL_RESUME_PCT ?? 70);
-// Node secrets can be supplied two ways (both work in k8s): the MILL_SECRETS JSON blob, OR
-// individual env vars (e.g. `envFrom` a k8s Secret). A node only ever sees the refs it
-// declares (makeCtx scrubs to `secrets: [...]`), so exposing the process env here is safe.
-const secrets: Record<string, string> = {
+// Node secrets come from three sources (a node only ever sees the refs it declares — makeCtx
+// scrubs to `secrets: [...]`, so exposing the whole set here is safe): individual env vars
+// (e.g. `envFrom` a k8s Secret), the MILL_SECRETS JSON blob, and the Redis store (UI-managed).
+// The env-derived set is fixed at startup; the Redis set is re-read per job so edits apply live.
+const envSecrets: Record<string, string> = {
   ...(process.env as Record<string, string>),
   ...(process.env.MILL_SECRETS ? JSON.parse(process.env.MILL_SECRETS) : {}),
 };
@@ -58,6 +60,9 @@ async function handle(spec: JobSpec, raw: string) {
   }
   running.set(spec.id, { id: spec.id, workflow: spec.workflow, startedAt: Date.now() });
   await q.markRunning(spec.id, workerId);
+  // Re-read UI-managed secrets per job (cheap HGETALL) so a value added in the UI applies to
+  // the next run without a worker restart. Env/k8s Secrets < Redis store (UI wins on conflict).
+  const secrets = { ...envSecrets, ...(await secretStore.all().catch(() => ({}))) };
   const job = { projectDir: spec.projectDir, workflow: spec.workflow, input: spec.input, secrets, revision: spec.revision, request: spec.request as import("@mill/sdk").RequestCtx | undefined };
   let res;
   if (isolate) {

@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Boxes, Cpu, Workflow as WorkflowIcon, GitBranch, Network, HelpCircle } from "lucide-react";
+import { Boxes, Cpu, Workflow as WorkflowIcon, GitBranch, Network, HelpCircle, KeyRound } from "lucide-react";
 import { InfoTip } from "./InfoTip";
 import { workspace } from "../lib/mock";
 
@@ -47,6 +47,7 @@ export function Layout() {
           <nav className="ml-auto flex items-center gap-1">
             <NavItem to="/workspace" icon={<Boxes className="h-4 w-4" />} label="Workspace" tip="Browse the projects (git repos) in this workspace." />
             <NavItem to="/fleet" icon={<Cpu className="h-4 w-4" />} label="Fleet" tip="Live worker fleet, queue depth, and autoscaling signals." />
+            <NavItem to="/secrets" icon={<KeyRound className="h-4 w-4" />} label="Secrets" tip="Runtime credentials (API keys, tokens) injected into ctx.secrets. Values are write-only." />
             <NavItem to="/architecture" icon={<Network className="h-4 w-4" />} label="Architecture" tip="In-app design reference: topology, no-DB rationale, k8s strategy, tech decisions." />
             <a
               href="/help"

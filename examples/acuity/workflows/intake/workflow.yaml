@@ -5,7 +5,7 @@ triggers: [{ type: manual }, { type: webhook }]
 nodes:
   - { key: start,          kind: start,  name: Start }
   - { key: verify,         kind: jscode, name: Verify + parse (any format), file: nodes/verify.js, secrets: [ WEBHOOK_SECRET ] }
-  - { key: fetch-acuity,   kind: jscode, name: Fetch appt (Acuity),  file: nodes/fetch-acuity.js }
+  - { key: fetch-acuity,   kind: jscode, name: Fetch appt (Acuity),  file: nodes/fetch-acuity.js, secrets: [ ACUITY_USER_ID, ACUITY_API_KEY ] }
   - { key: fetch-internal, kind: jscode, name: Lookup patient (EHR), file: nodes/fetch-internal.js }
   - { key: consolidate,    kind: jscode, name: Consolidate + route,  file: nodes/consolidate.js }
   - { key: dispatch,       kind: fanout, name: Call workloads (parallel), each: "input.calls" }

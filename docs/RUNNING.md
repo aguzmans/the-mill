@@ -182,6 +182,11 @@ curl        localhost:8787/p/acuity                    -H "Authorization: Bearer
 - **Auth**: `Authorization: Bearer <MILL_INGRESS_TOKEN>` (constant-time compared). If the token
   isn't configured the `/p` routes return `503` (disabled) — code-triggering endpoints are never
   open by default. Wrong/missing token → `401`.
+- **Capability URLs (no header needed)**: for providers that **can't send an auth header** (Acuity,
+  Twilio, legacy Stripe), give the webhook trigger an unguessable `path` of **≥24 chars** —
+  `triggers: [{ type: webhook, path: <long-random> }]`. `POST /p/w/<workflow>/<long-random>` then
+  authenticates **by the path** (no bearer). The default `/p/w/<workflow>/<project>` path still
+  needs the bearer; a wrong path is `404`. Treat the path as a secret (rotate by editing it).
 - **Any payload format**: the ingress accepts **anything** (JSON, `x-www-form-urlencoded`,
   multipart, XML, raw) — it best-effort parses the body into `input` **and** hands the workflow
   the raw request on **`ctx.request`** = `{ method, contentType, headers, query, raw }`. So a
@@ -198,7 +203,13 @@ curl        localhost:8787/p/acuity                    -H "Authorization: Bearer
   `examples/acuity` (Acuity appointment → enrich → route to 1–N downstream workloads).
 - **Input**: `GET` → query params; other methods → best-effort parsed body (raw always on `ctx.request.raw`).
 - **Custom path**: a workflow's `triggers: [{ type: webhook, path: <token> }]` also exposes
-  `/p/w/<workflow>/<token>` (an unguessable capability URL).
+  `/p/w/<workflow>/<token>`; a token ≥24 chars is a **capability URL** that authenticates by
+  itself (see Auth above) — this is how Acuity reaches `intake` with no header.
+- **Secrets in nodes**: a node reads `ctx.secrets.<NAME>` only if it declares `secrets: [<NAME>]`.
+  Set values on the **Secrets** page (stored in Redis, injected at run time) or via k8s Secrets /
+  `MILL_SECRETS`. `examples/acuity` reads `ACUITY_USER_ID` + `ACUITY_API_KEY` to fetch the full
+  appointment from Acuity's API (Basic auth); without them it skips the fetch and routes on the
+  webhook fields, so you can wire it incrementally.
 - The **Endpoints** card on each project page shows + copies these URLs (and reads "No HTTP
   endpoints" until a workflow declares a webhook trigger); the editor's webhook trigger shows
   the workflow's URL.
