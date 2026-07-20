@@ -432,24 +432,35 @@ export function ProjectPage() {
 function EndpointsCard({ endpoints, onCopy }: { endpoints: ProjectEndpoints; onCopy: (url: string) => void }) {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const abs = (p: string) => `${origin}${p}`;
+  const exposed = !!endpoints.projectPath; // ≥1 workflow opted in with a webhook trigger
   return (
     <div className="card p-4" data-testid="endpoints-card">
       <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
         <Webhook className="h-4 w-4 text-brand-400" /> Endpoints
-        <InfoTip text="Stable URLs on this host that trigger workloads over HTTP/REST. Send the bearer token in an Authorization header. Add ?wait=1 to get the result synchronously; omit it for a webhook-style { jobId }." />
+        <InfoTip text="A workflow is exposed over HTTP only when it declares a webhook trigger — nothing is reachable until you configure it. Send the bearer token in an Authorization header. Add ?wait=1 for a synchronous result; omit it for a webhook-style { jobId }." />
       </h2>
-      <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-400">
-        {endpoints.authRequired
-          ? <span className="chip bg-emerald-500/10 text-emerald-300"><ShieldCheck className="h-3 w-3" /> Bearer token required</span>
-          : <span className="chip bg-amber-500/10 text-amber-300"><AlertTriangle className="h-3 w-3" /> ingress token not set (MILL_INGRESS_TOKEN)</span>}
-        <span className="font-mono text-slate-500">Authorization: Bearer &lt;token&gt;</span>
-      </div>
-      <div className="mt-3 space-y-1.5">
-        <EndpointRow label="project" url={abs(endpoints.projectPath)} onCopy={onCopy} />
-        {endpoints.workflows.map((w) => (
-          <EndpointRow key={w.workflow} label={w.workflow} url={abs(w.path)} onCopy={onCopy} />
-        ))}
-      </div>
+      {!exposed ? (
+        <div className="mt-2 rounded-lg border border-white/5 bg-ink-950/40 p-3 text-[11px] text-slate-400" data-testid="endpoints-none">
+          No HTTP endpoints. This project isn't exposed to the outside world. Open a workflow and
+          add a <span className="font-medium text-slate-300">webhook</span> trigger to give it a URL —
+          manual, cron and event workflows run without one.
+        </div>
+      ) : (
+        <>
+          <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-400">
+            {endpoints.authRequired
+              ? <span className="chip bg-emerald-500/10 text-emerald-300"><ShieldCheck className="h-3 w-3" /> Bearer token required</span>
+              : <span className="chip bg-amber-500/10 text-amber-300"><AlertTriangle className="h-3 w-3" /> ingress token not set — endpoints return 503 until MILL_INGRESS_TOKEN (or the project's ingress.tokenEnv) is set</span>}
+            <span className="font-mono text-slate-500">Authorization: Bearer &lt;token&gt;</span>
+          </div>
+          <div className="mt-3 space-y-1.5">
+            <EndpointRow label="project" url={abs(endpoints.projectPath!)} onCopy={onCopy} />
+            {endpoints.workflows.map((w) => (
+              <EndpointRow key={w.workflow} label={w.workflow} url={abs(w.path)} onCopy={onCopy} />
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

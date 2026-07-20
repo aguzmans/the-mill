@@ -159,20 +159,24 @@ downloads them and runs anywhere. See `examples/deps-demo`.
 
 ### Tokenized ingress (webhook / REST URLs)
 
-Every project and workflow gets a stable URL on the same host, secured by a **bearer token**
-(`MILL_INGRESS_TOKEN`). REST/HTTP works today; WebSocket is designed-for (same routing) but
-not yet implemented.
+A workflow is reachable over HTTP **only when it opts in with a `webhook` trigger** — that
+trigger *is* the "expose me" switch. Manual/cron/event-only workflows still run, but have **no**
+`/p` URL (a non-exposed project/workflow returns `404`, and its Endpoints card reads "No HTTP
+endpoints"). Exposed URLs are stable, on the same host, and secured by a **bearer token**
+(`MILL_INGRESS_TOKEN` or the project's `ingress.tokenEnv`). REST/HTTP works today; WebSocket is
+designed-for (same routing) but not yet implemented.
 
 ```
-POST  https://the-mill.example.com/p/w/<workflow>/<project>     # trigger a workflow
-GET   https://the-mill.example.com/p/<project>                  # list a project's endpoints
+POST  https://the-mill.example.com/p/w/<workflow>/<project>     # trigger a webhook-exposed workflow
+GET   https://the-mill.example.com/p/<project>                  # list a project's exposed endpoints
 ```
 
 ```bash
 export TOK=…              # = MILL_INGRESS_TOKEN
-curl -XPOST localhost:8787/p/w/math/demos          -H "Authorization: Bearer $TOK" -d '{"input":{"a":[1,2,3]}}'   # → { jobId } (async)
-curl -XPOST "localhost:8787/p/w/math/demos?wait=1" -H "Authorization: Bearer $TOK" -d '{"input":{}}'             # → { status, result } (sync, bounded)
-curl        localhost:8787/p/demos                 -H "Authorization: Bearer $TOK"                                # → project + workflow URLs
+# examples/acuity: `intake` declares a webhook trigger (its siblings don't → they aren't exposed)
+curl -XPOST localhost:8787/p/w/intake/acuity          -H "Authorization: Bearer $TOK" -d '{"input":{"email":"a@b.co"}}'  # → { jobId } (async)
+curl -XPOST "localhost:8787/p/acuity?wait=1"          -H "Authorization: Bearer $TOK" -d '{"input":{"email":"a@b.co"}}'  # → { status, result } (project's sole exposed wf)
+curl        localhost:8787/p/acuity                    -H "Authorization: Bearer $TOK"                                    # → project + exposed workflow URLs
 ```
 
 - **Auth**: `Authorization: Bearer <MILL_INGRESS_TOKEN>` (constant-time compared). If the token
@@ -195,8 +199,9 @@ curl        localhost:8787/p/demos                 -H "Authorization: Bearer $TO
 - **Input**: `GET` → query params; other methods → best-effort parsed body (raw always on `ctx.request.raw`).
 - **Custom path**: a workflow's `triggers: [{ type: webhook, path: <token> }]` also exposes
   `/p/w/<workflow>/<token>` (an unguessable capability URL).
-- The **Endpoints** card on each project page shows + copies these URLs; the editor's webhook
-  trigger shows the workflow's URL.
+- The **Endpoints** card on each project page shows + copies these URLs (and reads "No HTTP
+  endpoints" until a workflow declares a webhook trigger); the editor's webhook trigger shows
+  the workflow's URL.
 
 ### Remote / standalone callScript
 

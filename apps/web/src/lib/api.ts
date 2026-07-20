@@ -141,8 +141,9 @@ export async function getDiff(projectId: string): Promise<{ diff: DiffEntryLive[
 }
 export interface ProjectEndpoints {
   project: string;
-  projectPath: string;
+  projectPath: string | null; // null → no workflow exposes an HTTP endpoint yet
   workflows: { workflow: string; path: string; customPaths: string[] }[];
+  ingressEnabled?: boolean; // a bearer token is configured (global or per-project)
   authRequired: boolean;
 }
 export async function getEndpoints(projectId: string): Promise<ProjectEndpoints> {

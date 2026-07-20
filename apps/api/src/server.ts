@@ -132,6 +132,7 @@ const INGRESS_TOKEN = process.env.MILL_INGRESS_TOKEN; // global fallback token
 const wfRoutes = new Map<string, { project: string; workflow: string }>(); // key: `${workflow}/${path}`
 const projRoutes = new Map<string, string>(); // key: path → project id
 const projectTokens = new Map<string, string>(); // project id → its bearer token (per-project override)
+const projWebhookWfs = new Map<string, string[]>(); // project id → workflows that OPT IN to an HTTP endpoint (declare a `webhook` trigger)
 
 function safeEq(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -161,23 +162,35 @@ function syncTriggers() {
   wfRoutes.clear();
   projRoutes.clear();
   projectTokens.clear();
+  projWebhookWfs.clear();
   for (const pid of listProjects(PROJECTS_DIR)) {
-    projRoutes.set(pid, pid); // default project endpoint: /p/<project-id>
     try {
       const proj = loadProject(join(PROJECTS_DIR, pid));
       const env = proj.ingress?.tokenEnv;
       if (env && process.env[env]) projectTokens.set(pid, process.env[env]!); // per-project token via Secret/env ref
     } catch { /* invalid project.yaml — skip */ }
+    const exposed: string[] = []; // workflows in this project that opt in to an HTTP endpoint
     for (const wname of listWorkflows(join(PROJECTS_DIR, pid))) {
-      wfRoutes.set(`${wname}/${pid}`, { project: pid, workflow: wname }); // default: /p/w/<wf>/<project-id>
       try {
         const { def } = loadWorkflow(join(PROJECTS_DIR, pid), wname);
+        const hasWebhook = def.triggers.some((t) => t.type === "webhook");
+        // An HTTP endpoint exists ONLY when a workflow opts in with a `webhook` trigger.
+        // Manual/cron/event-only workflows run, but are NOT reachable over /p — nothing is
+        // "exposed" until you configure it.
+        if (hasWebhook) {
+          exposed.push(wname);
+          wfRoutes.set(`${wname}/${pid}`, { project: pid, workflow: wname }); // default: /p/w/<wf>/<project-id>
+        }
         for (const t of def.triggers) {
           // effective policy: the trigger's own, else the workflow-level default.
           triggers.push({ project: pid, workflow: wname, type: t.type, schedule: t.schedule, path: t.path, concurrencyPolicy: t.concurrencyPolicy ?? def.concurrencyPolicy });
           if (t.type === "webhook" && t.path) wfRoutes.set(`${wname}/${t.path}`, { project: pid, workflow: wname }); // custom token path
         }
       } catch { /* skip invalid workflow */ }
+    }
+    if (exposed.length) {
+      projWebhookWfs.set(pid, exposed);
+      projRoutes.set(pid, pid); // project endpoint /p/<id> only when ≥1 workflow is exposed
     }
   }
   // Prune allow-empty guard: never let a suddenly-empty tree (broken clone, bad revision)
@@ -525,12 +538,22 @@ api.get("/reconcile-events", (c) => c.json({ events: reconcileLog }));
 api.get("/projects/:id/endpoints", (c) => {
   const { id } = c.req.param();
   if (!existsSync(join(PROJECTS_DIR, id, "project.yaml"))) return c.json({ error: "project not found" }, 404);
-  const workflows = listWorkflows(join(PROJECTS_DIR, id)).map((w) => {
+  // Only workflows that opt in with a `webhook` trigger have an HTTP endpoint. A project with
+  // none exposes nothing — the UI shows a "no endpoints, add a webhook trigger" hint instead.
+  const exposed = projWebhookWfs.get(id) ?? [];
+  const workflows = exposed.map((w) => {
     const custom: string[] = [];
     try { const { def } = loadWorkflow(join(PROJECTS_DIR, id), w); for (const t of def.triggers) if (t.type === "webhook" && t.path) custom.push(`/p/w/${w}/${t.path}`); } catch { /* skip */ }
     return { workflow: w, path: `/p/w/${w}/${id}`, customPaths: custom };
   });
-  return c.json({ project: id, projectPath: `/p/${id}`, workflows, authRequired: !!tokenFor(id), perProjectToken: projectTokens.has(id) });
+  return c.json({
+    project: id,
+    projectPath: workflows.length ? `/p/${id}` : null, // null → nothing exposed yet
+    workflows,
+    ingressEnabled: !!tokenFor(id), // a bearer token is configured (global or per-project)
+    authRequired: !!tokenFor(id),
+    perProjectToken: projectTokens.has(id),
+  });
 });
 
 // What a Sync would apply: the name-status diff between the live and target revisions.
@@ -737,14 +760,14 @@ app.get("/p/:path", (c) => {
   if (!project) return c.json({ error: "no such project endpoint" }, 404);
   const bad = bearerGuard(c, project); if (bad) return bad;
   const origin = new URL(c.req.url).origin;
-  const workflows = listWorkflows(join(PROJECTS_DIR, project)).map((w) => ({ workflow: w, url: `${origin}/p/w/${w}/${project}` }));
+  const workflows = (projWebhookWfs.get(project) ?? []).map((w) => ({ workflow: w, url: `${origin}/p/w/${w}/${project}` }));
   return c.json({ project, url: `${origin}/p/${project}`, workflows });
 });
 app.post("/p/:path", async (c) => {
   const project = projRoutes.get(c.req.param("path"));
   if (!project) return c.json({ error: "no such project endpoint" }, 404);
   const bad = bearerGuard(c, project); if (bad) return bad;
-  const wfs = listWorkflows(join(PROJECTS_DIR, project));
+  const wfs = projWebhookWfs.get(project) ?? []; // only webhook-exposed workflows
   if (wfs.length === 1) return ingressTrigger(c, project, wfs[0]);
   return c.json({ error: "project exposes multiple workflows — POST to /p/w/<workflow>/" + project, workflows: wfs }, 400);
 });
