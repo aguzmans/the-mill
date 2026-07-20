@@ -4,7 +4,7 @@ metadata: { name: crm-upsert }
 triggers: [{ type: manual }]
 nodes:
   - { key: start, kind: start,  name: Start }
-  - { key: crm, kind: jscode, name: crm-upsert, file: nodes/crm.js }
+  - { key: crm, kind: jscode, name: crm-upsert, file: nodes/crm.js, secrets: [ CRM_API_URL, CRM_API_KEY ] }
   - { key: end,   kind: end,    name: End }
 edges:
   - { from: start, to: crm }

@@ -1,0 +1,10 @@
+{
+  "name": "acuity",
+  "private": true,
+  "type": "module",
+  "dependencies": {},
+  "scripts": {
+    "start": "bun run index.js",
+    "start-server": "bun run index.js serve"
+  }
+}

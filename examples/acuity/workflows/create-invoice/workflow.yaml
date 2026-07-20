@@ -4,7 +4,7 @@ metadata: { name: create-invoice }
 triggers: [{ type: manual }]
 nodes:
   - { key: start, kind: start,  name: Start }
-  - { key: invoice, kind: jscode, name: create-invoice, file: nodes/invoice.js }
+  - { key: invoice, kind: jscode, name: create-invoice, file: nodes/invoice.js, secrets: [ BILLING_API_URL, BILLING_API_KEY ] }
   - { key: end,   kind: end,    name: End }
 edges:
   - { from: start, to: invoice }

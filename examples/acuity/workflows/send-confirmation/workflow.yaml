@@ -4,7 +4,7 @@ metadata: { name: send-confirmation }
 triggers: [{ type: manual }]
 nodes:
   - { key: start, kind: start,  name: Start }
-  - { key: send, kind: jscode, name: send-confirmation, file: nodes/send.js }
+  - { key: send, kind: jscode, name: send-confirmation, file: nodes/send.js, secrets: [ NOTIFY_API_URL, NOTIFY_API_KEY ] }
   - { key: end,   kind: end,    name: End }
 edges:
   - { from: start, to: send }
