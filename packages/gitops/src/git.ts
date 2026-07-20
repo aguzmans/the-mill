@@ -19,6 +19,17 @@ const redact = (s: string) => s.replace(/x-access-token:[^@]+@/g, "x-access-toke
 
 export const Git = {
   clone: (url: string, dir: string, token?: string) => git(["clone", "--quiet", authUrl(url, token), dir]),
+  /**
+   * Materialize `url`@`branch` into a NON-empty `dir` (git clone refuses those — e.g. a k8s
+   * PVC's `lost+found`). init → add remote → fetch → checkout, in place. Untracked leftovers
+   * (lost+found) are simply ignored.
+   */
+  initFetchCheckout: async (url: string, dir: string, branch: string, token?: string) => {
+    await git(["init", "-q", "-b", branch, dir]);
+    await git(["remote", "add", "origin", authUrl(url, token)], dir);
+    await git(["fetch", "--quiet", "--all", "--prune"], dir);
+    await git(["checkout", "-q", "-f", "-B", branch, `origin/${branch}`], dir);
+  },
   fetch: (dir: string) => git(["fetch", "--quiet", "--all", "--prune"], dir),
   revParse: (dir: string, ref: string) => git(["rev-parse", ref], dir),
   headSha: (dir: string) => git(["rev-parse", "HEAD"], dir),

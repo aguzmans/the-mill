@@ -44,6 +44,18 @@ beforeAll(async () => {
 
 afterAll(() => { if (base && existsSync(base)) rmSync(base, { recursive: true, force: true }); });
 
+describe("openRepo", () => {
+  test("clones into a NON-empty working copy (a PVC's lost+found)", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const dir = join(base, "pvc-workdir");
+    mkdirSync(join(dir, "lost+found"), { recursive: true }); // simulate an ext4 PVC root
+    writeFileSync(join(dir, "lost+found", ".keep"), "");
+    const st = await openRepo(remote, dir, "main"); // git clone would fail here — init-in-place must work
+    expect(st.syncedRevision).toMatch(/^[0-9a-f]{7,}$/);
+    expect(existsSync(join(dir, "billing", "project.yaml"))).toBe(true);
+  });
+});
+
 describe("reconcile", () => {
   test("a valid revision reconciles to Synced / Healthy", async () => {
     const s = await reconcile(state);
