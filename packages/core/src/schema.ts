@@ -71,6 +71,9 @@ export const workflowDef = z.object({
   nodes: z.array(workflowNode).min(1),
   edges: z.array(workflowEdge).default([]),
   concurrencyPolicy: z.enum(["Allow", "Forbid", "Replace"]).optional(),
+  // inputSchema: a JS boolean expression over `input` validated against the RUN input before
+  // the start node runs — rejects malformed payloads (e.g. from webhooks) at the boundary.
+  inputSchema: z.string().optional(),
   // exclusive: run this workflow ALONE on its worker/pod until it finishes — the worker
   // takes no co-tenant jobs for the duration (heavy/CPU-hungry/memory-hungry runs get the
   // whole pod). Combined with queue-depth autoscaling, an exclusive job in the queue pulls

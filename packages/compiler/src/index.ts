@@ -35,5 +35,5 @@ export function buildPlan(wf: WorkflowDef): ExecPlan {
     };
   }
 
-  return { workflow: wf.metadata.name, startKey: start.key, order, nodes };
+  return { workflow: wf.metadata.name, startKey: start.key, order, nodes, inputSchema: wf.inputSchema };
 }

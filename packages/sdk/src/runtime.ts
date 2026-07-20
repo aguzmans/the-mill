@@ -84,6 +84,13 @@ export async function executePlan(plan: ExecPlan, deps: ExecuteDeps): Promise<Ru
   const state: Record<string, unknown> = {};
   let result: unknown = undefined;
 
+  // Workflow-level input schema: validate the RUN input up front, attributed to the start node,
+  // so a malformed payload fails cleanly at the boundary instead of deep inside a node.
+  if (plan.inputSchema) {
+    try { checkSchema(plan.inputSchema, deps.input, "input", plan.workflow); }
+    catch (e) { throw new WorkflowError(plan.startKey, e, {}); }
+  }
+
   for (const key of plan.order) {
     const node = plan.nodes[key];
     if (!node) continue;

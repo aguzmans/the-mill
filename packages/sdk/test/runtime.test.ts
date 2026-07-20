@@ -42,6 +42,19 @@ describe("executePlan — branching", () => {
   });
 });
 
+describe("executePlan — workflow input schema", () => {
+  const schemaPlan = (): ExecPlan => ({ ...branchingPlan(), inputSchema: "typeof input.n === 'number'" });
+  test("accepts a run input that satisfies the workflow inputSchema", async () => {
+    const r = await executePlan(schemaPlan(), { input: { n: 5 }, loadNode, callScript: noCall });
+    expect(r.result).toEqual({ doubled: 10 });
+  });
+  test("rejects a run input that violates the workflow inputSchema (fails at the start node)", async () => {
+    await expect(
+      executePlan(schemaPlan(), { input: { n: "nope" }, loadNode, callScript: noCall }),
+    ).rejects.toThrow(/schema|input/i);
+  });
+});
+
 describe("executePlan — fan-in", () => {
   test("a multi-parent node reads every live parent via ctx.inputs", async () => {
     const plan: ExecPlan = {

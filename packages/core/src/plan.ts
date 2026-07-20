@@ -30,4 +30,5 @@ export interface ExecPlan {
   startKey: string;
   order: string[]; // topological order
   nodes: Record<string, PlanNode>;
+  inputSchema?: string; // JS boolean expr over the run `input` — validated before the start node
 }

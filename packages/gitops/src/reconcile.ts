@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { listProjects, loadProject, listWorkflows, loadWorkflow } from "@mill/projectfs";
+import { listProjects, loadProject, listWorkflows, loadWorkflow, validateNodeSources } from "@mill/projectfs";
 import { buildPlan } from "@mill/compiler";
 import { Git } from "./git";
 
@@ -50,9 +50,13 @@ export function validateTree(root: string): { ok: boolean; projects: ProjectStat
     const workflows: WorkflowStatus[] = [];
     for (const name of listWorkflows(dir)) {
       try {
-        const { def } = loadWorkflow(dir, name);
-        buildPlan(def);
-        workflows.push({ name, ok: true });
+        const { def, dir: wfDir } = loadWorkflow(dir, name);
+        buildPlan(def); // structural (graph) validity — a failure blocks applying the revision
+        // Node source must actually parse. A broken .js marks the workflow Degraded and blocks
+        // its dispatch, but does NOT block the repo apply (healthy workflows keep serving).
+        const src = validateNodeSources(wfDir, def);
+        if (src.length) workflows.push({ name, ok: false, error: src.map((e) => `${e.node}: ${e.error}`).join("; ") });
+        else workflows.push({ name, ok: true });
       } catch (e) {
         ok = false;
         workflows.push({ name, ok: false, error: msg(e) });
@@ -90,7 +94,9 @@ export async function reconcile(state: RepoState, opts: { apply?: boolean } = {}
       targetRevision: target,
       syncedRevision: state.syncedRevision,
       sync: v.ok && state.syncedRevision === target ? "Synced" : "OutOfSync",
-      health: v.ok ? "Healthy" : "Degraded",
+      // Health reflects per-workflow status (incl. broken node source), independent of the
+      // apply gate (`v.ok`, structural) — a repo can be Synced yet Degraded on one workflow.
+      health: v.projects.every((p) => p.health === "Healthy") ? "Healthy" : "Degraded",
       projects: v.projects,
       error: !v.ok
         ? `revision ${Git.short(target)} failed to validate — keeping last-known-good ${Git.short(state.syncedRevision)}`

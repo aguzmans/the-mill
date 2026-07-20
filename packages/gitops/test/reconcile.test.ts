@@ -78,4 +78,22 @@ describe("reconcile", () => {
     expect(s.health).toBe("Healthy");
     expect(s.syncedRevision).toBe(s.targetRevision);
   });
+
+  test("a broken node .js → workflow Degraded but the revision still applies (healthy ones keep serving)", async () => {
+    // valid graph, but the node source has a syntax error (a shell comment — the site-check bug)
+    writeFileSync(join(author, "billing/workflows/heartbeat/nodes/beat.js"), "export default async () => ({ ok: true })\n# manual apply test\n");
+    await commitPush("break heartbeat node source");
+
+    const s = await reconcile(state);
+    expect(s.syncedRevision).toBe(s.targetRevision); // applied — a bad node file does NOT block apply
+    expect(s.health).toBe("Degraded");               // …but health reflects the broken workflow
+    const billing = s.projects.find((p) => p.id === "billing");
+    expect(billing?.workflows.find((w) => w.name === "heartbeat")?.ok).toBe(false);
+    expect(billing?.workflows.find((w) => w.name === "invoices")?.ok).toBe(true); // healthy sibling unaffected
+
+    // restore
+    cpSync(join(BILLING, "workflows/heartbeat/nodes/beat.js"), join(author, "billing/workflows/heartbeat/nodes/beat.js"));
+    await commitPush("fix heartbeat");
+    expect((await reconcile(state)).health).toBe("Healthy");
+  });
 });

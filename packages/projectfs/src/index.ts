@@ -43,6 +43,25 @@ export function loadWorkflow(projectDir: string, name: string): LoadedWorkflow {
   return { def: r.value!, dir };
 }
 
+/**
+ * Parse every jscode/loop node's `.js` source for syntax errors (missing file counts too).
+ * Catches a broken node BEFORE a job is dispatched — the graph compiling is not enough, the
+ * node code must actually parse. Returns one entry per broken node ([] = all sources valid).
+ */
+export function validateNodeSources(dir: string, def: WorkflowDef): { node: string; error: string }[] {
+  const errors: { node: string; error: string }[] = [];
+  const transpiler = new Bun.Transpiler({ loader: "js" });
+  for (const n of def.nodes) {
+    const file = (n as { file?: string }).file;
+    if (!file) continue; // only jscode / loop-with-file nodes have source
+    const abs = join(dir, file);
+    if (!existsSync(abs)) { errors.push({ node: n.key, error: `missing node file '${file}'` }); continue; }
+    try { transpiler.transformSync(readFileSync(abs, "utf8")); }
+    catch (e) { errors.push({ node: n.key, error: e instanceof Error ? e.message.split("\n")[0] : String(e) }); }
+  }
+  return errors;
+}
+
 /** Union of every node's declared npm `deps` across all workflows in a project. */
 export function collectDeps(projectDir: string): Record<string, string> {
   const deps: Record<string, string> = {};

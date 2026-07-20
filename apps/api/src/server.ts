@@ -14,7 +14,7 @@ import { createLogger } from "@mill/telemetry";
 const log = createLogger("api");
 
 const ENV_SECRETS: Record<string, string> = process.env.MILL_SECRETS ? JSON.parse(process.env.MILL_SECRETS) : {};
-import { loadProject, listWorkflows, loadWorkflow, listProjects, collectDeps } from "@mill/projectfs";
+import { loadProject, listWorkflows, loadWorkflow, listProjects, collectDeps, validateNodeSources } from "@mill/projectfs";
 import { buildPlan } from "@mill/compiler";
 import { openRepo, reconcile, deletePaths, writePaths, diffToApply, type RepoState, type ReconcileStatus } from "@mill/gitops";
 import { parseWorkflow } from "@mill/core";
@@ -54,6 +54,30 @@ setInterval(() => {
 
 let repoState: RepoState | null = null;
 
+/**
+ * Why a workflow can't be dispatched right now (graph won't compile, or a node's .js won't
+ * parse), or null if it's runnable. Guards every trigger path so a broken workflow is rejected
+ * at the boundary with a clear message instead of enqueuing a job that fails at runtime.
+ */
+// Compile results are stable for a given synced revision — cache them so high-frequency crons
+// and hot webhook endpoints don't re-transpile every node file on every trigger. Cleared on
+// each reconcile (a new revision invalidates the working copy).
+const compileCache = new Map<string, string | null>();
+function runnableError(projectDir: string, workflow: string): string | null {
+  const cacheKey = `${lastStatus?.syncedRevision ?? ""}:${projectDir}:${workflow}`;
+  const hit = compileCache.get(cacheKey);
+  if (hit !== undefined) return hit;
+  let result: string | null;
+  try {
+    const { def, dir } = loadWorkflow(projectDir, workflow);
+    buildPlan(def);
+    const src = validateNodeSources(dir, def);
+    result = src.length ? src.map((e) => `${e.node}: ${e.error}`).join("; ") : null;
+  } catch (e) { result = e instanceof Error ? e.message : String(e); }
+  compileCache.set(cacheKey, result);
+  return result;
+}
+
 function enqueueJob(projectDir: string, workflow: string, input: unknown, trigger = "manual", request?: unknown): string {
   const jobId = "job_" + crypto.randomUUID().slice(0, 8);
   const projectId = projectDir.split("/").filter(Boolean).pop() ?? projectDir;
@@ -68,6 +92,13 @@ function enqueueJob(projectDir: string, workflow: string, input: unknown, trigge
 
 // Cron + webhook triggers, rebuilt from the reconciled workflows on every reconcile.
 const triggerEngine = new TriggerEngine(async (t, input) => {
+  // Don't dispatch a broken workflow — a compile/parse error would just fail at runtime.
+  const bad = runnableError(join(PROJECTS_DIR, t.project), t.workflow);
+  if (bad) {
+    q.metricInc("dispatch_skipped:compile_error").catch(() => {});
+    log.warn("dispatch skipped — workflow won't compile", { project: t.project, workflow: t.workflow, error: bad });
+    return;
+  }
   // concurrencyPolicy enforcement — CRON only (k8s CronJob semantics). Webhook/manual/event
   // runs are intentional and always fire. Replace is best-effort: drop a still-queued prior
   // run; if one is already executing, let it finish and skip this one (degrades to Forbid).
@@ -204,6 +235,7 @@ const AUTOSYNC = (process.env.MILL_AUTOSYNC ?? "true") !== "false";
 async function doReconcile(opts: { force?: boolean } = {}): Promise<(ReconcileStatus & { at: number }) | null> {
   if (!repoState) return null;
   const s = await reconcile(repoState, { apply: opts.force ? true : AUTOSYNC }); // force = manual Sync applies now
+  if (s.syncedRevision !== lastStatus?.syncedRevision) compileCache.clear(); // working copy changed
   lastStatus = { ...s, at: Date.now() };
   // Log an activity entry when something changed (new target, applied revision, or an error).
   const sig = `${s.targetRevision}|${s.syncedRevision}|${s.error ?? ""}`;
@@ -281,7 +313,7 @@ api.get("/projects/:id/workflows/:wf", (c) => {
     const plan = buildPlan(def);
     // Include node code so the editor can render + inspect a workflow it doesn't have mocked.
     const nodes = def.nodes.map((n) => (n.kind === "jscode" && n.file ? { ...n, code: readFileSafe(join(dir, n.file)) } : n));
-    return c.json({ workflow: def.metadata.name, nodes, edges: def.edges, triggers: def.triggers, order: plan.order, exclusive: def.exclusive ?? false });
+    return c.json({ workflow: def.metadata.name, nodes, edges: def.edges, triggers: def.triggers, order: plan.order, exclusive: def.exclusive ?? false, inputSchema: def.inputSchema ?? "" });
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
   }
@@ -291,7 +323,13 @@ api.post("/projects/:id/workflows/:wf/trigger", async (c) => {
   const { id, wf } = c.req.param();
   const dir = join(PROJECTS_DIR, id);
   if (!existsSync(join(dir, "workflows", wf, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
-  const body = await c.req.json().catch(() => ({}));
+  const badWf = runnableError(dir, wf);
+  if (badWf) return c.json({ error: `workflow '${wf}' won't compile: ${badWf}` }, 422);
+  // A non-empty but malformed JSON body is a caller error — reject it instead of silently
+  // running with empty input (an empty body is fine and defaults to {}).
+  const text = await c.req.text();
+  let body: { input?: unknown } = {};
+  if (text.trim()) { try { body = JSON.parse(text); } catch { return c.json({ error: "invalid JSON body" }, 400); } }
   const jobId = enqueueJob(dir, wf, body?.input ?? {}, "manual");
   return c.json({ jobId });
 });
@@ -626,6 +664,8 @@ app.post("/hooks/:project/:workflow", async (c) => {
   const { project, workflow } = c.req.param();
   const dir = join(PROJECTS_DIR, project);
   if (!existsSync(join(dir, "workflows", workflow, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
+  const badHook = runnableError(dir, workflow);
+  if (badHook) return c.json({ error: `workflow '${workflow}' won't compile: ${badHook}` }, 422);
   const body = await c.req.json().catch(() => ({}));
   const jobId = enqueueJob(dir, workflow, (body && body.input) ?? body ?? {}, "webhook");
   return c.json({ jobId, via: "webhook" });
@@ -638,6 +678,8 @@ app.post("/hooks/:project/:workflow", async (c) => {
 async function ingressTrigger(c: Parameters<Parameters<typeof app.all>[1]>[0], project: string, workflow: string): Promise<Response> {
   const dir = join(PROJECTS_DIR, project);
   if (!existsSync(join(dir, "workflows", workflow, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
+  const badWf = runnableError(dir, workflow);
+  if (badWf) return c.json({ error: `workflow '${workflow}' won't compile: ${badWf}` }, 422);
   const url = new URL(c.req.url);
   const method = c.req.method;
   const headers: Record<string, string> = {};
