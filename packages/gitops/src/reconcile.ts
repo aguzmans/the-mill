@@ -174,12 +174,13 @@ export async function diffToApply(state: RepoState, target: string, subpath?: st
 /** Clone (or open an existing) working copy and record the initial revision. */
 export async function openRepo(url: string, dir: string, branch: string, token?: string): Promise<RepoState> {
   const { existsSync, mkdirSync, readdirSync } = await import("node:fs");
+  Git.setToken(token); // held in memory; supplied to git via env, never in a URL or argv
   mkdirSync(dir, { recursive: true });
   if (!existsSync(join(dir, ".git"))) {
     // `git clone` needs an empty target; a mounted PVC often isn't (it has `lost+found`).
     // Clone into a truly-empty dir, otherwise init the repo in place.
-    if (readdirSync(dir).length === 0) await Git.clone(url, dir, token);
-    else await Git.initFetchCheckout(url, dir, branch, token);
+    if (readdirSync(dir).length === 0) await Git.clone(url, dir);
+    else await Git.initFetchCheckout(url, dir, branch);
   }
   let syncedRevision = "";
   try {

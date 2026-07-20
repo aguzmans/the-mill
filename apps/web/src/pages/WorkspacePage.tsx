@@ -44,17 +44,22 @@ export function WorkspacePage() {
     } finally { setCreating(false); }
   }
 
-  // In Live mode, render real projects from /api/status; otherwise the mock catalogue.
+  // Live mode renders ONLY real projects from /api/status — never the demo catalogue.
+  // The mock catalogue exists purely for the standalone /prototype build (!LIVE).
   const cards = ready
     ? status!.projects!.map((p) => ({
         id: p.id, name: cap(p.id), description: "GitOps project (live from the controller).",
         sync: status!.sync ?? "OutOfSync", health: p.health, branch: "main",
-        revision: (status!.syncedRevision ?? "").slice(0, 7), wfCount: p.workflows.length,
+        revision: (status!.syncedRevision ?? "").slice(0, 7), wfCount: (p.workflows ?? []).length,
       }))
-    : projects.map((p) => ({
-        id: p.id, name: p.name, description: p.description,
-        sync: p.sync, health: p.health, branch: p.branch, revision: p.revision, wfCount: p.workflows.length,
-      }));
+    : LIVE
+      ? [] // live but not yet loaded → show a connecting state, not demo data
+      : projects.map((p) => ({
+          id: p.id, name: p.name, description: p.description,
+          sync: p.sync, health: p.health, branch: p.branch, revision: p.revision, wfCount: p.workflows.length,
+        }));
+  const connecting = LIVE && !ready; // controller status hasn't arrived yet
+  const emptyLive = LIVE && ready && cards.length === 0; // connected, but the repo has no projects
 
   return (
     <div className="space-y-6" data-testid="workspace-page">
@@ -69,7 +74,7 @@ export function WorkspacePage() {
           </h1>
           <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-400">
             <FolderGit2 className="h-4 w-4" />
-            Root config repo: <span className="font-mono text-slate-300">{workspace.rootRepo}</span>
+            Root config repo: <span className="font-mono text-slate-300">{LIVE ? "git-backed workspace" : workspace.rootRepo}</span>
             <InfoTip text="The root config repo (app-of-apps) registers which project repos this workspace tracks. Credentials live in k8s Secrets, never in git." />
             <Spec doc="ARCH §5" />
           </p>
@@ -87,12 +92,33 @@ export function WorkspacePage() {
           <GitCommitHorizontal className="h-4 w-4 text-brand-400" /> Workspace
           <InfoTip text="v1 ships as a single GitHub repo with a folder per project (each project's config lives in its folder); Save writes to it directly. Binding several repos ('app-of-apps') comes soon after v1. Credentials are k8s Secrets, never in git." />
         </span>
-        <span>{workspace.name} ·</span>
-        <span className="font-mono text-slate-300">{projects.length} projects</span>
+        <span>{LIVE ? "Workspace" : workspace.name} ·</span>
+        <span className="font-mono text-slate-300">{LIVE ? cards.length : projects.length} projects</span>
         <span className="chip bg-white/5 text-[10px] text-slate-400">v1: single repo · multi-repo soon</span>
         <span className="text-slate-600">·</span>
         <span className="inline-flex items-center gap-1"><KeyRound className="h-3.5 w-3.5" /> creds via k8s Secrets (never in git)</span>
       </div>
+
+      {connecting && (
+        <div className="card p-8 text-center text-sm text-slate-400" data-testid="workspace-connecting">
+          <div className="mx-auto mb-3 h-6 w-6 animate-spin rounded-full border-2 border-white/10 border-t-brand-400" />
+          Connecting to the controller…
+        </div>
+      )}
+
+      {emptyLive && (
+        <div className="card p-8 text-center" data-testid="workspace-empty">
+          <FolderGit2 className="mx-auto mb-3 h-8 w-8 text-slate-500" />
+          <div className="text-sm font-medium text-slate-200">No projects yet</div>
+          <p className="mx-auto mt-1 max-w-md text-xs text-slate-400">
+            This workspace's git repo has no projects. Click <span className="font-medium text-slate-300">New Project</span> to
+            create one — Mill writes <span className="font-mono">&lt;name&gt;/project.yaml</span>, commits it, and reconciles.
+          </p>
+          <button className="btn-primary mx-auto mt-4" data-testid="empty-new-project" onClick={() => setShowNew(true)}>
+            <Plus className="h-4 w-4" /> New Project
+          </button>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3" data-testid="project-grid">
         {cards.map((p, i) => (

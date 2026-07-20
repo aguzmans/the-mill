@@ -69,7 +69,8 @@ function StepBreakdown({ w }: { w: Workflow }) {
 
 export function ProjectPage() {
   const { projectId } = useParams();
-  const mockProject = findProject(projectId);
+  // Live mode uses ONLY controller data; the mock catalogue is for the /prototype build.
+  const mockProject = LIVE ? undefined : findProject(projectId);
   const [showReconcile, setShowReconcile] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [showNewWf, setShowNewWf] = useState(false);
@@ -120,7 +121,14 @@ export function ProjectPage() {
       }
     : undefined);
 
-  if (!project) return <div className="text-slate-400">Project not found.</div>;
+  if (!project) {
+    // In live mode a missing project usually means the controller status hasn't loaded yet.
+    return LIVE && !ready
+      ? <div className="flex items-center gap-2 text-sm text-slate-400" data-testid="project-connecting">
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/10 border-t-brand-400" /> Connecting to the controller…
+        </div>
+      : <div className="text-slate-400" data-testid="project-not-found">Project not found.</div>;
+  }
 
   const effSync = live ? (status!.sync ?? "OutOfSync") : project.sync;
   const effHealth = live ? liveProject!.health : project.health;
@@ -275,7 +283,7 @@ export function ProjectPage() {
 
       <div className="space-y-3" data-testid="workflow-list">
         {live
-          ? liveProject!.workflows.map((w, i) => {
+          ? (liveProject!.workflows ?? []).map((w, i) => {
               const body = (
                 <div className="card flex flex-wrap items-center justify-between gap-3 p-4 transition-shadow hover:glow">
                   <div className="min-w-0">

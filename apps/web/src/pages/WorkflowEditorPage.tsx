@@ -109,7 +109,8 @@ const edgeMarker = (branch?: "true" | "false") => ({
 
 export function WorkflowEditorPage() {
   const { projectId, workflowId } = useParams();
-  const mock = findWorkflow(projectId, workflowId);
+  // Live mode fetches the real graph from the controller; the mock catalogue is /prototype-only.
+  const mock = LIVE ? { project: undefined, workflow: undefined } : findWorkflow(projectId, workflowId);
   const [live, setLive] = useState<{ project: EditorProject; workflow: Workflow } | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);

@@ -82,9 +82,24 @@ rough and assume a small team.
   policy, an editable **Dependencies** panel, and a **Test this step** runner — all live.
 - **Fleet page runs on real data** (`/api/fleet`): live workers (memory, executor tier,
   heartbeat age, jobs running now), fleet-wide throughput/p50/p95/success/wait from a
-  rolling completion window, and the pending-queue breakdown — mock catalogue only as a
-  no-worker fallback.
+  rolling completion window, and the pending-queue breakdown.
+- **No demo data in the live build** — **DONE**: the frontend mock catalogue (seeded
+  Billing/Growth projects, sample fleet workers/queue/stats, the "Acme" workspace) exists
+  **only** for the standalone `/prototype` build. In the live build (`VITE_MILL_MODE=live`)
+  every page renders controller data or an explicit **connecting / empty** state — the mock
+  module is dead-code-eliminated out of the live bundle, so no fabricated project or worker
+  can ever appear in a deployment.
 - **Exit:** a non-author builds a 3-node workflow, hits Save (⇒ a commit), and watches it run with live logs.
+
+### Deferred UI (mockups pulled from the live build — build as real features later)
+These were only ever hand-authored fixtures in the prototype and are **not** shipped live:
+- **Seeded demo/sample projects** — an optional, clearly-labelled "load sample project"
+  action that actually commits a real example project to the workspace repo (vs. faking it
+  in the browser). Until then, a fresh workspace shows the empty state.
+- **Workspace switcher / multi-workspace** — the named-tenant switcher in the top bar is
+  prototype-only; live shows a neutral "Workspace" until multi-repo/app-of-apps lands.
+- **Historical fleet analytics** — the mock throughput sparkline/percentiles beyond the
+  live rolling window; a durable metrics-backed history view (Prometheus/Tempo) later.
 
 ## M5 — Export (wk 12–13)
 **Goal:** download a project as a standalone, runnable bundle.

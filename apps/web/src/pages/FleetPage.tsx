@@ -39,7 +39,12 @@ export function FleetPage() {
   const { fleet, ready } = useFleet();
   const now = fleet?.now ?? 0;
 
-  // Live in LIVE mode (real workers + rolling stats from /api/fleet); mock otherwise.
+  // Live in LIVE mode (real workers + rolling stats from /api/fleet). In LIVE-but-not-ready we
+  // show an empty fleet (connecting), never demo workers. The mock fleet is /prototype-only.
+  const EMPTY_STATS: FleetStats = {
+    throughputPerMin: 0, completedLastHour: 0, failedLastHour: 0, p50Ms: 0, p95Ms: 0,
+    successRatePct: 100, avgWaitMs: 0, throughputTrend: [],
+  };
   const workers: ViewWorker[] = ready
     ? fleet!.workers.map((w) => ({
         id: w.id, host: w.host, status: "online", executor: w.executor ?? "in-process", paused: w.paused,
@@ -48,13 +53,15 @@ export function FleetPage() {
         concMin: w.concMin, concMax: w.concMax, inFlight: w.inFlight,
         jobs: (w.jobs ?? []).map((j) => ({ id: j.id, workflow: j.workflow, elapsedMs: Math.max(0, now - j.startedAt) })),
       }))
-    : mockWorkers.map((w) => ({
-        id: w.id, host: w.host, status: w.status, executor: w.executor, paused: w.paused,
-        heartbeatAgeS: w.heartbeatAgeS, leaseTtlS: w.leaseTtlS, memMB: w.memMB, memMaxMB: w.memMaxMB,
-        concMin: w.concMin, concMax: w.concMax, inFlight: w.inFlight,
-        jobs: w.jobs.map((j) => ({ id: j.id, workflow: j.workflow, node: j.node, elapsedMs: j.elapsedMs, memMB: j.memMB })),
-      }));
-  const fleetStats: FleetStats = ready ? fleet!.stats : {
+    : LIVE
+      ? []
+      : mockWorkers.map((w) => ({
+          id: w.id, host: w.host, status: w.status, executor: w.executor, paused: w.paused,
+          heartbeatAgeS: w.heartbeatAgeS, leaseTtlS: w.leaseTtlS, memMB: w.memMB, memMaxMB: w.memMaxMB,
+          concMin: w.concMin, concMax: w.concMax, inFlight: w.inFlight,
+          jobs: w.jobs.map((j) => ({ id: j.id, workflow: j.workflow, node: j.node, elapsedMs: j.elapsedMs, memMB: j.memMB })),
+        }));
+  const fleetStats: FleetStats = ready ? fleet!.stats : LIVE ? EMPTY_STATS : {
     throughputPerMin: mockStats.throughputPerMin, completedLastHour: mockStats.completedLastHour,
     failedLastHour: mockStats.failedLastHour,
     p50Ms: mockStats.p50Ms, p95Ms: mockStats.p95Ms, successRatePct: mockStats.successRatePct,
@@ -62,6 +69,7 @@ export function FleetPage() {
   };
   const failed = fleetStats.failedLastHour ?? 0;
   const queue: ViewQueue = ready ? fleet!.queue
+    : LIVE ? { depth: 0, oldestWaitMs: 0, byWorkflow: [] }
     : { depth: mockQueue.depth, oldestWaitMs: mockQueue.oldestWaitMs, byWorkflow: mockQueue.byWorkflow };
 
   const online = workers.filter((w) => w.status === "online").length;

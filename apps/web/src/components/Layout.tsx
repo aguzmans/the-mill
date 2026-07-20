@@ -37,7 +37,7 @@ export function Layout() {
 
           <div className="flex items-center gap-1 rounded-lg border border-white/5 bg-ink-850/60 px-2 py-1 text-xs text-slate-300" data-testid="workspace-switcher">
             <Boxes className="h-3.5 w-3.5 text-brand-400" />
-            <span className="font-medium">{workspace.name}</span>
+            <span className="font-medium">{import.meta.env.VITE_MILL_MODE === "live" ? "Workspace" : workspace.name}</span>
             <InfoTip
               label="workspace"
               text="A workspace is your top-level tenant. It binds one or more git repos (projects). The root config repo lists them."
