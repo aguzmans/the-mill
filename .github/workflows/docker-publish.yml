@@ -14,7 +14,7 @@ concurrency:
 
 env:
   # Change "mill-backend" if you want a different Docker Hub repository name.
-  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/mill-backend
+  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/the-mill
 
 jobs:
   build-and-push:
