@@ -1,0 +1,66 @@
+name: Build & Publish image
+
+# Publishes the mill-backend image (API + worker + the served UI) to Docker Hub.
+# Runs on pushes to main (→ :latest) and on version tags (→ :1.2.3, :1.2), plus manual dispatch.
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Change "mill-backend" if you want a different Docker Hub repository name.
+  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/mill-backend
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The backend image COPYs pre-built web bundles (dist-live at /, dist-prototype at
+      # /prototype). Build them here so the image serves the current UI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build the web UI bundles
+        working-directory: apps/web
+        run: |
+          npm install --no-audit --no-fund
+          VITE_MILL_MODE=live npx vite build --outDir dist-live --emptyOutDir
+          npx vite build --base=/prototype/ --outDir dist-prototype --emptyOutDir
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
