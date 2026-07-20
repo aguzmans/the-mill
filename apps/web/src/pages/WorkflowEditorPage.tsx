@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ReactFlow, Background, Controls, MarkerType, addEdge, useNodesState, useEdgesState,
   type ReactFlowInstance, type Connection, type Node, type Edge,
@@ -58,6 +58,27 @@ function liveToWorkflow(name: string, g: LiveGraph): Workflow {
   };
 }
 
+/** A brand-new workflow (from "New Workflow") that doesn't exist in git yet: a minimal
+ *  start → step → end draft with the chosen first trigger. Save commits it and creates the files. */
+function seedWorkflow(name: string, trigger: "manual" | "cron" | "webhook" | "event"): Workflow {
+  return {
+    id: name,
+    name: capW(name),
+    description: "New workflow (draft) — not yet committed. Build it, then Save to commit.",
+    sync: "OutOfSync", health: "Healthy", lastRun: "idle",
+    triggers: [{ type: trigger, detail: "" }],
+    nodes: [
+      { key: "start", kind: "start", name: "Start", position: { x: 0, y: 150 } },
+      { key: "step", kind: "jscode", name: "Step", file: "nodes/step.js", position: { x: 260, y: 150 } },
+      { key: "end", kind: "end", name: "End", position: { x: 520, y: 150 } },
+    ],
+    edges: [{ from: "start", to: "step" }, { from: "step", to: "end" }],
+    runs: [],
+    exclusive: false,
+    inputSchema: "",
+  };
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const DND_MIME = "application/mill-node-kind";
 type EditTrigger = { type: "manual" | "cron" | "webhook" | "event"; schedule?: string; path?: string; concurrencyPolicy?: "Allow" | "Forbid" | "Replace" };
@@ -109,6 +130,11 @@ const edgeMarker = (branch?: "true" | "false") => ({
 
 export function WorkflowEditorPage() {
   const { projectId, workflowId } = useParams();
+  const [searchParams] = useSearchParams();
+  // A brand-new draft opened from "New Workflow": ?new=1&trigger=<type>. It doesn't exist in
+  // git yet, so we seed a blank graph instead of fetching (which would 404).
+  const isNew = LIVE && searchParams.get("new") === "1";
+  const newTrigger = (["manual", "cron", "webhook", "event"].includes(searchParams.get("trigger") || "") ? searchParams.get("trigger") : "manual") as "manual" | "cron" | "webhook" | "event";
   // Live mode fetches the real graph from the controller; the mock catalogue is /prototype-only.
   const mock = LIVE ? { project: undefined, workflow: undefined } : findWorkflow(projectId, workflowId);
   const [live, setLive] = useState<{ project: EditorProject; workflow: Workflow } | null>(null);
@@ -118,13 +144,15 @@ export function WorkflowEditorPage() {
   useEffect(() => {
     setLive(null); setErr(null);
     if ((mock.project && mock.workflow) || !LIVE || !projectId || !workflowId) return;
+    const proj = { id: projectId, name: capW(projectId), branch: "main" };
+    if (isNew) { setLive({ project: proj, workflow: seedWorkflow(workflowId, newTrigger) }); return; }
     setLoading(true);
     getWorkflowGraph(projectId, workflowId)
-      .then((g) => setLive({ project: mock.project ?? { id: projectId, name: capW(projectId), branch: "main" }, workflow: liveToWorkflow(workflowId, g) }))
+      .then((g) => setLive({ project: mock.project ?? proj, workflow: liveToWorkflow(workflowId, g) }))
       .catch((e) => setErr(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, workflowId]);
+  }, [projectId, workflowId, isNew]);
 
   const project = (mock.project ?? live?.project) as EditorProject | undefined;
   const workflow = mock.workflow ?? live?.workflow;
@@ -135,6 +163,7 @@ export function WorkflowEditorPage() {
 }
 
 function EditorInner({ project, workflow }: { project: EditorProject; workflow: Workflow }) {
+  const navigate = useNavigate();
   const [statuses, setStatuses] = useState<Record<string, NodeStatus>>({});
   const [selected, setSelected] = useState<string | null>(workflow?.nodes[0]?.key ?? null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -364,6 +393,8 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       await saveWorkflow(project.id, workflow.id, { message: commitMsg, workflow: def, files });
       setShowCommit(false);
       flash(`Saved · committed to ${project.branch} · reconciling`);
+      // If this was a new draft (?new=1), drop the flag so a reload loads the committed workflow.
+      navigate(`/projects/${project.id}/workflows/${workflow.id}`, { replace: true });
     } catch (e) {
       const issues = (e as { issues?: unknown[] }).issues;
       flash(`Save failed: ${e instanceof Error ? e.message : String(e)}${issues?.length ? ` (${issues.length} issue${issues.length === 1 ? "" : "s"})` : ""}`);

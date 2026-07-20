@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import {
   ArrowLeft, GitBranch, RefreshCw, Download, Plus, Clock, Webhook, Hand, Zap,
@@ -74,6 +74,9 @@ export function ProjectPage() {
   const [showReconcile, setShowReconcile] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [showNewWf, setShowNewWf] = useState(false);
+  const [npWfName, setNpWfName] = useState("");
+  const [npWfTrigger, setNpWfTrigger] = useState<"manual" | "cron" | "webhook" | "event">("manual");
+  const navigate = useNavigate();
   const [policy, setPolicy] = useState({ autoSync: mockProject?.autoSync ?? false, selfHeal: mockProject?.selfHeal ?? false, prune: mockProject?.prune ?? false });
   const { toast, flash } = useToast();
   const { status, reload, ready } = useLiveStatus();
@@ -401,7 +404,15 @@ export function ProjectPage() {
         footer={
           <>
             <button className="btn-ghost" onClick={() => setShowNewWf(false)}>Cancel</button>
-            <button className="btn-primary" data-testid="new-workflow-create" onClick={() => { setShowNewWf(false); flash("Draft created · Save will commit workflow.yaml + nodes/"); }}>Create draft</button>
+            <button className="btn-primary" data-testid="new-workflow-create" onClick={() => {
+              const slug = npWfName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+              if (!slug) { flash("Enter a workflow name"); return; }
+              setShowNewWf(false);
+              // Live: open the new workflow in the editor as a draft; Save there commits it to git.
+              // Prototype: no backend to write to — keep the illustrative flash.
+              if (LIVE) navigate(`/projects/${project.id}/workflows/${slug}?new=1&trigger=${npWfTrigger}`);
+              else flash("Draft created · Save will commit workflow.yaml + nodes/");
+            }}>Create draft</button>
           </>
         }
       >
@@ -409,15 +420,16 @@ export function ProjectPage() {
           <p className="text-xs text-slate-400">Creates an in-memory draft. Nothing is written until you Save, which commits a <span className="font-mono">workflow.yaml</span> + node <span className="font-mono">.js</span> files to the repo.</p>
           <label className="block">
             <div className="mb-1 text-xs font-medium text-slate-300">Name</div>
-            <input className="inp" defaultValue="Refund Processor" />
+            <input className="inp font-mono" placeholder="e.g. acuity-webhook" data-testid="np-wf-name" value={npWfName} onChange={(e) => setNpWfName(e.target.value)} autoFocus />
+            <p className="mt-1 text-[11px] text-slate-500">Becomes the folder <span className="font-mono">workflows/{npWfName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "<name>"}/</span> — lowercase letters, digits, hyphens.</p>
           </label>
           <label className="block">
             <div className="mb-1 text-xs font-medium text-slate-300">First trigger</div>
-            <select className="inp">
-              <option>manual</option>
-              <option>cron</option>
-              <option>webhook</option>
-              <option>event</option>
+            <select className="inp" data-testid="np-wf-trigger" value={npWfTrigger} onChange={(e) => setNpWfTrigger(e.target.value as typeof npWfTrigger)}>
+              <option value="manual">manual</option>
+              <option value="cron">cron</option>
+              <option value="webhook">webhook</option>
+              <option value="event">event</option>
             </select>
           </label>
         </div>
