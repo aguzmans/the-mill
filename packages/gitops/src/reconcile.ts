@@ -76,6 +76,12 @@ export async function reconcile(state: RepoState, opts: { apply?: boolean } = {}
   const apply = opts.apply !== false; // default: auto-apply
   try {
     await Git.fetch(state.dir);
+    // A brand-new empty remote (no commits yet) has no `origin/<branch>`. That's not an error —
+    // it's an empty workspace waiting for its first project. Report it cleanly (no scary banner)
+    // so the UI shows its "No projects yet" state instead of a Degraded reconcile failure.
+    if (!(await Git.remoteBranchExists(state.dir, state.branch))) {
+      return { targetRevision: "", syncedRevision: "", sync: "Synced", health: "Healthy", projects: [] };
+    }
     const target = await Git.revParse(state.dir, `origin/${state.branch}`);
 
     const candidate = `${state.dir}.candidate`;

@@ -51,8 +51,24 @@ export const Git = {
   checkoutDetach: (dir: string, sha: string) => git(["checkout", "--quiet", "--force", "--detach", sha], dir),
   /** Restore one path in the working tree from a specific revision (per-project pinning). */
   checkoutPath: (dir: string, sha: string, path: string) => git(["checkout", sha, "--", path], dir),
+  /** Does `origin/<branch>` exist? False for a brand-new empty remote (no commits yet). */
+  remoteBranchExists: (dir: string, branch: string) =>
+    git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`], dir).then(() => true).catch(() => false),
   // ── write side (UI edits → commits, ARCHITECTURE §5) ──────────────────────
-  checkoutBranch: (dir: string, branch: string) => git(["checkout", "-q", "-f", "-B", branch, `origin/${branch}`], dir),
+  // Put the working copy on `branch` ready for a commit. Normally reset to the remote tip;
+  // but an EMPTY remote (first-ever project) has no `origin/<branch>` to branch from — there
+  // we just place HEAD on an unborn local branch so the first commit lands on it and the
+  // subsequent `git push` creates `origin/<branch>`.
+  checkoutBranch: async (dir: string, branch: string) => {
+    if (await Git.remoteBranchExists(dir, branch)) {
+      await git(["checkout", "-q", "-f", "-B", branch, `origin/${branch}`], dir);
+    } else {
+      // -B fails on an unborn HEAD (no commit to reset to); symbolic-ref is the safe fallback.
+      await git(["checkout", "-q", "-f", "-B", branch], dir).catch(() =>
+        git(["symbolic-ref", "HEAD", `refs/heads/${branch}`], dir),
+      );
+    }
+  },
   add: (dir: string) => git(["add", "-A"], dir),
   commit: (dir: string, message: string) => git(["-c", "user.email=mill@local", "-c", "user.name=Mill", "commit", "-q", "-m", message], dir),
   push: (dir: string, branch: string) => git(["push", "-q", "origin", branch], dir),

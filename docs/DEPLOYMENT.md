@@ -79,7 +79,25 @@ have no safe default.
 There are **three kinds** of secret; all come from k8s `Secret`s (or External Secrets /
 IRSA), never from git.
 
-**a) Git credential** — `GIT_TOKEN` on the controller.
+**a) Git credential** — `GIT_TOKEN` on the controller. It is held in memory and handed to
+`git` through a per-call credential helper that reads it from the process env, so the token
+is **never** put in the remote URL, argv, `.git/config`, or an error/log line. The token must
+be able to **read (and, for UI Save/Delete, write) `PROJECT_REPO`**:
+- **Fine-grained PAT / GitHub App**: `Contents: Read and write` on that specific repo.
+- **Classic PAT**: the `repo` scope.
+- **SAML/SSO orgs**: after creating the token, **authorize it for the org** (Configure SSO),
+  or GitHub hides the repo and every clone returns `Repository not found`.
+
+**Verify the repo + token before you deploy** (swap in real values; the token stays in the
+env, never in argv):
+```bash
+GIT_TOKEN=<PAT> git \
+  -c credential.helper='!f(){ echo username=x-access-token; echo "password=$GIT_TOKEN"; }; f' \
+  ls-remote https://github.com/<org>/<repo>.git
+```
+Prints refs → good. `Repository not found` → wrong URL, or the token lacks access/SSO. A
+brand-new **empty** repo (no commits) is fine — the controller comes up with an empty
+workspace and the UI shows a "No projects yet" state until you push or create a project.
 
 **b) Ingress tokens** — `MILL_INGRESS_TOKEN` (global) and/or per-project tokens. A project
 declares `ingress: { tokenEnv: PAYMENTS_INGRESS_TOKEN }` in its `project.yaml`; you inject an
@@ -410,3 +428,31 @@ spec:
   ARCHITECTURE §9. `mill_queue_oldest_wait_seconds` (OBSERVABILITY.md) is your backlog alert.
 - **Health**: `GET /api/health` for probes. **Metrics**: `GET /api/metrics` (stays open even
   with `MILL_ADMIN_TOKEN`; add `bearer_token` to the scrape if you route it through auth).
+
+---
+
+## 6. Troubleshooting
+
+**`repo init failed … git clone … Repository not found`** — the controller cloned
+`PROJECT_REPO` but GitHub refused. This is **config, not a bug**; the clone URL in the log is
+intentionally scrubbed of the token. GitHub returns the same "not found" for a missing repo
+*and* a private repo the token can't see (it never leaks existence). Check, in order:
+1. **URL** — is `PROJECT_REPO` your real `https://github.com/<org>/<repo>.git`? (A common
+   miss is a leftover placeholder like `acme/mill-projects`.)
+2. **Token access** — does `GIT_TOKEN` have `Contents: Read`/`repo` on that repo?
+3. **SSO** — SAML org? Authorize the token for the org (§3a).
+
+Reproduce it in one line with the `ls-remote` check in §3a; fix the env; roll the controller.
+
+**Workspace shows a "No projects yet" empty state** — expected when the repo clones but has
+no `*/project.yaml` yet. Push a project folder (or click **New Project**) and it appears on
+the next reconcile. (The live UI shows **only** real controller data — it never renders the
+`/prototype` demo catalogue; see ROADMAP M4.)
+
+**UI shows demo "Billing/Growth" projects** — the pod is serving an **old image** built
+before the demo data was removed from the live bundle. Rebuild/republish and roll the
+deployment. Confirm the nav badge reads **Live** (not Prototype).
+
+**`… requires a git-backed workspace (PROJECT_REPO)`** on Save/Delete/New Project — the
+controller is running in **dir mode** (no `PROJECT_REPO` set), which is read-only from a
+mounted folder. Set `PROJECT_REPO` (+ PVC at `WORKDIR`) to enable git-backed writes.

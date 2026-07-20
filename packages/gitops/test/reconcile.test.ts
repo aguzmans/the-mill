@@ -2,7 +2,7 @@ import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, cpSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { openRepo, reconcile, type RepoState } from "../src";
+import { openRepo, reconcile, writePaths, type RepoState } from "../src";
 
 const BILLING = resolve(import.meta.dir, "../../../examples/billing");
 const BAD_WORKFLOW = `apiVersion: mill/v1
@@ -53,6 +53,34 @@ describe("openRepo", () => {
     const st = await openRepo(remote, dir, "main"); // git clone would fail here — init-in-place must work
     expect(st.syncedRevision).toMatch(/^[0-9a-f]{7,}$/);
     expect(existsSync(join(dir, "billing", "project.yaml"))).toBe(true);
+  });
+});
+
+describe("empty remote (brand-new repo, no commits)", () => {
+  test("reconcile reports a clean empty workspace; the first project can be created", async () => {
+    const emptyRemote = join(base, "empty-remote.git");
+    const emptyWork = join(base, "empty-work");
+    await git(["init", "-q", "--bare", "-b", "main", emptyRemote]);
+
+    // Clone the empty remote — openRepo must succeed with no synced revision.
+    const st = await openRepo(emptyRemote, emptyWork, "main");
+    expect(st.syncedRevision).toBe("");
+
+    // Reconcile an empty remote → Synced/Healthy, no projects, NO error banner.
+    const empty = await reconcile(st);
+    expect(empty.health).toBe("Healthy");
+    expect(empty.projects).toEqual([]);
+    expect(empty.error).toBeUndefined();
+
+    // First-ever project via the UI write path (this is what New Project does). Previously
+    // failed: `git checkout -f -B main origin/main` — origin/main doesn't exist yet.
+    await writePaths(st, [{ path: "payments/project.yaml", content: "apiVersion: mill/v1\nkind: Project\nmetadata: { name: payments }\n" }], "create payments");
+
+    // The push created origin/main; the next reconcile adopts it.
+    const after = await reconcile(st);
+    expect(after.sync).toBe("Synced");
+    expect(after.projects.find((p) => p.id === "payments")).toBeTruthy();
+    expect(after.syncedRevision).toBe(after.targetRevision);
   });
 });
 
