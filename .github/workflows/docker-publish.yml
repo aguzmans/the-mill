@@ -1,10 +1,10 @@
 name: Build & Publish image
 
 # Publishes the mill-backend image (API + worker + the served UI) to Docker Hub.
-# Runs on pushes to main (→ :latest) and on version tags (→ :1.2.3, :1.2), plus manual dispatch.
+# Fires ONLY when a version tag is pushed (v1.2.3 → :1.2.3, :1.2, :latest) — never on a
+# plain push to main. `workflow_dispatch` lets you also run it by hand from the Actions tab.
 on:
   push:
-    branches: [main]
     tags: ["v*.*.*"]
   workflow_dispatch:
 
@@ -42,13 +42,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # Change "mill-backend" if you want a different Docker Hub repository name.
+          # Docker Hub repository this image is published to.
           images: ${{ secrets.DOCKERHUB_USERNAME }}/the-mill
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=sha,format=short
 
       - name: Build & push
         uses: docker/build-push-action@v6
