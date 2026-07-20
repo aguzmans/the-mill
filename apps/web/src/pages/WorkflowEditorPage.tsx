@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { findWorkflow, NODE_KINDS, compileCondition, type NodeStatus, type NodeKind, type WorkflowNode, type WorkflowEdge, type RunRecord, type Workflow, type IfClause } from "../lib/mock";
 import { nodeTypes, KindIcon, kindAccent } from "../graph/MillNode";
-import { resolvePosition } from "../graph/layout";
+import { resolvePosition, deoverlap } from "../graph/layout";
 import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
 import { JsEditor } from "../components/JsEditor";
 import { InfoTip, Tip } from "../components/InfoTip";
@@ -31,9 +31,16 @@ function autoLayout(edges: { from: string; to: string }[], order: string[]): Rec
   const byDepth: Record<number, string[]> = {};
   for (const key of order) (byDepth[depth[key] ?? 0] ??= []).push(key);
   const pos: Record<string, { x: number; y: number }> = {};
+  // Column pitch (COL) must exceed the node's rendered width so sequential steps never touch;
+  // ROW likewise exceeds node height. Nodes stacked in one column are centred against the
+  // tallest column so branches read as a balanced tree instead of top-aligned overlaps.
+  const COL = 300, ROW = 120;
+  const maxRows = Math.max(...Object.values(byDepth).map((n) => n.length));
   for (const key of order) {
     const d = depth[key] ?? 0;
-    pos[key] = { x: d * 210 + 20, y: byDepth[d].indexOf(key) * 96 + 20 };
+    const col = byDepth[d];
+    const rowOffset = (maxRows - col.length) / 2; // centre this column's rows vertically
+    pos[key] = { x: d * COL + 20, y: (col.indexOf(key) + rowOffset) * ROW + 20 };
   }
   return pos;
 }
@@ -47,6 +54,7 @@ function liveToWorkflow(name: string, g: LiveGraph): Workflow {
     sync: "Synced", health: "Healthy", lastRun: "idle",
     triggers: triggers as Workflow["triggers"], nodes, edges: g.edges as WorkflowEdge[], runs: [],
     exclusive: g.exclusive ?? false,
+    inputSchema: g.inputSchema ?? "",
   };
 }
 
@@ -146,20 +154,23 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
     })),
   );
   const [exclusive, setExclusive] = useState<boolean>(workflow.exclusive ?? false);
+  const [inputSchema, setInputSchema] = useState<string>(workflow.inputSchema ?? "");
   const dropCounter = useRef(0);
   const { toast, flash } = useToast();
   const logRef = useRef<HTMLDivElement>(null);
 
-  const initialNodes = useMemo<Node[]>(
-    () =>
-      (workflow?.nodes ?? []).map((n) => ({
-        id: n.key,
-        type: "mill",
-        position: n.position,
-        data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, inputSchema: n.inputSchema, outputSchema: n.outputSchema, status: "idle" as NodeStatus },
-      })),
-    [workflow],
-  );
+  const initialNodes = useMemo<Node[]>(() => {
+    const src = workflow?.nodes ?? [];
+    // Guarantee steps are separated: never render one node on top of another, whatever the
+    // positions came from (hand-authored fixtures, auto-layout, or the workflow file).
+    const spread = deoverlap(src.map((n) => ({ id: n.key, position: n.position, kind: n.kind })));
+    return src.map((n) => ({
+      id: n.key,
+      type: "mill",
+      position: spread[n.key] ?? n.position,
+      data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, inputSchema: n.inputSchema, outputSchema: n.outputSchema, status: "idle" as NodeStatus },
+    }));
+  }, [workflow]);
   const initialEdges = useMemo<Edge[]>(
     () =>
       (workflow?.edges ?? []).map((e) => ({
@@ -333,6 +344,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       apiVersion: "mill/v1", kind: "Workflow", metadata: { name: workflow.id },
       triggers: trig.length ? trig : [{ type: "manual" }], nodes: defNodes, edges: defEdges,
       ...(exclusive ? { exclusive: true } : {}),
+      ...(inputSchema.trim() ? { inputSchema: inputSchema.trim() } : {}),
     };
     const files: Record<string, string> = {};
     for (const rn of nodes) {
@@ -341,7 +353,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       if (file && (d.kind === "jscode" || d.kind === "loop")) files[file] = (d.code as string) ?? DEFAULT_JS;
     }
     return { def, files };
-  }, [nodes, edges, workflow, triggers, exclusive]);
+  }, [nodes, edges, workflow, triggers, exclusive, inputSchema]);
 
   const doSave = useCallback(async () => {
     if (!LIVE) { setShowCommit(false); flash(`Committed to ${project.branch} · reconcile queued`); return; }
@@ -594,7 +606,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
 
       {/* triggers + observability */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <TriggersPanel triggers={triggers} setTriggers={setTriggers} exclusive={exclusive} setExclusive={setExclusive} workflow={workflow.id} projectId={project.id} onCopy={(url) => { navigator.clipboard?.writeText(url).catch(() => {}); flash("Webhook URL copied"); }} />
+        <TriggersPanel triggers={triggers} setTriggers={setTriggers} exclusive={exclusive} setExclusive={setExclusive} inputSchema={inputSchema} setInputSchema={setInputSchema} workflow={workflow.id} projectId={project.id} onCopy={(url) => { navigator.clipboard?.writeText(url).catch(() => {}); flash("Webhook URL copied"); }} />
         <ObservabilityPanel onOpen={(dest) => flash(`Opening ${dest} …`)} />
       </div>
 
@@ -1234,7 +1246,7 @@ function TriggerIcon({ type }: { type: string }) {
   return type === "cron" ? <Clock className="h-3.5 w-3.5" /> : type === "webhook" ? <Webhook className="h-3.5 w-3.5" /> : type === "event" ? <Zap className="h-3.5 w-3.5" /> : <Hand className="h-3.5 w-3.5" />;
 }
 
-function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, workflow, projectId, onCopy }: { triggers: EditTrigger[]; setTriggers: (t: EditTrigger[]) => void; exclusive: boolean; setExclusive: (v: boolean) => void; workflow: string; projectId: string; onCopy: (url: string) => void }) {
+function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, inputSchema, setInputSchema, workflow, projectId, onCopy }: { triggers: EditTrigger[]; setTriggers: (t: EditTrigger[]) => void; exclusive: boolean; setExclusive: (v: boolean) => void; inputSchema: string; setInputSchema: (v: string) => void; workflow: string; projectId: string; onCopy: (url: string) => void }) {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const hookUrl = `${origin}/p/w/${workflow}/${projectId}`; // tokenized ingress URL (bearer required)
   const update = (i: number, patch: Partial<EditTrigger>) => setTriggers(triggers.map((t, j) => (j === i ? { ...t, ...patch } : t)));
@@ -1286,6 +1298,20 @@ function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, workflo
           <span className="block text-[11px] text-slate-500">Dedicate a whole worker pod to each run (no co-tenant jobs).</span>
         </span>
       </label>
+      <div className="mt-3 border-t border-white/5 pt-3" data-testid="input-schema-field">
+        <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-slate-200">
+          Run input schema
+          <InfoTip text="A JS boolean expression over `input`, validated against the whole run payload BEFORE the first node runs — rejects malformed webhook/manual/cron inputs at the boundary. Leave blank to accept any input. e.g. typeof input.email === 'string' && Array.isArray(input.items)" />
+        </div>
+        <input
+          className="inp !py-1 w-full font-mono text-[11px]"
+          data-testid="input-schema-input"
+          placeholder="(optional) e.g. typeof input.id === 'number'"
+          value={inputSchema}
+          onChange={(e) => setInputSchema(e.target.value)}
+          spellCheck={false}
+        />
+      </div>
     </div>
   );
 }

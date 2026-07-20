@@ -90,6 +90,7 @@ export interface LiveGraph {
   order: string[];
   triggers: any[];
   exclusive?: boolean;
+  inputSchema?: string;
 }
 export async function getWorkflowGraph(projectId: string, wf: string): Promise<LiveGraph> {
   const r = await fetch(`${BASE}/projects/${projectId}/workflows/${wf}`);

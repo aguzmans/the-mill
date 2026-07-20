@@ -23,6 +23,29 @@ function trackConsole(page: Page): string[] {
   return errs;
 }
 
+test.describe("nodes are never rendered on top of each other", () => {
+  for (const [pid, wf] of WORKFLOWS) {
+    test(`${pid}/${wf}`, async ({ page }) => {
+      await page.goto(`${BASE}/projects/${pid}/workflows/${wf}`);
+      await expect(page.getByTestId("workflow-editor")).toBeVisible();
+      await page.waitForTimeout(500);
+      const boxes = await page.evaluate(() =>
+        Array.from(document.querySelectorAll(".react-flow__node")).map((n) => {
+          const r = (n as HTMLElement).getBoundingClientRect();
+          return { id: (n as HTMLElement).getAttribute("data-id"), x: r.x, y: r.y, w: r.width, h: r.height };
+        }),
+      );
+      const overlaps: string[] = [];
+      for (let i = 0; i < boxes.length; i++)
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i], b = boxes[j];
+          if (a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y) overlaps.push(`${a.id}<->${b.id}`);
+        }
+      expect(overlaps, `overlapping nodes: ${overlaps.join(", ")}`).toEqual([]);
+    });
+  }
+});
+
 test.describe("engineer config-editing sweep (all workflows)", () => {
   for (const [pid, wf] of WORKFLOWS) {
     test(`${pid}/${wf}: edit triggers, exclusivity, nodes without errors`, async ({ page }) => {

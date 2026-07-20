@@ -458,6 +458,7 @@ api.get("/metrics", async (c) => {
   counterFamily("mill_ingress_total", "Ingress requests by outcome", "ingress_total:", "outcome", (k) => k.slice("ingress_total:".length));
   counterFamily("mill_concurrency_skipped_total", "Cron runs skipped by concurrencyPolicy", "concurrency_skipped:", "policy", (k) => k.slice("concurrency_skipped:".length));
   counterFamily("mill_concurrency_replaced_total", "Queued runs superseded by Replace policy", "concurrency_replaced:", "policy", (k) => k.slice("concurrency_replaced:".length));
+  counterFamily("mill_dispatch_skipped_total", "Triggers skipped because the workflow won't compile", "dispatch_skipped:", "reason", (k) => k.slice("dispatch_skipped:".length));
   if (counters["retries_total"]) { help("mill_retries_total", "Run-level retries", "counter"); lines.push(`mill_retries_total ${num(counters["retries_total"])}`); }
   if (counters["ingress_auth_failures_total"]) { help("mill_ingress_auth_failures_total", "Ingress bearer auth failures", "counter"); lines.push(`mill_ingress_auth_failures_total ${num(counters["ingress_auth_failures_total"])}`); }
 
@@ -755,6 +756,10 @@ app.get("/console", (c) => c.html(consoleHtml));
 const WEB_LIVE = resolve(import.meta.dir, "../../../web-live");
 const WEB_PROTO = resolve(import.meta.dir, "../../../web-prototype");
 const liveIndex = existsSync(join(WEB_LIVE, "index.html")) ? readFileSync(join(WEB_LIVE, "index.html"), "utf8") : null;
+
+// In-app developer guide (self-contained HTML, bundled from apps/web/public). Served at /help.
+const helpHtml = existsSync(join(WEB_LIVE, "developer-guide.html")) ? readFileSync(join(WEB_LIVE, "developer-guide.html"), "utf8") : null;
+app.get("/help", (c) => (helpHtml ? c.html(helpHtml) : c.json({ error: "developer guide not built" }, 404)));
 const protoIndex = existsSync(join(WEB_PROTO, "index.html")) ? readFileSync(join(WEB_PROTO, "index.html"), "utf8") : null;
 
 if (protoIndex) {

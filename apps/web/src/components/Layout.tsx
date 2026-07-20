@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Boxes, Cpu, Workflow as WorkflowIcon, GitBranch, Network } from "lucide-react";
+import { Boxes, Cpu, Workflow as WorkflowIcon, GitBranch, Network, HelpCircle } from "lucide-react";
 import { InfoTip } from "./InfoTip";
 import { workspace } from "../lib/mock";
 
@@ -48,6 +48,16 @@ export function Layout() {
             <NavItem to="/workspace" icon={<Boxes className="h-4 w-4" />} label="Workspace" tip="Browse the projects (git repos) in this workspace." />
             <NavItem to="/fleet" icon={<Cpu className="h-4 w-4" />} label="Fleet" tip="Live worker fleet, queue depth, and autoscaling signals." />
             <NavItem to="/architecture" icon={<Network className="h-4 w-4" />} label="Architecture" tip="In-app design reference: topology, no-DB rationale, k8s strategy, tech decisions." />
+            <a
+              href="/help"
+              target="_blank"
+              rel="noreferrer"
+              data-testid="nav-help"
+              className="group flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200"
+            >
+              <HelpCircle className="h-4 w-4" />
+              <span>Help</span>
+            </a>
             {import.meta.env.VITE_MILL_MODE === "live" ? (
               <span className="chip bg-emerald-500/15 text-emerald-300" data-testid="proto-badge">
                 Live

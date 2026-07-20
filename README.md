@@ -9,6 +9,7 @@ execute each node with pod-level isolation.
 | I want to… | Read |
 |---|---|
 | **Deploy Mill on EKS** (components, config, secrets, manifests, **autoscaling**) | **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** |
+| **Learn to build a workflow** (illustrated, for JS developers) | In the app: the **Help** link in the top nav (served at **`/help`**). Source: `apps/web/public/developer-guide.html`. |
 | Run the stack locally (docker-compose) + author & trigger workflows | [docs/RUNNING.md](docs/RUNNING.md) |
 | Monitor it (Prometheus metrics, alerts, dashboards) | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
 | Understand the design (controller, queue, executors, isolation) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |

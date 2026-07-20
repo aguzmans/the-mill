@@ -42,7 +42,8 @@ Legend: **Build** = we build core logic on it · **Direct** = used mostly as-is 
 ## Isolation (worker image)
 | Component | Role in Mill | License | Usage |
 |---|---|---|---|
-| **nsjail** | Phase-1 sandbox (userns + seccomp + cgroups), **ON by default** | Apache-2.0 — **Invoke** (wraps the Bun subprocess) | Invoke |
+| **Container executor (Docker/OCI)** | **Implemented** local isolation: one hardened `--rm` container per job. On EKS the boundary is the **hardened worker pod itself** (in-process execution) | — (built-in) | Built |
+| **nsjail** *(roadmap)* | Phase-1 in-pod sandbox (userns + seccomp + cgroups) — a drop-in under the same Executor seam where available | Apache-2.0 — **Invoke** | Invoke |
 | **gVisor (runsc)** *(later)* | Phase-2 semi-trusted isolation | Apache-2.0 | Reuse |
 | **Firecracker / firecracker-containerd** *(later)* | Phase-3 untrusted microVM | Apache-2.0 | Reuse |
 | **Kata Containers** *(optional)* | VM isolation as a k8s RuntimeClass | Apache-2.0 | Reuse |
@@ -53,7 +54,8 @@ Legend: **Build** = we build core logic on it · **Direct** = used mostly as-is 
 | **Kubernetes / EKS** | Runs all containers; **Deployments** for API/UI/workers | Apache-2.0 | Reuse |
 | **Ingress controller** (AWS LB Controller / nginx) | UI routing + **webhook ingestion** + TLS | Apache-2.0 | Reuse |
 | **cert-manager** *(optional)* | TLS certs for Ingress | Apache-2.0 | Reuse |
-| **HPA + Cluster Autoscaler** | **Sole** worker autoscaler: memory/CPU-based pod scaling + node scaling (no KEDA) | Apache-2.0 | Reuse |
+| **HPA + Cluster Autoscaler** | Worker autoscaler: memory/CPU-based pod scaling + node scaling | Apache-2.0 | Reuse |
+| **KEDA** *(recommended)* | Scale workers on **queue depth** (`mill_queue_depth` / Redis list) — the right signal for a pull queue; see DEPLOYMENT.md | Apache-2.0 | Reuse |
 | **External Secrets Operator** *(optional)* | Sync secrets into the cluster | Apache-2.0 | Reuse |
 | **Grafana + Alloy + Loki + Prometheus + Tempo** | All logs/metrics/traces/history (your existing stack) | AGPL-3.0/Apache-2.0 — **Reuse** as separate services | Reuse |
 | **Git provider** (GitHub/GitLab/…) | Hosts project repos (desired state) | external | Reuse |

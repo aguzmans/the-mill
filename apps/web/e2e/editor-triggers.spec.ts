@@ -43,6 +43,16 @@ test.describe("editor — triggers, exclusivity, layout", () => {
     await expect(rows(page)).toHaveCount(3);
   });
 
+  test("run input schema field is present and editable", async ({ page }) => {
+    await page.goto("/projects/billing/workflows/invoices");
+    const field = page.getByTestId("input-schema-field");
+    await expect(field).toBeVisible();
+    await expect(field).toContainText("Run input schema");
+    const input = page.getByTestId("input-schema-input");
+    await input.fill("typeof input.since === 'string'");
+    await expect(input).toHaveValue("typeof input.since === 'string'");
+  });
+
   test("exclusive-execution toggle is present and interactive", async ({ page }) => {
     await page.goto("/projects/billing/workflows/invoices");
     const toggle = page.getByTestId("exclusive-toggle");

@@ -41,6 +41,7 @@ have no safe default.
 | `RECONCILE_INTERVAL_MS` | | `15000` | | Reconcile loop period. |
 | `MILL_AUTOSYNC` | | `true` | | `false` → validate but **hold** new revisions (manual Sync applies). |
 | `MILL_INGRESS_TOKEN` | | — | 🔒 | Global bearer for `/p` webhook endpoints (or use per-project tokens). |
+| `MILL_GIT_WEBHOOK_SECRET` | | — | 🔒 | HMAC secret for the `POST /git/webhook` push hook. When set, the controller verifies `X-Hub-Signature-256` and reconciles instantly on push (instead of waiting for the poll). Set the same secret in the GitHub webhook. |
 | `MILL_ADMIN_TOKEN` | | — | 🔒 | If set, all `/api/*` require this bearer (except `/api/health`, `/api/metrics`). Defense-in-depth; also locks the UI — usually leave unset and auth at the Ingress. |
 | `MILL_CORS_ORIGINS` | | — | | Comma-separated allowlist for cross-origin browsers (default: same-origin only). |
 | `MILL_STD_REGISTRY` | | — | | Base URL for `std://…@ver` remote callScript bundles. |

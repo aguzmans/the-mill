@@ -131,6 +131,7 @@ export interface Workflow {
   edges: WorkflowEdge[];
   concurrencyPolicy?: ConcurrencyPolicy;
   exclusive?: boolean; // run alone on a worker/pod until done
+  inputSchema?: string; // JS predicate validating the run input at the start
   activeRevision?: string; // the reconciled version actually dispatching
   runs?: RunRecord[];
 }

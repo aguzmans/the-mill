@@ -90,7 +90,7 @@ cluster's own concern** (its Cluster Autoscaler), so Mill only owns its Deployme
                                                     │  │ Executor │ │
                                                     │  └──────────┘ │
                                                     └───────────────┘
-                          scaled by HPA on memory/CPU (no KEDA) · Cluster Autoscaler for nodes
+                          scaled by HPA (memory/CPU) or KEDA (queue depth) · Cluster Autoscaler for nodes
 ```
 
 ---
@@ -191,14 +191,17 @@ from live load:
   schedule→start wait (`GET /api/fleet`). No metrics backend is required for the local
   stack; Prometheus is the production swap behind the same shape.
 
-**Fleet scaling: HPA on memory/CPU (no KEDA).** The number of worker pods is scaled by
-the Kubernetes **HPA on memory** (and/or CPU) plus the **Cluster Autoscaler** for nodes. We do **not**
-use KEDA. Consequence — the scaling signal is **resource pressure, not queue depth**:
-when workers fill and pause (above), fleet memory stays high and HPA adds pods; as load
-drains, HPA removes them. Trade-off we accept: no native queue-depth trigger and no
-scale-to-zero (HPA holds `minReplicas ≥ 1`). This pairs cleanly with dynamic per-worker
-concurrency — self-limiting workers surface real memory pressure, which is exactly what
-HPA scales on.
+**Fleet scaling: HPA on memory/CPU, or KEDA on queue depth.** The number of worker pods is scaled by
+the Kubernetes **HPA on memory/CPU**, or — recommended for a pull queue — by **KEDA on `mill_queue_depth`**
+(the Redis queue length), plus the **Cluster Autoscaler** for nodes. Queue depth leads the backlog where
+resource metrics lag; see DEPLOYMENT.md § Autoscale on queue depth.
+
+Two valid signals: **resource pressure** (HPA on memory/CPU — self-limiting workers surface real
+memory pressure when they fill and pause, so HPA adds pods) and **queue depth** (KEDA on
+`mill_queue_depth`/`mill_queue_oldest_wait_seconds` — reacts before a backlog builds, and can
+scale to zero). Either works; KEDA on queue depth is recommended for bursty/latency-sensitive
+fleets. Both pair cleanly with the dynamic per-worker `min`/`max` concurrency band (§3.5), which
+absorbs job-weight variance regardless of which trigger scales the pod count.
 
 ### 3.6 Observability — your existing Grafana stack (no Mill storage)
 - **Logs** → structured JSON to stdout (pino) → **Alloy** → **Loki**, labeled
@@ -427,7 +430,7 @@ designed away. So:
 |---|---|---|
 | API · UI · **worker pool** | **Deployments** | Long-running — what Deployments are for |
 | UI routing · **webhook ingestion** · TLS · **SSO** | **Ingress** (+ cert-manager); **SSO terminated here** | Reuse; don't build our own auth. Flat access in v1 |
-| Worker autoscaling | **HPA on memory/CPU** (Mill-owned) + the cluster's **Cluster Autoscaler** for nodes (not Mill's). **No KEDA** — scale on *resource pressure*, not queue depth. Per-worker **dynamic `min`/`max` concurrency** (§3.5) absorbs job-weight variance. | Fewer moving parts; memory is the honest signal |
+| Worker autoscaling | **HPA on memory/CPU** or **KEDA on queue depth** (`mill_queue_depth`) — Mill-owned; + the cluster's **Cluster Autoscaler** for nodes. Per-worker **dynamic `min`/`max` concurrency** (§3.5) absorbs job-weight variance. | Queue depth leads the backlog; resource pressure is the simpler fallback |
 | Secrets · quotas · NetworkPolicy | **Native K8s** (program + GitHub-cred Secrets). **Flat access in v1 — no RBAC yet** | Reuse |
 | **Scheduling (cron)** | **App-level** (BullMQ repeatable jobs) by default; native **CronJob** backend selectable behind the trigger interface | Fine-grained, no API-server pressure, works in local dev + export |
 | **Per-node execution** | **Warm worker pool** (nsjail'd subprocess) | ms not seconds; in-process data-passing + live logs |
@@ -494,10 +497,10 @@ Concrete ideas adopted from the landscape survey (`LANDSCAPE.md`), with the sour
 | History / telemetry| **Loki / Prometheus / Tempo via Alloy** | "Everything historical is logged"; nothing stored in Mill |
 | Exports            | **Tar the repo + generated entry**, streamed | Repo files *are* the export; no object store |
 | Frontend           | React + Vite + **@xyflow/react** + Monaco + TanStack Query + Tailwind/shadcn | Strong graph + code editing; renders from git |
-| Isolation (now)    | **Bun subprocess + nsjail** (userns/seccomp/cgroups), **ON by default** | OS-level (in-process isolates impossible on Bun); matches Windmill's hardened mode |
+| Isolation (now)    | **In-process inside a hardened worker pod** (the pod IS the boundary: non-root, read-only rootfs, cap-drop, seccomp, limits); **DockerExecutor** = one `--rm` container per job for local isolation | OS-level (in-process isolates impossible on Bun); pod hardening matches Windmill's hardened mode; nsjail is a drop-in under the same seam |
 | Isolation (later)  | **gVisor → Firecracker** (firecracker-containerd) | Swap behind `Executor`; skip pod-per-job (seconds of cold start) |
 | Future Go carve-out| **git reconciler**, behind a queue seam | *Only if* Mill goes deep on k8s CRDs — where go-git + controller-runtime + client-go genuinely beat TS |
-| Autoscaling        | **HPA on memory/CPU + Cluster Autoscaler** (no KEDA) | Scales on worker resource pressure; per-worker dynamic `min`/`max` concurrency (§3.5) handles job-weight variance |
+| Autoscaling        | **HPA on memory/CPU** or **KEDA on queue depth** + Cluster Autoscaler | Queue depth or resource pressure; per-worker dynamic `min`/`max` concurrency (§3.5) handles job-weight variance |
 
 ---
 

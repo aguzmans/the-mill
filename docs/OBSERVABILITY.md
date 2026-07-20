@@ -34,6 +34,9 @@ worker registry from Redis), so you scrape the controller, not each worker.
 | `mill_reconcile_total` | `result` (applied\|held\|degraded\|nochange) | GitOps reconcile passes by outcome. |
 | `mill_ingress_total` | `outcome` (ok\|unauthorized\|disabled) | Tokenized-ingress (`/p`) requests. |
 | `mill_ingress_auth_failures_total` | — | Bearer auth failures — **security signal**. |
+| `mill_concurrency_skipped_total` | `policy` (Forbid\|Replace) | Cron runs skipped because one was already in progress. |
+| `mill_concurrency_replaced_total` | `policy` (Replace) | Queued runs superseded so the newest wins. |
+| `mill_dispatch_skipped_total` | `reason` (compile_error) | Triggers dropped because the workflow won't compile — **a broken workflow shipped; alert on this**. |
 
 ### Histograms — real quantiles via `histogram_quantile()`
 | Metric | Meaning |
@@ -84,6 +87,13 @@ groups:
     for: 2m
     labels: { severity: critical }
     annotations: { summary: "No Mill workers heartbeating" }
+
+  # A broken workflow shipped — triggers are being dropped because it won't compile
+  - alert: MillBrokenWorkflow
+    expr: increase(mill_dispatch_skipped_total[15m]) > 0
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "A workflow won't compile — its triggers are being dropped (check reconcile health)" }
 
   # Reconcile loop stalled (no pass in 5m; interval is ~15s)
   - alert: MillReconcileStalled
