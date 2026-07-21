@@ -138,6 +138,61 @@ bearer**. The default `/p/w/<workflow>/<project>` path still requires the bearer
 path is `404`. Treat the path like a password (rotate by editing the trigger). The editor's
 webhook trigger has a "custom path" field for this.
 
+**e) Admin API token (`MILL_ADMIN_TOKEN`)** — locks the controller's `/api/*` behind a bearer
+(everything except `/api/health` and `/api/metrics`, which stay open for probes/scrape). Set it
+when the API is reachable by anything you don't fully trust — **without it, any caller that can
+reach the Service can read/write the runtime secret store and mutate projects.** ⚠️ It also
+locks the **browser UI** (the SPA calls `/api/*` with no bearer), so either drive the API
+headless (CLI/webhooks) or terminate human auth (SSO / oauth2-proxy) at the Ingress and keep
+this as defense-in-depth. Ingress webhook routes (`/p/*`) are unaffected — they authenticate by
+the capability path (d) or ingress token (b).
+
+Feed it like the other 🔒 controller secrets. **With External Secrets Operator + AWS Parameter
+Store** (the idiomatic path):
+
+```bash
+# 1) Store the value (SecureString — ESO decrypts it). Rotate by overwriting + rolling the pod.
+aws ssm put-parameter --region <region> \
+  --name /mill/<env>/mill-controller/admin-token \
+  --type SecureString --value "$(openssl rand -hex 24)" --overwrite
+```
+```yaml
+# 2) Add one entry to the ExternalSecret that builds the controller's Secret (alongside
+#    git-token / ingress-token). Do NOT create a second target Secret — reuse this one.
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata: { name: mill-controller-secrets, namespace: <ns> }
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { name: aws-parameterstore, kind: ClusterSecretStore }  # your store
+  target: { name: mill-controller-secrets, creationPolicy: Owner }
+  data:
+    # …existing git-token / ingress-token / git-webhook-secret entries…
+    - secretKey: admin-token
+      remoteRef: { key: /mill/<env>/mill-controller/admin-token }
+```
+```yaml
+# 3) Reference it from the controller container env (same style as the other keys):
+          env:
+            - name: MILL_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: { name: mill-controller-secrets, key: admin-token }
+```
+
+**Ordering:** `secretKeyRef` is required by default, so the key must exist in the k8s Secret
+*before* the Deployment rolls, or the new pod is stuck in `CreateContainerConfigError`. Under
+Argo CD, put the ExternalSecret in an earlier sync-wave than the Deployment
+(`argocd.argoproj.io/sync-wave: "0"` vs `"1"`); otherwise apply the ExternalSecret and confirm
+the key landed (`kubectl -n <ns> get secret mill-controller-secrets -o jsonpath='{.data.admin-token}'`)
+before rolling. The worker does **not** need this — it talks to Redis, not the HTTP API.
+
+**Verify** after rollout:
+```bash
+curl -so /dev/null -w '%{http_code}\n' https://<host>/api/projects                       # 401
+curl -so /dev/null -w '%{http_code}\n' -H "Authorization: Bearer <token>" .../api/projects # 200
+curl -so /dev/null -w '%{http_code}\n' https://<host>/api/health                          # 200 (probes OK)
+```
+
 ---
 
 ## 4. Manifests (template these into the Helm chart)
@@ -166,7 +221,8 @@ type: Opaque
 stringData:
   GIT_TOKEN: "REPLACE"
   MILL_INGRESS_TOKEN: "REPLACE"        # global webhook bearer
-  # MILL_ADMIN_TOKEN: "REPLACE"        # optional; also locks the UI
+  # MILL_ADMIN_TOKEN: "REPLACE"        # optional; locks /api/* AND the UI — see §3(e) for the
+                                       # External Secrets + Parameter Store recipe (preferred)
   # PAYMENTS_INGRESS_TOKEN: "REPLACE"  # per-project token(s) referenced by ingress.tokenEnv
 ---
 apiVersion: v1
