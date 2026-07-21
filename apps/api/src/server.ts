@@ -475,6 +475,13 @@ api.get("/metrics", async (c) => {
 
   // ── gauges (current state) ──
   g("mill_workers", "Workers currently registered", workers.length);
+  // One series per heartbeating pod, so you can see EXACTLY which workers are registered — a
+  // Deployment with N replicas should show N series here. Fewer ⇒ pods not registering (e.g.
+  // colliding worker ids, or a pod that can't reach Redis). host is the pod name.
+  if (workers.length) {
+    help("mill_worker_info", "Registered worker (1 per heartbeating pod)", "gauge");
+    for (const w of workers) lines.push(`mill_worker_info{worker_id="${w.id}",host="${w.host}",executor="${w.executor ?? "in-process"}"} 1`);
+  }
   g("mill_workers_inflight", "Jobs executing across the fleet", inFlight);
   g("mill_worker_capacity", "Total concurrent job slots across the fleet (Σ concMax)", capacity);
   g("mill_worker_saturation_ratio", "Fleet busy fraction: inflight / capacity (0..1)", capacity > 0 ? inFlight / capacity : 0);
@@ -493,6 +500,8 @@ api.get("/metrics", async (c) => {
     for (const [k, v] of rows) lines.push(`${metric}{${label}="${keyToLabel(k)}"} ${num(v)}`);
   };
   counterFamily("mill_jobs_total", "Jobs finished by status", "jobs_total:", "status", (k) => k.slice("jobs_total:".length));
+  // Failures bucketed by cause — e.g. reason="workflow_not_found" ⇒ workers can't see /app/workdir.
+  counterFamily("mill_jobs_failed_total", "Failed jobs by reason", "jobs_failed_reason:", "reason", (k) => k.slice("jobs_failed_reason:".length));
   // jobs_wf:<workflow>:<status> → two labels (workflow, status) for flexible querying.
   const wfRows = byPrefix("jobs_wf:");
   if (wfRows.length) {

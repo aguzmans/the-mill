@@ -14,7 +14,11 @@ const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
 const q = new MillQueue(redis);
 const secretStore = new SecretStore(redis); // UI-managed secrets, merged per job (below)
 
-const workerId = "w-" + ((process.env.MILL_WORKER_ID ?? process.env.HOSTNAME ?? crypto.randomUUID()).slice(0, 6));
+// Worker id MUST be unique per pod — the registry (and each worker's processing list + the
+// crash reaper) key on it. k8s pod names end in a per-pod random suffix, so take the LAST
+// dash-segment; slicing the FRONT collapsed every `mill-worker-*` pod to the same id.
+const rawWorkerId = process.env.MILL_WORKER_ID ?? process.env.HOSTNAME ?? crypto.randomUUID();
+const workerId = "w-" + (rawWorkerId.split("-").pop() || rawWorkerId).slice(0, 8);
 const host = os.hostname();
 const concMin = Number(process.env.MILL_CONC_MIN ?? 1);
 const concMax = Number(process.env.MILL_CONC_MAX ?? process.env.MILL_CONCURRENCY ?? 8);

@@ -54,6 +54,20 @@ export interface QueueEvent {
   type: string;
 }
 
+/** Bucket a job's error into a small, low-cardinality reason for the `mill_jobs_failed_total`
+ * metric. `workflow_not_found` almost always means the worker can't see the reconciled
+ * /app/workdir (missing shared volume mount), not a bad workflow. */
+export function classifyFailure(error?: string): string {
+  const e = (error ?? "").toLowerCase();
+  if (!e) return "unknown";
+  if (e.includes("file not found") || e.includes("workflow.yaml") || e.includes("no such file")) return "workflow_not_found";
+  if (e.includes("won't compile") || e.includes("compile") || e.includes("syntaxerror") || e.includes("buildmessage")) return "compile_error";
+  if (e.includes("schema")) return "schema_validation";
+  if (e.includes("timeout") || e.includes("timed out")) return "timeout";
+  if (e.includes("econnrefused") || e.includes("enotfound") || e.includes("fetch") || e.includes("network")) return "network";
+  return "node_error";
+}
+
 export class MillQueue {
   private blocking?: Redis; // dedicated connection for BRPOP (blocking)
 
@@ -227,6 +241,9 @@ export class MillQueue {
       // Monotonic counters + latency/wait histograms for Prometheus.
       await this.metricInc(`jobs_total:${status}`);
       await this.metricInc(`jobs_wf:${rec.w}:${status}`);
+      // Classify failures so a systemic cause (e.g. workers missing the /app/workdir mount →
+      // "workflow_not_found") is visible in metrics instead of a generic "failed".
+      if (status === "failed") await this.metricInc(`jobs_failed_reason:${classifyFailure(extra.error)}`);
       await this.observe("job_duration_seconds", rec.d / 1000);
       await this.observe("job_wait_seconds", rec.wait / 1000);
     }
