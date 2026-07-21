@@ -443,13 +443,16 @@ export function ProjectPage() {
 // ── Reconcile drawer body ─────────────────────────────────────────────────────
 function EndpointsCard({ endpoints, onCopy }: { endpoints: ProjectEndpoints; onCopy: (url: string) => void }) {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const abs = (p: string) => `${origin}${p}`;
+  // Prefer the configured PUBLIC webhook host — the UI is usually browsed via a different
+  // (internal/SSO) origin, and external providers must hit the public `/p` ingress.
+  const base = endpoints.publicBaseUrl || origin;
+  const abs = (p: string) => `${base}${p}`;
   const exposed = !!endpoints.projectPath; // ≥1 workflow opted in with a webhook trigger
   return (
     <div className="card p-4" data-testid="endpoints-card">
       <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
         <Webhook className="h-4 w-4 text-brand-400" /> Endpoints
-        <InfoTip text="A workflow is exposed over HTTP only when it declares a webhook trigger — nothing is reachable until you configure it. Send the bearer token in an Authorization header. Add ?wait=1 for a synchronous result; omit it for a webhook-style { jobId }." />
+        <InfoTip text="A workflow is exposed over HTTP only when it declares a webhook trigger. A trigger with a long unguessable path is a capability URL — public, NO bearer (for header-less providers like Acuity). The default /p/w/<wf>/<project> path needs Authorization: Bearer <token>. Add ?wait=1 for a synchronous result." />
       </h2>
       {!exposed ? (
         <div className="mt-2 rounded-lg border border-white/5 bg-ink-950/40 p-3 text-[11px] text-slate-400" data-testid="endpoints-none">
@@ -459,28 +462,31 @@ function EndpointsCard({ endpoints, onCopy }: { endpoints: ProjectEndpoints; onC
         </div>
       ) : (
         <>
-          <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-400">
-            {endpoints.authRequired
-              ? <span className="chip bg-emerald-500/10 text-emerald-300"><ShieldCheck className="h-3 w-3" /> Bearer token required</span>
-              : <span className="chip bg-amber-500/10 text-amber-300"><AlertTriangle className="h-3 w-3" /> ingress token not set — endpoints return 503 until MILL_INGRESS_TOKEN (or the project's ingress.tokenEnv) is set</span>}
-            <span className="font-mono text-slate-500">Authorization: Bearer &lt;token&gt;</span>
-          </div>
+          {!endpoints.publicBaseUrl && (
+            <div className="mt-1 text-[11px] text-amber-300/90" data-testid="endpoints-origin-warn">
+              Showing <span className="font-mono">{origin}</span> (this browser). Set <span className="font-mono">MILL_PUBLIC_WEBHOOK_URL</span> to the public <span className="font-mono">/p</span> ingress so external providers get the right host.
+            </div>
+          )}
           <div className="mt-3 space-y-1.5">
-            <EndpointRow label="project" url={abs(endpoints.projectPath!)} onCopy={onCopy} />
-            {endpoints.workflows.map((w) => (
-              <EndpointRow key={w.workflow} label={w.workflow} url={abs(w.path)} onCopy={onCopy} />
-            ))}
+            <EndpointRow label="project" url={abs(endpoints.projectPath!)} kind="bearer" onCopy={onCopy} />
+            {endpoints.workflows.map((w) => {
+              const cap = w.customPaths[0]; // a ≥24-char capability path = public, no bearer
+              return cap
+                ? <EndpointRow key={w.workflow} label={w.workflow} url={abs(cap)} kind="public" onCopy={onCopy} />
+                : <EndpointRow key={w.workflow} label={w.workflow} url={abs(w.path)} kind="bearer" onCopy={onCopy} />;
+            })}
           </div>
         </>
       )}
     </div>
   );
 }
-function EndpointRow({ label, url, onCopy }: { label: string; url: string; onCopy: (u: string) => void }) {
+function EndpointRow({ label, url, kind, onCopy }: { label: string; url: string; kind: "public" | "bearer"; onCopy: (u: string) => void }) {
   return (
     <div className="flex items-center justify-between gap-2 rounded-lg border border-white/5 bg-ink-950/40 px-2.5 py-1.5 text-[11px]" data-testid={`endpoint-${label}`}>
       <span className="flex min-w-0 items-center gap-2">
         <span className="w-20 shrink-0 truncate text-slate-400">{label}</span>
+        <span className={`chip shrink-0 ${kind === "public" ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/15 text-slate-400"}`} data-testid={`endpoint-kind-${label}`}>{kind === "public" ? "no token" : "bearer"}</span>
         <span className="truncate font-mono text-slate-300">{url}</span>
       </span>
       <button type="button" data-testid={`copy-endpoint-${label}`} onClick={() => onCopy(url)} className="chip shrink-0 bg-white/5 text-slate-400 hover:text-slate-200"><FileArchive className="h-3 w-3" /> copy</button>

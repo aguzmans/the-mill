@@ -16,7 +16,7 @@ import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
 import { JsEditor } from "../components/JsEditor";
 import { InfoTip, Tip } from "../components/InfoTip";
 import { Modal, DiffRow, Spec, useToast, Toast } from "../components/Kit";
-import { LIVE, triggerRun, streamEvents, getJob, getWorkflowGraph, saveWorkflow, testNode, getRuns, retryRun, getTimeline, getStatus, getFleet, type LiveGraph, type NodeTestResult, type LiveRun } from "../lib/api";
+import { LIVE, triggerRun, streamEvents, getJob, getWorkflowGraph, saveWorkflow, testNode, getRuns, retryRun, getTimeline, getStatus, getFleet, getEndpoints, type LiveGraph, type NodeTestResult, type LiveRun } from "../lib/api";
 
 const capW = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 type EditorProject = { id: string; name: string; branch: string; revision?: string; workflows?: Workflow[] };
@@ -174,6 +174,13 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
   const [selectedRun, setSelectedRun] = useState<string | null>(workflow?.runs?.[0]?.id ?? null);
   const [liveRuns, setLiveRuns] = useState<RunRecord[]>([]);
   const [rf, setRf] = useState<ReactFlowInstance | null>(null);
+  // Public webhook host (MILL_PUBLIC_WEBHOOK_URL) so the copied trigger URL points at the public
+  // /p ingress, not the internal/SSO host the editor is browsed from. null → fall back to origin.
+  const [publicBaseUrl, setPublicBaseUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!LIVE || !project?.id) return;
+    getEndpoints(project.id).then((e) => setPublicBaseUrl(e.publicBaseUrl ?? null)).catch(() => {});
+  }, [project?.id]);
   // Editable triggers (scheduling). Recover schedule/path from the loaded trigger detail.
   const [triggers, setTriggers] = useState<EditTrigger[]>(() =>
     (workflow.triggers ?? []).map((t) => ({
@@ -645,7 +652,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
 
       {/* triggers + observability */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <TriggersPanel triggers={triggers} setTriggers={setTriggers} exclusive={exclusive} setExclusive={setExclusive} inputSchema={inputSchema} setInputSchema={setInputSchema} workflow={workflow.id} projectId={project.id} onCopy={(url) => { navigator.clipboard?.writeText(url).catch(() => {}); flash("Webhook URL copied"); }} />
+        <TriggersPanel triggers={triggers} setTriggers={setTriggers} exclusive={exclusive} setExclusive={setExclusive} inputSchema={inputSchema} setInputSchema={setInputSchema} workflow={workflow.id} projectId={project.id} publicBaseUrl={publicBaseUrl} onCopy={(url) => { navigator.clipboard?.writeText(url).catch(() => {}); flash("Webhook URL copied"); }} />
         <ObservabilityPanel onOpen={(dest) => flash(`Opening ${dest} …`)} />
       </div>
 
@@ -1285,9 +1292,13 @@ function TriggerIcon({ type }: { type: string }) {
   return type === "cron" ? <Clock className="h-3.5 w-3.5" /> : type === "webhook" ? <Webhook className="h-3.5 w-3.5" /> : type === "event" ? <Zap className="h-3.5 w-3.5" /> : <Hand className="h-3.5 w-3.5" />;
 }
 
-function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, inputSchema, setInputSchema, workflow, projectId, onCopy }: { triggers: EditTrigger[]; setTriggers: (t: EditTrigger[]) => void; exclusive: boolean; setExclusive: (v: boolean) => void; inputSchema: string; setInputSchema: (v: string) => void; workflow: string; projectId: string; onCopy: (url: string) => void }) {
+function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, inputSchema, setInputSchema, workflow, projectId, publicBaseUrl, onCopy }: { triggers: EditTrigger[]; setTriggers: (t: EditTrigger[]) => void; exclusive: boolean; setExclusive: (v: boolean) => void; inputSchema: string; setInputSchema: (v: string) => void; workflow: string; projectId: string; publicBaseUrl?: string | null; onCopy: (url: string) => void }) {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const hookUrl = `${origin}/p/w/${workflow}/${projectId}`; // tokenized ingress URL (bearer required)
+  const base = publicBaseUrl || origin; // public /p ingress host if configured, else this origin
+  // A webhook trigger's URL: a long custom path is a capability URL (public, no bearer); a short
+  // or empty path falls back to the default project path (bearer required).
+  const urlFor = (t: EditTrigger) => `${base}/p/w/${workflow}/${(t.path && t.path.length > 0) ? t.path : projectId}`;
+  const isPublic = (t: EditTrigger) => !!t.path && t.path.length >= 24;
   const update = (i: number, patch: Partial<EditTrigger>) => setTriggers(triggers.map((t, j) => (j === i ? { ...t, ...patch } : t)));
   const remove = (i: number) => setTriggers(triggers.filter((_, j) => j !== i));
   const add = () => setTriggers([...triggers, { type: "manual" }]);
@@ -1320,8 +1331,9 @@ function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, inputSc
             </div>
             {t.type === "webhook" && (
               <div className="mt-1.5 flex items-center gap-2 pl-6">
-                <span className="truncate font-mono text-[10px] text-slate-500">{hookUrl}</span>
-                <button className="chip shrink-0 bg-white/5 text-slate-400 hover:text-slate-200" onClick={() => onCopy(hookUrl)} data-testid="copy-webhook"><Copy className="h-3 w-3" /> copy URL</button>
+                <span className={`chip shrink-0 ${isPublic(t) ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/15 text-slate-400"}`}>{isPublic(t) ? "no token" : "bearer"}</span>
+                <span className="truncate font-mono text-[10px] text-slate-500">{urlFor(t)}</span>
+                <button className="chip shrink-0 bg-white/5 text-slate-400 hover:text-slate-200" onClick={() => onCopy(urlFor(t))} data-testid="copy-webhook"><Copy className="h-3 w-3" /> copy URL</button>
               </div>
             )}
           </div>

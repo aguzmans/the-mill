@@ -175,6 +175,7 @@ export interface ProjectEndpoints {
   project: string;
   projectPath: string | null; // null → no workflow exposes an HTTP endpoint yet
   workflows: { workflow: string; path: string; customPaths: string[] }[];
+  publicBaseUrl?: string | null; // public webhook host (MILL_PUBLIC_WEBHOOK_URL); null → use this origin
   ingressEnabled?: boolean; // a bearer token is configured (global or per-project)
   authRequired: boolean;
 }

@@ -49,6 +49,7 @@ services:
       - PORT=8080
       - MILL_INGRESS_TOKEN=${MILL_INGRESS_TOKEN:-}   # bearer token for the /p tokenized ingress
       - MILL_ADMIN_TOKEN=${MILL_ADMIN_TOKEN:-}   # when set, /api/* requires this bearer (except /health, /metrics)
+      - MILL_PUBLIC_WEBHOOK_URL=${MILL_PUBLIC_WEBHOOK_URL:-}   # public /p ingress origin the UI shows for webhook URLs (else it uses the browser origin)
       - MILL_CORS_ORIGINS=${MILL_CORS_ORIGINS:-}
       - DEPS_TOKEN=${DEPS_TOKEN:-}   # per-project ingress token (demo)
       - MILL_AUTOSYNC=${MILL_AUTOSYNC:-true}   # false → validate but hold new revisions (manual Sync applies)

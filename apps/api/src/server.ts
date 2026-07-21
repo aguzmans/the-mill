@@ -139,6 +139,11 @@ const triggerEngine = new TriggerEngine(async (t, input) => {
 // ── Tokenized ingress: stable per-project (/p/:path) and per-workflow (/p/w/:wf/:path)
 // URLs on the same host, rebuilt from the reconciled workflows. Bearer-token secured.
 const INGRESS_TOKEN = process.env.MILL_INGRESS_TOKEN; // global fallback token
+// Public base URL of the webhook (public) ingress, e.g. https://win-the-mill.example.com — the
+// host external providers (Acuity, …) must POST to. The UI is usually browsed via a DIFFERENT
+// (internal/SSO) host, so without this the endpoint URLs it shows would point at the wrong,
+// bearer-gated host. Set it to the `/p` ingress origin.
+const PUBLIC_WEBHOOK_URL = (process.env.MILL_PUBLIC_WEBHOOK_URL ?? "").replace(/\/$/, "") || null;
 const wfRoutes = new Map<string, { project: string; workflow: string }>(); // key: `${workflow}/${path}`
 const projRoutes = new Map<string, string>(); // key: path → project id
 const projectTokens = new Map<string, string>(); // project id → its bearer token (per-project override)
@@ -604,6 +609,7 @@ api.get("/projects/:id/endpoints", (c) => {
     project: id,
     projectPath: workflows.length ? `/p/${id}` : null, // null → nothing exposed yet
     workflows,
+    publicBaseUrl: PUBLIC_WEBHOOK_URL, // public webhook host to prefix paths with (null → UI falls back to its own origin)
     ingressEnabled: !!tokenFor(id), // a bearer token is configured (global or per-project)
     authRequired: !!tokenFor(id),
     perProjectToken: projectTokens.has(id),

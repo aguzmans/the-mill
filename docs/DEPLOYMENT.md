@@ -50,6 +50,7 @@ have no safe default.
 | `MILL_GIT_WEBHOOK_SECRET` | | — | 🔒 | HMAC secret for the `POST /git/webhook` push hook. When set, the controller verifies `X-Hub-Signature-256` and reconciles instantly on push (instead of waiting for the poll). Set the same secret in the GitHub webhook. |
 | `MILL_ADMIN_TOKEN` | | — | 🔒 | If set, all `/api/*` require this bearer (except `/api/health`, `/api/metrics`). Defense-in-depth; also locks the UI — usually leave unset and auth at the Ingress. |
 | `MILL_CORS_ORIGINS` | | — | | Comma-separated allowlist for cross-origin browsers (default: same-origin only). |
+| `MILL_PUBLIC_WEBHOOK_URL` | | — | | Origin of the **public `/p` ingress** (e.g. `https://win-the-mill.example.com`). The UI is usually browsed via a different internal/SSO host, so set this or the webhook URLs it shows point external providers (Acuity, …) at the wrong, bearer-gated host. |
 | `MILL_STD_REGISTRY` | | — | | Base URL for `std://…@ver` remote callScript bundles. |
 | `MILL_SECRETS` | | `{}` | 🔒 | Node secrets available to the controller's step-tester (same bag as the worker). |
 | `MILL_SECRETS_KEY` | | — | 🔒 | Encrypts the Redis-backed **runtime secret store** (UI-managed) at rest (AES-256-GCM). Set the **same value on the api and every worker**. Unset → values stored plaintext in Redis (dev only). |
@@ -459,13 +460,16 @@ of loss on a hard crash; use `appendfsync always` only if you can't tolerate any
 
 | Env var | Default | What it controls |
 |---|---|---|
-| `MILL_JOB_TTL_SECONDS` | `604800` (7 days) | TTL on each job's hash, events (logs), journal, and per-workflow runs index. Set on **both api and worker**. |
+| `MILL_JOB_TTL_SECONDS` | `604800` (7 days) | TTL on each job's hash, events (logs), journal, per-workflow runs index, **and the per-revision project bundles** (`mill:bundle:<project>@<rev>`) the workers fetch. Set on **both api and worker**. |
 | `MILL_COMPLETED_MAX` | `5000` | Rolling cap on the global completed-runs list that feeds the dashboard/run-history. |
 | `MILL_REDIS_MAXMEMORY` | `1gb` | Redis `maxmemory` (compose passes it through). Size from the table below. |
 
 **Memory sizing.** Measured footprint (calibrated on a running stack): a job hash ≈ **0.4–2 KB**,
 each live-log event ≈ **~90 B**, and the **journal is deleted on success** (only failed/requeued
-runs keep it). So per-job memory is dominated by **log-event volume**. Model:
+runs keep it). So per-job memory is dominated by **log-event volume**. **Project bundles**
+(`mill:bundle:<project>@<rev>`) add a small, near-constant term: one entry per project **per
+active revision** (the whole project's YAML+JS, typically a few KB–tens of KB), TTL'd and evicted
+first under pressure — negligible unless projects are huge or you retain many old revisions. Model: 
 
 ```
 bytes/job ≈ hash(~0.5KB + input + result) + events(N × ~0.1KB) + (failed ? nodes × ~0.2KB : 0)
