@@ -14,7 +14,7 @@ import { createLogger } from "@mill/telemetry";
 const log = createLogger("api");
 
 const ENV_SECRETS: Record<string, string> = process.env.MILL_SECRETS ? JSON.parse(process.env.MILL_SECRETS) : {};
-import { loadProject, listWorkflows, loadWorkflow, listProjects, collectDeps, validateNodeSources } from "@mill/projectfs";
+import { loadProject, listWorkflows, loadWorkflow, listProjects, collectDeps, validateNodeSources, packProject } from "@mill/projectfs";
 import { buildPlan } from "@mill/compiler";
 import { openRepo, reconcile, deletePaths, writePaths, diffToApply, type RepoState, type ReconcileStatus } from "@mill/gitops";
 import { parseWorkflow } from "@mill/core";
@@ -82,10 +82,19 @@ function runnableError(projectDir: string, workflow: string): string | null {
 function enqueueJob(projectDir: string, workflow: string, input: unknown, trigger = "manual", request?: unknown): string {
   const jobId = "job_" + crypto.randomUUID().slice(0, 8);
   const projectId = projectDir.split("/").filter(Boolean).pop() ?? projectDir;
+  const revision = lastStatus?.syncedRevision;
   // Carry the workflow's `exclusive` flag onto the job so the worker can dedicate a pod to it.
   let exclusive: boolean | undefined;
   try { exclusive = loadWorkflow(projectDir, workflow).def.exclusive; } catch { /* leave undefined */ }
-  q.enqueue({ id: jobId, projectDir, workflow, input, revision: lastStatus?.syncedRevision, trigger, runKey: `${projectId}/${workflow}`, request, exclusive })
+  // Ship the project's code to the worker via Redis (keyed by revision) so the worker needs no
+  // shared /app/workdir. q.enqueue publishes the bundle (write-once, NX) BEFORE queueing the job.
+  let bundleKey: string | undefined;
+  let bundleFiles: Record<string, string> | undefined;
+  if (revision) {
+    bundleKey = q.bundleKeyFor(projectId, revision);
+    try { bundleFiles = packProject(projectDir); } catch (e) { console.error("packProject failed:", e); }
+  }
+  q.enqueue({ id: jobId, projectDir, workflow, input, revision, project: projectId, bundleKey, bundleFiles, trigger, runKey: `${projectId}/${workflow}`, request, exclusive })
     .catch((e) => console.error("enqueue failed:", e));
   q.metricInc(`triggered:${trigger}`).catch(() => {});
   return jobId;

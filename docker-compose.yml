@@ -87,8 +87,8 @@ services:
       - MILL_JOB_TTL_SECONDS=${MILL_JOB_TTL_SECONDS:-604800}   # must match the api (job key TTL)
       # Flat secrets, as k8s Secrets would be injected on EKS (each node still sees only its declared refs).
       - MILL_SECRETS={"WAREHOUSE_DSN":"postgres://demo","SMTP_URL":"smtp://demo","API_URL":"https://demo","WEBHOOK_SECRET":"whsec_test_123"}
-    volumes:
-      - workdir:/app/workdir:ro    # reads (read-only) the reconciled working copy the controller checks out
+    # NO shared workdir: the worker fetches each job's project bundle from Redis into its own
+    # ephemeral /tmp (the Windmill model). The controller↔worker shared volume is gone.
     deploy:
       replicas: 2                  # a small worker fleet (HPA scales this on EKS)
       resources:

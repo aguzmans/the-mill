@@ -20,7 +20,13 @@ controller and the worker — same image, **different command**. Plus Redis and 
 | **web** | The React UI. **Already baked into `mill-backend`** and served by the controller at `/`, so no separate deployment is required. | — | — |
 
 The controller keeps a **git working copy on a PVC** (the source of truth is the git repo;
-the PVC is a rebuildable cache). Workers are stateless and horizontally scaled.
+the PVC is a rebuildable cache). **Workers need no shared filesystem** — when the controller
+enqueues a job it publishes that project's files to **Redis** as a bundle keyed by revision
+(`mill:bundle:<project>@<rev>`, write-once, TTL'd); the worker fetches the bundle for its job
+into its own ephemeral `/tmp` and runs from there (the Windmill model — the central store holds
+the code, workers pull per job). So **do not mount `WORKDIR` on workers** and give them **no
+volume at all** (a `tmpfs`/`emptyDir` for `/tmp` on a read-only-rootfs pod is enough). Only the
+controller mounts the working-copy PVC.
 
 ---
 
@@ -36,7 +42,7 @@ have no safe default.
 | `PROJECT_BRANCH` | | `main` | | Tracked branch. |
 | `GIT_TOKEN` | ✅* | — | 🔒 | Git credential (GitHub PAT/deploy token) for a private repo. |
 | `REDIS_URL` | ✅ | — | | e.g. `redis://mill-redis:6379`. |
-| `WORKDIR` | | `/app/workdir` | | Working-copy path — **mount the PVC here**. |
+| `WORKDIR` | | `/app/workdir` | | Working-copy path — **mount the PVC here** (**controller only**; workers need no workdir — they fetch bundles from Redis). |
 | `PORT` | | `8080` | | HTTP port. |
 | `RECONCILE_INTERVAL_MS` | | `15000` | | Reconcile loop period. |
 | `MILL_AUTOSYNC` | | `true` | | `false` → validate but **hold** new revisions (manual Sync applies). |
@@ -59,7 +65,8 @@ have no safe default.
 | `MILL_CONC_MIN` / `MILL_CONC_MAX` | | `1` / `8` | | Per-worker concurrency band. |
 | `MILL_MEM_MAX_MB` | | `1024` | | Memory ceiling the worker sizes admission against — **set to the pod memory limit**. |
 | `MILL_PAUSE_PCT` / `MILL_RESUME_PCT` | | `85` / `70` | | Load-shed thresholds. |
-| `MILL_WORKER_ID` | | hostname | | Registry id (default fine — use the pod name). |
+| `MILL_WORKER_ID` | | hostname | | Registry id — **must be unique per pod** (the worker keys its heartbeat + processing list on it; it derives a distinct id from the pod-name suffix, so inject the pod name via `fieldRef: metadata.name`). |
+| `MILL_BUNDLE_DIR` | | `$HOME/mill-bundles` (`/tmp/…`) | | Where the worker materializes project bundles fetched from Redis. Keep it on the pod's `tmpfs`/`emptyDir` — never a shared volume. |
 | `MILL_SECRETS` **and/or** individual secret env vars | | `{}` | 🔒 | **Node secrets** — see §3. |
 | `MILL_SECRETS_KEY` | | — | 🔒 | **Must match the controller's** so the worker can decrypt UI-managed secrets. |
 | `MILL_LOG_LEVEL` / `MILL_LOG_FORMAT` | | | | As above. |
@@ -318,6 +325,11 @@ spec:
   template:
     metadata: { labels: { app: mill-worker } }
     spec:
+      # NO PVC / no shared workdir: the worker fetches each job's project bundle from Redis into
+      # its own /tmp (see §1) — it depends only on Redis. Hardened like a locked-down pod.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: worker
           image: <registry>/mill-backend:<tag>
@@ -326,12 +338,21 @@ spec:
             - { name: REDIS_URL,       value: "redis://mill-redis:6379" }
             - { name: MILL_CONC_MAX,   value: "8" }
             - { name: MILL_MEM_MAX_MB, value: "1024" }   # = memory limit below
-            - { name: MILL_WORKER_ID,  valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: HOME,            value: "/tmp" }   # bundle cache + any runtime writes stay on tmpfs
+            - { name: MILL_WORKER_ID,  valueFrom: { fieldRef: { fieldPath: metadata.name } } }  # unique per pod
           envFrom:
             - secretRef: { name: mill-node-secrets }      # ctx.secrets.*
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }              # scratch: bundle materialization + deps installs
           resources:
             requests: { cpu: "250m", memory: "512Mi" }
             limits:   { cpu: "1",    memory: "1Gi" }
+      volumes:
+        - { name: tmp, emptyDir: {} }                     # NO PVC, NO EFS — just ephemeral scratch
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

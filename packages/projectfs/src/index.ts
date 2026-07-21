@@ -1,5 +1,5 @@
-import { readFileSync, existsSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { readFileSync, existsSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
+import { join, resolve, dirname } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { parseProject, parseWorkflow, type WorkflowDef, type ProjectDef } from "@mill/core";
 
@@ -85,6 +85,41 @@ export async function loadNodeFn(workflowDir: string, file: string, rev?: string
   const fn = mod.default;
   if (typeof fn !== "function") throw new Error(`node file '${file}' must default-export a function`);
   return fn;
+}
+
+// ── project bundles (ship code to workers via Redis — no shared filesystem) ──────
+// A project is small text (project.yaml + workflows/**/{workflow.yaml,nodes/*.js}), so the
+// controller packs the whole project into a flat { relPath: utf8 } map, publishes it to Redis
+// keyed by revision, and a worker materializes it into its own ephemeral /tmp before running.
+// This is the Windmill model (workers fetch code from the central store per job) with Redis as
+// that store; it removes the controller↔worker shared /app/workdir entirely.
+const BUNDLE_SKIP = new Set(["node_modules", ".git"]); // runtime cruft, never part of the source
+
+/** Serialize a project directory to a flat { relPath: utf8-content } map. */
+export function packProject(projectDir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (abs: string, rel: string) => {
+    for (const d of readdirSync(abs, { withFileTypes: true })) {
+      if (BUNDLE_SKIP.has(d.name)) continue;
+      const childAbs = join(abs, d.name);
+      const childRel = rel ? `${rel}/${d.name}` : d.name;
+      if (d.isDirectory()) walk(childAbs, childRel);
+      else if (d.isFile()) out[childRel] = readFileSync(childAbs, "utf8");
+    }
+  };
+  walk(projectDir, "");
+  return out;
+}
+
+/** Materialize a packed project map into `destProjectDir` (created if needed); returns it. */
+export function unpackProject(files: Record<string, string>, destProjectDir: string): string {
+  for (const [rel, content] of Object.entries(files)) {
+    if (rel.includes("..") || rel.startsWith("/")) throw new Error(`illegal bundle path '${rel}'`);
+    const abs = join(destProjectDir, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, content);
+  }
+  return destProjectDir;
 }
 
 /** Resolve a callScript ref (v1: "workflows/<name>" in the same project). */

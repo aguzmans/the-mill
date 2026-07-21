@@ -16,6 +16,8 @@ export interface JobSpec {
   revision?: string; // git SHA the job was enqueued at (cache-busts node imports)
   request?: unknown; // webhook envelope (raw body + headers + query) → ctx.request
   exclusive?: boolean; // run alone on a worker/pod until done (no co-tenant jobs)
+  project?: string;   // project id — with `revision`, forms the bundle key
+  bundleKey?: string; // Redis key of the project bundle the worker fetches (no shared workdir)
 }
 
 export interface RunningJob {
@@ -60,6 +62,7 @@ export interface QueueEvent {
 export function classifyFailure(error?: string): string {
   const e = (error ?? "").toLowerCase();
   if (!e) return "unknown";
+  if (e.includes("bundle not found")) return "bundle_missing"; // Redis bundle expired → retrigger
   if (e.includes("file not found") || e.includes("workflow.yaml") || e.includes("no such file")) return "workflow_not_found";
   if (e.includes("won't compile") || e.includes("compile") || e.includes("syntaxerror") || e.includes("buildmessage")) return "compile_error";
   if (e.includes("schema")) return "schema_validation";
@@ -89,7 +92,24 @@ export class MillQueue {
   }
 
   // ── producer ──────────────────────────────────────────────────────────────
-  async enqueue(spec: JobSpec & { trigger?: string; runKey?: string }): Promise<void> {
+  // ── workflow-bundle cache (workers fetch code by revision → no shared filesystem) ──
+  /** Redis key for a project's file bundle at a revision. */
+  bundleKeyFor(project: string, revision: string): string { return this.key("bundle", `${project}@${revision}`); }
+  async bundleExists(key: string): Promise<boolean> { return (await this.redis.exists(key)) === 1; }
+  /** Publish a bundle write-once per revision (NX) with the job TTL — dedup across many jobs. */
+  async putBundle(key: string, files: Record<string, string>): Promise<void> {
+    await this.redis.set(key, JSON.stringify(files), "EX", this.ttl, "NX");
+  }
+  async getBundle(key: string): Promise<Record<string, string> | null> {
+    const v = await this.redis.get(key);
+    return v ? (JSON.parse(v) as Record<string, string>) : null;
+  }
+
+  async enqueue(spec: JobSpec & { trigger?: string; runKey?: string; bundleFiles?: Record<string, string> }): Promise<void> {
+    // Ship the code the worker needs to Redis BEFORE queueing the job, so the worker can never
+    // pull a job whose bundle isn't there yet. `bundleFiles` is not serialized into the job.
+    if (spec.bundleKey && spec.bundleFiles) await this.putBundle(spec.bundleKey, spec.bundleFiles);
+    const { bundleFiles: _omit, ...jobSpec } = spec;
     await this.redis.hset(this.key("job", spec.id), {
       status: "queued",
       workflow: spec.workflow,
@@ -107,7 +127,7 @@ export class MillQueue {
       await this.redis.ltrim(rk, 0, 49);
       await this.redis.expire(rk, this.ttl);
     }
-    await this.redis.lpush(this.key("queue"), JSON.stringify(spec));
+    await this.redis.lpush(this.key("queue"), JSON.stringify(jobSpec));
   }
 
   /**

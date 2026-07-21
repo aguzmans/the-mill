@@ -2,6 +2,9 @@ import Redis from "ioredis";
 import os from "node:os";
 import { MillQueue, SecretStore, type JobSpec, type RunningJob } from "@mill/queue";
 import { runWorkflow, DockerExecutor, type Executor } from "@mill/executor";
+import { unpackProject } from "@mill/projectfs";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { createLogger } from "@mill/telemetry";
 
 const log = createLogger("worker");
@@ -54,6 +57,21 @@ const beat = () => q.heartbeat({
 });
 setInterval(() => beat().catch(() => {}), 3000);
 
+// Materialize a project bundle from Redis into ephemeral /tmp, cached by revision so repeat
+// jobs of the same revision skip the fetch. HOME is /tmp on the hardened (read-only-rootfs) pod.
+const BUNDLE_ROOT = join(process.env.MILL_BUNDLE_DIR ?? process.env.HOME ?? "/tmp", "mill-bundles");
+const materialized = new Set<string>();
+async function materializeBundle(project: string, revision: string, bundleKey: string): Promise<string> {
+  const dir = join(BUNDLE_ROOT, revision, project);
+  if (materialized.has(dir) && existsSync(join(dir, "project.yaml"))) return dir;
+  const files = await q.getBundle(bundleKey);
+  if (!files) throw new Error(`workflow bundle not found in Redis (${bundleKey}) — controller cache expired; retrigger`);
+  unpackProject(files, dir);
+  materialized.add(dir);
+  log.info("materialized bundle", { project, revision: revision.slice(0, 7), files: Object.keys(files).length });
+  return dir;
+}
+
 async function handle(spec: JobSpec, raw: string) {
   // Replace concurrency policy: a run superseded while still queued must not execute.
   const pre = await q.getJob(spec.id).then((j) => j.status).catch(() => undefined);
@@ -67,7 +85,12 @@ async function handle(spec: JobSpec, raw: string) {
   // Re-read UI-managed secrets per job (cheap HGETALL) so a value added in the UI applies to
   // the next run without a worker restart. Env/k8s Secrets < Redis store (UI wins on conflict).
   const secrets = { ...envSecrets, ...(await secretStore.all().catch(() => ({}))) };
-  const job = { projectDir: spec.projectDir, workflow: spec.workflow, input: spec.input, secrets, revision: spec.revision, request: spec.request as import("@mill/sdk").RequestCtx | undefined };
+  // Fetch the project's code from Redis into ephemeral /tmp (no shared workdir). Falls back to
+  // spec.projectDir only when no bundle was published (dir-mode dev).
+  const projectDir = spec.bundleKey && spec.revision && spec.project
+    ? await materializeBundle(spec.project, spec.revision, spec.bundleKey)
+    : spec.projectDir;
+  const job = { projectDir, workflow: spec.workflow, input: spec.input, secrets, revision: spec.revision, request: spec.request as import("@mill/sdk").RequestCtx | undefined };
   let res;
   if (isolate) {
     // Isolated in a container; replay the run's events to Redis once it finishes.
