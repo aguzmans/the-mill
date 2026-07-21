@@ -162,11 +162,15 @@ the edge plus the app-layer auth on every route gives defense in depth.
 **e) Admin API token (`MILL_ADMIN_TOKEN`)** — locks the controller's `/api/*` behind a bearer
 (everything except `/api/health` and `/api/metrics`, which stay open for probes/scrape). Set it
 when the API is reachable by anything you don't fully trust — **without it, any caller that can
-reach the Service can read/write the runtime secret store and mutate projects.** ⚠️ It also
-locks the **browser UI** (the SPA calls `/api/*` with no bearer), so either drive the API
-headless (CLI/webhooks) or terminate human auth (SSO / oauth2-proxy) at the Ingress and keep
-this as defense-in-depth. Ingress webhook routes (`/p/*`) are unaffected — they authenticate by
-the capability path (d) or ingress token (b).
+reach the Service can read/write the runtime secret store and mutate projects.** Ingress webhook
+routes (`/p/*`) are unaffected — they authenticate by the capability path (d) or ingress token (b).
+
+**Using the UI when the token is set.** The SPA has no server session, so it attaches the token
+to `/api` calls itself: the header's **"Sign in"** control takes the token and stores it in that
+browser's `localStorage` (per-operator, never committed). Live-log streaming (`EventSource`,
+which can't send headers) passes it as `?access_token=…` instead — so it appears in access logs;
+prefer terminating human auth at an SSO Ingress for anything beyond an internal tool. Until an
+operator signs in, data pages show a graceful "unauthorized — sign in" state rather than failing.
 
 Feed it like the other 🔒 controller secrets. **With External Secrets Operator + AWS Parameter
 Store** (the idiomatic path):

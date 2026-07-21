@@ -12,7 +12,8 @@ export function useLiveStatus(intervalMs = 5000) {
     if (!LIVE) return;
     reload();
     const t = setInterval(reload, intervalMs);
-    return () => clearInterval(t);
+    window.addEventListener("mill:token", reload);
+    return () => { clearInterval(t); window.removeEventListener("mill:token", reload); };
   }, [reload, intervalMs]);
   const ready = LIVE && !!status && !status.pending && !!status.projects;
   return { status, reload, ready };
@@ -33,7 +34,8 @@ export function useFleet(intervalMs = 3000) {
     if (!LIVE) return;
     reload();
     const t = setInterval(reload, intervalMs);
-    return () => clearInterval(t);
+    window.addEventListener("mill:token", reload);
+    return () => { clearInterval(t); window.removeEventListener("mill:token", reload); };
   }, [reload, intervalMs]);
   const ready = LIVE && !!fleet;
   return { fleet, reload, ready, error };

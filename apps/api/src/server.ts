@@ -307,9 +307,12 @@ const ADMIN_TOKEN = process.env.MILL_ADMIN_TOKEN;
 const ADMIN_OPEN = new Set(["/api/health", "/api/metrics"]);
 api.use("*", async (c, next) => {
   if (!ADMIN_TOKEN) return next();
-  if (ADMIN_OPEN.has(new URL(c.req.url).pathname)) return next();
+  const url = new URL(c.req.url);
+  if (ADMIN_OPEN.has(url.pathname)) return next();
+  // Bearer header for normal fetch(); `?access_token=` for EventSource (SSE can't set headers).
   const m = (c.req.header("authorization") ?? "").match(/^Bearer\s+(.+)$/i);
-  if (!m || !safeEq(m[1], ADMIN_TOKEN)) return c.json({ error: "unauthorized (admin token required)" }, 401);
+  const supplied = m ? m[1] : (url.searchParams.get("access_token") ?? "");
+  if (!supplied || !safeEq(supplied, ADMIN_TOKEN)) return c.json({ error: "unauthorized (admin token required)" }, 401);
   return next();
 });
 

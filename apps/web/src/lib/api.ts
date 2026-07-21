@@ -3,11 +3,34 @@
 export const LIVE = import.meta.env.VITE_MILL_MODE === "live";
 const BASE = (import.meta.env.VITE_MILL_API as string) || "/api";
 
+// ── Admin API token ──────────────────────────────────────────────────────────
+// When the controller runs with MILL_ADMIN_TOKEN, every /api call needs the bearer. The SPA
+// has no server session, so we keep the token in localStorage and attach it to each request.
+// Set it once from the header field (the key icon); clear it to "sign out".
+const TOKEN_KEY = "mill.adminToken";
+export function getAdminToken(): string {
+  try { return localStorage.getItem(TOKEN_KEY) ?? ""; } catch { return ""; }
+}
+export function setAdminToken(token: string): void {
+  try { token ? localStorage.setItem(TOKEN_KEY, token) : localStorage.removeItem(TOKEN_KEY); } catch { /* private mode */ }
+  try { window.dispatchEvent(new CustomEvent("mill:token")); } catch { /* non-browser */ }
+}
+/** Merge the bearer (when set) into request headers. */
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const t = getAdminToken();
+  return { ...(extra ?? {}), ...(t ? { Authorization: `Bearer ${t}` } : {}) };
+}
+/** EventSource can't send headers — carry the token as a query param for SSE only. */
+function withToken(url: string): string {
+  const t = getAdminToken();
+  return t ? url + (url.includes("?") ? "&" : "?") + "access_token=" + encodeURIComponent(t) : url;
+}
+
 /** GET JSON that FAILS LOUDLY on a non-2xx. A 401/500 body is still valid JSON, so a bare
  * `.json()` would hand pages an `{error}` object where they expect `{workers:[…]}` and then
  * crash on `.map`. Throwing here lets the polling hooks catch it and render an error state. */
 async function getJSON<T>(path: string): Promise<T> {
-  const r = await fetch(`${BASE}${path}`);
+  const r = await fetch(`${BASE}${path}`, { headers: authHeaders() });
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `GET ${path} (${r.status})`);
   return r.json() as Promise<T>;
 }
@@ -26,7 +49,7 @@ export interface LiveEvent {
 export async function triggerRun(projectId: string, workflow: string, input: unknown): Promise<string> {
   const r = await fetch(`${BASE}/projects/${projectId}/workflows/${workflow}/trigger`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ input }),
   });
   if (!r.ok) throw new Error(`trigger failed (${r.status})`);
@@ -36,7 +59,7 @@ export async function triggerRun(projectId: string, workflow: string, input: unk
 }
 
 export function streamEvents(jobId: string, onEvent: (e: LiveEvent) => void, onDone: () => void): () => void {
-  const es = new EventSource(`${BASE}/jobs/${jobId}/events`);
+  const es = new EventSource(withToken(`${BASE}/jobs/${jobId}/events`));
   let closed = false;
   const stop = () => { if (closed) return; closed = true; es.close(); onDone(); };
   es.onmessage = (m) => { const e = JSON.parse(m.data) as LiveEvent; onEvent(e); if (e.type === "done") stop(); };
@@ -89,7 +112,7 @@ export async function getStatus(): Promise<LiveStatus> {
   return getJSON(`/status`);
 }
 export async function reconcileNow(): Promise<LiveStatus> {
-  return (await fetch(`${BASE}/reconcile`, { method: "POST" })).json();
+  return (await fetch(`${BASE}/reconcile`, { method: "POST", headers: authHeaders() })).json();
 }
 
 export interface LiveGraph {
@@ -102,13 +125,13 @@ export interface LiveGraph {
   inputSchema?: string;
 }
 export async function getWorkflowGraph(projectId: string, wf: string): Promise<LiveGraph> {
-  const r = await fetch(`${BASE}/projects/${projectId}/workflows/${wf}`);
+  const r = await fetch(`${BASE}/projects/${projectId}/workflows/${wf}`, { headers: authHeaders() });
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `graph ${r.status}`);
   return r.json();
 }
 
 async function del(path: string) {
-  const r = await fetch(`${BASE}${path}`, { method: "DELETE" });
+  const r = await fetch(`${BASE}${path}`, { method: "DELETE", headers: authHeaders() });
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `delete ${r.status}`);
   return r.json();
 }
@@ -118,7 +141,7 @@ export const deleteProject = (projectId: string) => del(`/projects/${projectId}`
 export async function createProject(id: string, opts?: { autoSync?: boolean; selfHeal?: boolean; prune?: boolean }) {
   const r = await fetch(`${BASE}/projects`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ id, ...opts }),
   });
   const j = await r.json().catch(() => ({}));
@@ -135,7 +158,7 @@ export async function getTimeline(jobId: string): Promise<{ nodeTimings: NodeTim
   return getJSON(`/jobs/${jobId}/timeline`);
 }
 export async function retryRun(jobId: string): Promise<{ jobId: string }> {
-  const r = await fetch(`${BASE}/jobs/${jobId}/retry`, { method: "POST" });
+  const r = await fetch(`${BASE}/jobs/${jobId}/retry`, { method: "POST", headers: authHeaders() });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || `retry ${r.status}`);
   return j;
@@ -163,7 +186,7 @@ export interface NodeTestResult { status: "succeeded" | "failed"; node: string; 
 export async function testNode(projectId: string, wf: string, key: string, input: unknown, secrets?: Record<string, string>): Promise<NodeTestResult> {
   const r = await fetch(`${BASE}/projects/${projectId}/workflows/${wf}/nodes/${key}/test`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ input, secrets }),
   });
   return r.json();
@@ -173,7 +196,7 @@ export interface SaveWorkflowBody { message?: string; workflow: unknown; files: 
 export async function saveWorkflow(projectId: string, wf: string, body: SaveWorkflowBody) {
   const r = await fetch(`${BASE}/projects/${projectId}/workflows/${wf}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authHeaders({ "content-type": "application/json" }),
     body: JSON.stringify(body),
   });
   const j = await r.json().catch(() => ({}));
@@ -188,11 +211,11 @@ export async function getSecrets(): Promise<SecretsInfo> {
 }
 export async function putSecret(name: string, value: string): Promise<void> {
   const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}`, {
-    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ value }),
+    method: "PUT", headers: authHeaders({ "content-type": "application/json" }), body: JSON.stringify({ value }),
   });
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `save failed (${r.status})`);
 }
 export async function deleteSecret(name: string): Promise<void> {
-  const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}`, { method: "DELETE" });
+  const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}`, { method: "DELETE", headers: authHeaders() });
   if (!r.ok) throw new Error(`delete failed (${r.status})`);
 }

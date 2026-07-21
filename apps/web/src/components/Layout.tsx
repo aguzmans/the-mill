@@ -2,6 +2,7 @@ import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { Boxes, Cpu, Workflow as WorkflowIcon, GitBranch, Network, HelpCircle, KeyRound } from "lucide-react";
 import { InfoTip } from "./InfoTip";
+import { TokenControl } from "./TokenControl";
 import { workspace } from "../lib/mock";
 
 function NavItem({ to, icon, label, tip }: { to: string; icon: React.ReactNode; label: string; tip: string }) {
@@ -60,10 +61,13 @@ export function Layout() {
               <span>Help</span>
             </a>
             {import.meta.env.VITE_MILL_MODE === "live" ? (
-              <span className="chip bg-emerald-500/15 text-emerald-300" data-testid="proto-badge">
-                Live
-                <InfoTip text="Wired to the real backend. Run actually triggers a job on the controller and streams live logs from the worker." />
-              </span>
+              <>
+                <TokenControl />
+                <span className="chip bg-emerald-500/15 text-emerald-300" data-testid="proto-badge">
+                  Live
+                  <InfoTip text="Wired to the real backend. Run actually triggers a job on the controller and streams live logs from the worker." />
+                </span>
+              </>
             ) : (
               <span className="chip bg-brand-500/15 text-brand-300" data-testid="proto-badge">
                 Prototype
