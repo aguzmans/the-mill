@@ -36,8 +36,11 @@ const statusBadge: Record<string, string> = {
 };
 
 export function FleetPage() {
-  const { fleet, ready } = useFleet();
+  const { fleet, ready, error } = useFleet();
   const now = fleet?.now ?? 0;
+  // A live poll error with no cached fleet (e.g. the API now requires auth → 401) must NOT
+  // crash the page — show a clear banner instead of mapping over an absent workers array.
+  const loadError = LIVE && !!error && !fleet;
 
   // Live in LIVE mode (real workers + rolling stats from /api/fleet). In LIVE-but-not-ready we
   // show an empty fleet (connecting), never demo workers. The mock fleet is /prototype-only.
@@ -84,8 +87,8 @@ export function FleetPage() {
           Worker Fleet
           <InfoTip text="Stateless Bun workers pull jobs from the queue and run each node in-process inside their own hardened, HPA-scaled pod (the pod is the isolation boundary). They register in Redis on startup with a heartbeat TTL and never run alongside the api." />
           {LIVE && (
-            <span className={`chip text-[10px] ${ready ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/15 text-slate-400"}`} data-testid="fleet-source">
-              {ready ? "live" : "connecting…"}
+            <span className={`chip text-[10px] ${loadError ? "bg-rose-500/15 text-rose-300" : ready ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/15 text-slate-400"}`} data-testid="fleet-source">
+              {loadError ? "error" : ready ? "live" : "connecting…"}
             </span>
           )}
         </h1>
@@ -93,6 +96,15 @@ export function FleetPage() {
           Fleet scaled by the HPA on memory/CPU, or on queue depth via KEDA/custom metrics; each worker runs a dynamic min–max concurrency band. <Spec doc="ARCH §9" />
         </p>
       </div>
+
+      {/* Live-poll error (e.g. the API now requires auth → 401). Render a clear state rather
+          than crashing on an absent workers array. */}
+      {loadError && (
+        <div className="flex items-center gap-3 rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200" data-testid="fleet-error" role="alert">
+          <AlertTriangle className="h-5 w-5 shrink-0 text-rose-400" />
+          <span>Couldn’t load the fleet — the API returned an error{error ? ` (${error})` : ""}. If access was just restricted, sign in again.</span>
+        </div>
+      )}
 
       {/* Failures banner — impossible to miss when runs are failing. */}
       {failed > 0 && (

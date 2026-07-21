@@ -18,12 +18,16 @@ export function useLiveStatus(intervalMs = 5000) {
   return { status, reload, ready };
 }
 
-/** In LIVE mode, polls /api/fleet for real workers, queue, and execution stats. */
+/** In LIVE mode, polls /api/fleet for real workers, queue, and execution stats. Surfaces
+ * `error` so the page can show an "unauthorized / can't reach the API" state instead of
+ * crashing on a 401 body (which lacks the `workers`/`stats` arrays the view maps over). */
 export function useFleet(intervalMs = 3000) {
   const [fleet, setFleet] = useState<FleetData | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const reload = useCallback(async () => {
     if (!LIVE) return;
-    try { setFleet(await getFleet()); } catch { /* keep last */ }
+    try { setFleet(await getFleet()); setError(null); }
+    catch (e) { setError(e instanceof Error ? e.message : "failed to load fleet"); /* keep last fleet */ }
   }, []);
   useEffect(() => {
     if (!LIVE) return;
@@ -32,5 +36,5 @@ export function useFleet(intervalMs = 3000) {
     return () => clearInterval(t);
   }, [reload, intervalMs]);
   const ready = LIVE && !!fleet;
-  return { fleet, reload, ready };
+  return { fleet, reload, ready, error };
 }
