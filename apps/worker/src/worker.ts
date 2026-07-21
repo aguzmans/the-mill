@@ -82,44 +82,58 @@ async function handle(spec: JobSpec, raw: string) {
   }
   running.set(spec.id, { id: spec.id, workflow: spec.workflow, startedAt: Date.now() });
   await q.markRunning(spec.id, workerId);
-  // Re-read UI-managed secrets per job (cheap HGETALL) so a value added in the UI applies to
-  // the next run without a worker restart. Env/k8s Secrets < Redis store (UI wins on conflict).
-  const secrets = { ...envSecrets, ...(await secretStore.all().catch(() => ({}))) };
-  // Fetch the project's code from Redis into ephemeral /tmp (no shared workdir). Falls back to
-  // spec.projectDir only when no bundle was published (dir-mode dev).
-  const projectDir = spec.bundleKey && spec.revision && spec.project
-    ? await materializeBundle(spec.project, spec.revision, spec.bundleKey)
-    : spec.projectDir;
-  const job = { projectDir, workflow: spec.workflow, input: spec.input, secrets, revision: spec.revision, request: spec.request as import("@mill/sdk").RequestCtx | undefined };
-  let res;
-  if (isolate) {
-    // Isolated in a container; replay the run's events to Redis once it finishes.
-    res = await isolate.execute(job);
-    for (const e of res.events ?? []) await q.publishEvent(spec.id, e as any).catch(() => {});
-  } else {
-    // In-process: journal completed nodes so a requeued job (after a worker crash) resumes
-    // where it left off instead of re-doing finished work.
-    const journal = await q.journalGet(spec.id).catch(() => ({}));
-    res = await runWorkflow(job, (e) => { q.publishEvent(spec.id, e).catch(() => {}); }, {
-      journal,
-      onNodeDone: (k, o) => { q.journalSet(spec.id, k, o).catch(() => {}); },
+  try {
+    // Re-read UI-managed secrets per job (cheap HGETALL) so a value added in the UI applies to
+    // the next run without a worker restart. Env/k8s Secrets < Redis store (UI wins on conflict).
+    const secrets = { ...envSecrets, ...(await secretStore.all().catch(() => ({}))) };
+    // Fetch the project's code from Redis into ephemeral /tmp (no shared workdir). Falls back to
+    // spec.projectDir only when no bundle was published (dir-mode dev).
+    const projectDir = spec.bundleKey && spec.revision && spec.project
+      ? await materializeBundle(spec.project, spec.revision, spec.bundleKey)
+      : spec.projectDir;
+    const job = { projectDir, workflow: spec.workflow, input: spec.input, secrets, revision: spec.revision, request: spec.request as import("@mill/sdk").RequestCtx | undefined };
+    let res;
+    if (isolate) {
+      // Isolated in a container; replay the run's events to Redis once it finishes.
+      res = await isolate.execute(job);
+      for (const e of res.events ?? []) await q.publishEvent(spec.id, e as any).catch(() => {});
+    } else {
+      // In-process: journal completed nodes so a requeued job (after a worker crash) resumes
+      // where it left off instead of re-doing finished work.
+      const journal = await q.journalGet(spec.id).catch(() => ({}));
+      res = await runWorkflow(job, (e) => { q.publishEvent(spec.id, e).catch(() => {}); }, {
+        journal,
+        onNodeDone: (k, o) => { q.journalSet(spec.id, k, o).catch(() => {}); },
+      });
+      if (res.status === "succeeded") await q.journalClear(spec.id).catch(() => {}); // done — drop the journal
+    }
+    await q.markDone(spec.id, res.status, {
+      result: JSON.stringify(res.result ?? null),
+      error: res.error ?? "",
+      ms: String(res.ms),
+      worker: workerId,
+      isolation: executorTier,
     });
-    if (res.status === "succeeded") await q.journalClear(spec.id).catch(() => {}); // done — drop the journal
+    await q.publishEvent(spec.id, { type: "done", status: res.status, result: res.result ?? null, error: res.error ?? null });
+    log[res.status === "failed" ? "warn" : "info"]("job " + res.status, { job: spec.id, workflow: spec.workflow, ms: res.ms, executor: executorTier, error: res.error || undefined });
+  } catch (e) {
+    // A throw BETWEEN markRunning and markDone (e.g. the bundle fetch) MUST fail the job — never
+    // leave it stuck "running" forever. The worker loop's .catch only logs, so handle it here.
+    const error = e instanceof Error ? e.message : String(e);
+    log.error("job failed before completion", { job: spec.id, workflow: spec.workflow, error });
+    await q.markDone(spec.id, "failed", { error, worker: workerId, ms: "0" }).catch(() => {});
+    await q.publishEvent(spec.id, { type: "done", status: "failed", result: null, error }).catch(() => {});
+  } finally {
+    await q.ack(workerId, raw).catch(() => {}); // ALWAYS drop from the processing list
   }
-  await q.markDone(spec.id, res.status, {
-    result: JSON.stringify(res.result ?? null),
-    error: res.error ?? "",
-    ms: String(res.ms),
-    worker: workerId,
-    isolation: executorTier,
-  });
-  await q.publishEvent(spec.id, { type: "done", status: res.status, result: res.result ?? null, error: res.error ?? null });
-  await q.ack(workerId, raw); // remove from processing only after it's done + recorded
-  log[res.status === "failed" ? "warn" : "info"]("job " + res.status, { job: spec.id, workflow: spec.workflow, ms: res.ms, executor: executorTier, error: res.error || undefined });
 }
 
 async function loop() {
   log.info("worker online", { workerId, concMin, concMax, executor: executorTier, redis: process.env.REDIS_URL ?? "redis://localhost:6379" });
+  // Reclaim jobs orphaned in this pod's own processing list by a previous crash/restart (same
+  // pod name → same id, so the reaper won't touch it). Requeued jobs resume via their journal.
+  const reclaimed = await q.requeueOwn(workerId).catch(() => 0);
+  if (reclaimed) log.info("reclaimed orphaned jobs on startup", { workerId, reclaimed });
   await beat();
   while (true) {
     // Reactive gate: pause pulling above the memory threshold (never below min).

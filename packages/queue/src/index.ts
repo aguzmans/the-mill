@@ -216,6 +216,23 @@ export class MillQueue {
     await this.redis.hset(this.key("job", id), { status, ...extra });
   }
 
+  /**
+   * Requeue any jobs still in THIS worker's processing list — leftovers from a previous life of
+   * the same-named pod. A container restart keeps the worker id, so `reapDead` (which only
+   * requeues DEAD workers' lists) never recovers them; the worker calls this on startup instead.
+   * The node journal lets a requeued job resume where it left off. Returns how many it requeued.
+   */
+  async requeueOwn(workerId: string): Promise<number> {
+    const pk = this.key("processing", workerId);
+    let n = 0;
+    let raw: string | null;
+    while ((raw = await this.redis.lmove(pk, this.key("queue"), "RIGHT", "LEFT"))) {
+      n++;
+      try { const spec = JSON.parse(raw) as JobSpec; await this.setStatus(spec.id, "queued", { requeued: "true" }); } catch { /* skip malformed */ }
+    }
+    return n;
+  }
+
   // ── monotonic metrics (a single Redis hash of counters, for Prometheus) ──────
   /** Latency histogram bucket upper-bounds, in seconds (Prometheus convention). */
   static readonly BUCKETS = [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60];
