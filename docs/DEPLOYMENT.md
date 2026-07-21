@@ -130,13 +130,34 @@ the deployment.
   Guard writes by setting `MILL_ADMIN_TOKEN`. Good for credentials you rotate from the UI
   (e.g. `ACUITY_USER_ID`, `ACUITY_API_KEY`); k8s Secrets remain best for platform-managed ones.
 
-**d) Capability URLs (header-less webhook providers)** — providers like **Acuity**, Twilio, or
-legacy Stripe **can't send an `Authorization` header**. Give the workflow's webhook trigger an
-**unguessable `path`** (≥24 chars) — `triggers: [{ type: webhook, path: <long-random> }]` — and
-Mill authenticates **by the path itself**: `POST /p/w/<workflow>/<long-random>` needs **no
-bearer**. The default `/p/w/<workflow>/<project>` path still requires the bearer, and a wrong
-path is `404`. Treat the path like a password (rotate by editing the trigger). The editor's
-webhook trigger has a "custom path" field for this.
+**d) Webhook endpoint auth (per workflow) — "public" vs. bearer.** A workflow is reachable over
+HTTP only when it declares a `webhook` trigger; it then has **two** auth modes, chosen per
+endpoint, and `/p` is **never silently open** (no capability path and no token configured →
+`503 ingress disabled`; wrong token → `401`; wrong path → `404`):
+
+1. **Public capability URL (no `Authorization` header)** — for header-less providers like
+   **Acuity**, Twilio, or legacy Stripe. Give the trigger an **unguessable `path`** (≥24 chars):
+   `triggers: [{ type: webhook, path: <long-random> }]`. Mill then authenticates **by the path
+   itself** — `POST /p/w/<workflow>/<long-random>` needs no bearer. **Self-service**: the
+   editor's webhook trigger has a **"custom path"** field; **Save** commits it to `workflow.yaml`
+   and the reconciler registers it — no operator step. The path *is* the credential: treat it
+   like a password, serve it only over HTTPS, and rotate by editing the trigger.
+2. **Custom bearer token** — for callers that *can* send `Authorization: Bearer <token>`. The
+   default `/p/w/<workflow>/<project>` path (and any custom path shorter than 24 chars) requires
+   a bearer. The token is **per-project** via `ingress: { tokenEnv: FOO_INGRESS_TOKEN }` in
+   `project.yaml` (the controller reads `$FOO_INGRESS_TOKEN` from a k8s Secret/env), or the
+   global `MILL_INGRESS_TOKEN` fallback. This is **platform config** (git + Secret), *not*
+   settable from the UI/API — rotate by updating the Secret and rolling the controller.
+
+> ⚠️ `POST /hooks/:project/:workflow` is a separate **unauthenticated open trigger** (no
+> capability path, no bearer). Never route it on a public ingress — keep it ClusterIP-internal.
+
+**Segmenting by ingress** — because each route class self-authenticates (capability/token for
+`/p`, HMAC for `/git/webhook`, `MILL_ADMIN_TOKEN` for `/api/*`), you can run **multiple ingresses
+to the same controller Service**, each routing only its own path prefixes: a **public** webhook
+ingress (`/p`, `/git/webhook` only — never `/api`, `/hooks`, or `/api/metrics`), an **SSO** ingress
+for the UI + `/api`, and/or a **bearer-only** ingress for programmatic `/api`. Path isolation at
+the edge plus the app-layer auth on every route gives defense in depth.
 
 **e) Admin API token (`MILL_ADMIN_TOKEN`)** — locks the controller's `/api/*` behind a bearer
 (everything except `/api/health` and `/api/metrics`, which stay open for probes/scrape). Set it
