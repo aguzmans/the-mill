@@ -27,10 +27,13 @@ worker registry from Redis), so you scrape the controller, not each worker.
 ### Counters — `rate()`/`increase()` these
 | Metric | Labels | Meaning |
 |---|---|---|
-| `mill_jobs_total` | `status` (succeeded\|failed) | Jobs finished. Success ratio, failure rate. |
+| `mill_jobs_total` | `status` (succeeded\|failed\|cancelled) | Jobs finished. Success ratio, failure rate. |
+| `mill_jobs_failed_total` | `reason` (workflow_not_found\|compile_error\|schema_validation\|timeout\|network\|bundle_missing\|node_error\|unknown) | **Failures bucketed by cause.** `workflow_not_found` = worker can't materialize the bundle (missing `/tmp` / bundle gone); `bundle_missing` = Redis bundle expired; `timeout`/`network` = a node's outbound call. **This is the first thing to look at when jobs fail.** |
 | `mill_jobs_by_workflow_total` | `workflow`, `status` | Per-workflow throughput + failures. |
 | `mill_triggered_total` | `trigger` (manual\|cron\|webhook\|event) | Jobs enqueued, by how they started. |
 | `mill_retries_total` | — | Run-level retries (Re-run / `/jobs/:id/retry`). |
+| `mill_jobs_reclaimed_total` | — | Jobs a **restarted worker reclaimed** from its own processing list (same-id restart). Non-zero ⇒ workers are crashing/restarting mid-job. |
+| `mill_jobs_reaped_total` | — | Jobs the **reaper requeued** from workers whose heartbeat expired (a worker crashed/was killed). Pairs with the above for crash-recovery visibility. |
 | `mill_reconcile_total` | `result` (applied\|held\|degraded\|nochange) | GitOps reconcile passes by outcome. |
 | `mill_ingress_total` | `outcome` (ok\|unauthorized\|disabled) | Tokenized-ingress (`/p`) requests. |
 | `mill_ingress_auth_failures_total` | — | Bearer auth failures — **security signal**. |
@@ -47,7 +50,8 @@ worker registry from Redis), so you scrape the controller, not each worker.
 ### Gauges — current state
 | Metric | Meaning |
 |---|---|
-| `mill_workers` | Workers registered (heartbeating). |
+| `mill_workers` | Workers registered (heartbeating). Compare to the desired replica count — fewer ⇒ pods not registering. |
+| `mill_worker_info` | **1 per heartbeating pod**, labels `worker_id`, `host`, `executor`. `count(mill_worker_info)` should equal your worker replica count; a table of these = "which pods are live". |
 | `mill_workers_inflight` | Jobs executing across the fleet. |
 | `mill_worker_capacity` | Total concurrent job slots (Σ per-worker `concMax`) — fleet ceiling. |
 | `mill_worker_saturation_ratio` | Busy fraction `inflight / capacity` (0..1). |
@@ -122,26 +126,74 @@ groups:
     for: 5m
     labels: { severity: warning }
     annotations: { summary: "Sustained ingress bearer-auth failures" }
+
+  # Every run fails at bundle-materialization — worker missing a writable /tmp or the bundle
+  # cache is gone. This is the single most common "nothing runs" cause; alert loudly.
+  - alert: MillWorkersCantMaterialize
+    expr: increase(mill_jobs_failed_total{reason=~"workflow_not_found|bundle_missing"}[10m]) > 0
+    for: 5m
+    labels: { severity: critical }
+    annotations: { summary: "Workers can't load workflows (no writable /tmp or missing bundle) — see DEPLOYMENT §6" }
+
+  # Registered workers < desired replicas ⇒ pods not registering (colliding ids, can't reach Redis).
+  - alert: MillWorkersUnderReplicas
+    expr: count(mill_worker_info) < <desired_worker_replicas>
+    for: 10m
+    labels: { severity: warning }
+    annotations: { summary: "Fewer workers registered than replicas" }
+
+  # Crash-recovery is firing — workers are dying mid-job and their work is being requeued.
+  - alert: MillWorkerCrashRecovery
+    expr: increase(mill_jobs_reclaimed_total[15m]) + increase(mill_jobs_reaped_total[15m]) > 0
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "Workers crashing/restarting mid-job (jobs reclaimed/reaped)" }
 ```
 
 ## Dashboard panels
 
-- **Throughput** — `sum(rate(mill_jobs_total[5m]))`, split by `status`.
+Suggested Grafana rows (all from `/api/metrics` via Prometheus):
+
+**Overview**
+- **Throughput** — `sum(rate(mill_jobs_total[5m]))`, split by `status` (incl. `cancelled`).
 - **Success ratio** — `sum(rate(mill_jobs_total{status="succeeded"}[5m])) / sum(rate(mill_jobs_total[5m]))`.
 - **Latency** — `histogram_quantile(0.5|0.95|0.99, sum(rate(mill_job_duration_seconds_bucket[5m])) by (le))`.
-- **Queue** — `mill_queue_depth` and `mill_queue_oldest_wait_seconds`.
-- **Fleet** — `mill_workers`, `mill_workers_inflight`.
-- **By workflow** — `topk(10, sum by (workflow) (rate(mill_jobs_by_workflow_total{status="failed"}[15m])))`.
+- **Queue latency** — `histogram_quantile(0.95, sum(rate(mill_job_wait_seconds_bucket[5m])) by (le))`.
+
+**Failures (start here when something's red)**
+- **Failures by reason** — `sum by (reason) (rate(mill_jobs_failed_total[15m]))` (stacked bars + a table). Instantly separates infra (`workflow_not_found`/`bundle_missing`), egress (`timeout`/`network`), and workflow bugs (`compile_error`/`schema_validation`/`node_error`).
+- **Top failing workflows** — `topk(10, sum by (workflow) (rate(mill_jobs_by_workflow_total{status="failed"}[15m])))`.
+
+**Fleet & reliability**
+- **Workers** — stat `count(mill_worker_info)` vs desired replicas; table of `mill_worker_info` (`worker_id`, `host`, `executor`).
+- **Saturation** — `mill_worker_saturation_ratio`, `mill_workers_inflight` / `mill_worker_capacity`.
+- **Crash recovery** — `increase(mill_jobs_reclaimed_total[$__range])` + `increase(mill_jobs_reaped_total[$__range])` (should be flat at 0).
+
+**Queue / autoscaling**
+- **Queue** — `mill_queue_depth` and `mill_queue_oldest_wait_seconds` (the KEDA/HPA signals).
+
+**GitOps & triggers**
 - **GitOps** — `mill_reconcile_synced`, `mill_reconcile_healthy`, `mill_reconcile_age_seconds`, and `rate(mill_reconcile_total[15m])` by `result`.
-- **Triggers** — `sum by (trigger) (rate(mill_triggered_total[5m]))`.
+- **Triggers** — `sum by (trigger) (rate(mill_triggered_total[5m]))`; **security**: `rate(mill_ingress_auth_failures_total[5m])`, `rate(mill_dispatch_skipped_total[15m])`.
 
 ## Logs & traces
 
-- **Logs** — api + worker emit **structured JSON** (`{ts, level, component, msg, …fields}`,
-  token-redacted). Ship with Alloy → Loki; query by `component`, `workflow`, `job`, `level`.
-  `MILL_LOG_FORMAT=json` forces JSON in a TTY; `MILL_LOG_LEVEL` sets the floor.
-- **Traces** — planned: a run = one trace, each node = a span, exported via OTel → Tempo.
-  The metrics + structured logs above are the pieces available today.
+Mill **exposes** metrics (above) and **emits** structured logs. It does **not** emit OTel spans
+today, so Tempo has nothing to store yet — plan the dashboard around **Prometheus + Loki**.
+
+- **Logs (Loki)** — api + worker emit **structured JSON** (`{ts, level, component, msg, …fields}`,
+  token-redacted). Ship with Alloy → Loki. Useful fields to index/query: `component` (`api`|`worker`),
+  `workflow`, `job` (the job id), `workerId`, `level`, `error`, `ms`. `MILL_LOG_FORMAT=json` forces
+  JSON in a TTY; `MILL_LOG_LEVEL` sets the floor.
+- **Correlation without Tempo** — a run's story lives across metrics + logs + the app's own event
+  stream. To trace one run end-to-end, pivot on the **job id**: `{app="mill"} | json | job="job_xxxx"`
+  in Loki shows every node's `[<node>] running/succeeded/failed (…ms)` line + errors, in order —
+  the same per-node events the UI streams over SSE (`GET /api/jobs/:id/events`). A Grafana Explore
+  split (Prometheus latency panel ↔ Loki job logs) covers what a trace would, keyed on the job id.
+- **Traces (Tempo) — roadmap.** The intended shape: one run = one trace, each node = a span, via
+  OTel. The telemetry layer is a thin wrapper (`packages/telemetry`) designed for a drop-in
+  pino + OpenTelemetry swap; wiring OTel exporters there + emitting a span per node is the future
+  work to light up Tempo. Until then, use the job-id correlation above.
 
 ## Security note
 

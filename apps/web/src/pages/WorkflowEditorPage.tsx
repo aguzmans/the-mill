@@ -194,6 +194,12 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
     })),
   );
   const [exclusive, setExclusive] = useState<boolean>(workflow.exclusive ?? false);
+  // The manual Run button is only meaningful when the workflow declares a `manual` trigger.
+  // Webhook/cron/event-only jobs run via their endpoint/schedule — surface that instead.
+  const hasManualTrigger = triggers.some((t) => t.type === "manual");
+  const nonManualBy = triggers.find((t) => t.type === "webhook") ? "webhook — POST to its endpoint (Triggers panel)"
+    : triggers.find((t) => t.type === "cron") ? `cron schedule (${triggers.find((t) => t.type === "cron")?.schedule || "…"})`
+    : triggers.find((t) => t.type === "event") ? "an event" : "no trigger — add one";
   const [inputSchema, setInputSchema] = useState<string>(workflow.inputSchema ?? "");
   const dropCounter = useRef(0);
   const { toast, flash } = useToast();
@@ -518,10 +524,14 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
           )}
         </div>
         <div className="flex items-center gap-2">
-          <Tip text="Run this workflow now with the input payload below. Nodes execute in isolated workers; status and logs stream live.">
-            <button className="btn-primary" data-testid="run-btn" onClick={run} disabled={running}>
-              <Play className="h-4 w-4" /> {running ? "Running…" : "Run"}
-            </button>
+          <Tip text={(!LIVE || hasManualTrigger)
+            ? "Run this workflow now with the input payload below. Nodes execute in isolated workers; status and logs stream live."
+            : `Runs via ${nonManualBy}. Add a manual trigger to run it here with a test payload.`}>
+            <span>
+              <button className="btn-primary disabled:opacity-40 disabled:cursor-not-allowed" data-testid="run-btn" onClick={run} disabled={running || (LIVE && !hasManualTrigger)}>
+                <Play className="h-4 w-4" /> {running ? "Running…" : "Run"}
+              </button>
+            </span>
           </Tip>
           {running && runJobId && LIVE && (
             <Tip text="Politely stop the run: the current node finishes, then it stops at the next boundary and records as cancelled.">
@@ -619,6 +629,12 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
             <InfoTip text="Per-node execution status for the latest run. Updates live over WebSocket (Redis pub/sub) in the real app." />
             {runResult && <span data-testid="run-result" data-status={runResult}><StatusPill status={runResult} /></span>}
           </div>
+          {LIVE && !hasManualTrigger && (
+            <div className="mt-3 flex items-start gap-2 rounded-lg border border-white/10 bg-ink-950/40 px-3 py-2 text-[11px] text-slate-400" data-testid="run-trigger-note">
+              <Webhook className="mt-0.5 h-3.5 w-3.5 shrink-0 text-brand-400" />
+              <span>This workflow runs via <span className="text-slate-200">{nonManualBy}</span> — it isn't run by hand. The input below is only used if you add a <span className="font-medium">manual</span> trigger.</span>
+            </div>
+          )}
           <label className="mt-3 block">
             <div className="mb-1 flex items-center gap-1.5 text-xs text-slate-400">
               <Hand className="h-3.5 w-3.5" /> Manual input (JSON)

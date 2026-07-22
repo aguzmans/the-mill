@@ -50,7 +50,7 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", redac
 
 // Reaper: requeue in-flight jobs of workers whose heartbeat expired (crash recovery).
 setInterval(() => {
-  q.reapDead().then((n) => { if (n) console.log(`reaper: requeued ${n} orphaned job(s) from dead worker(s)`); }).catch(() => {});
+  q.reapDead().then((n) => { if (n) { console.log(`reaper: requeued ${n} orphaned job(s) from dead worker(s)`); q.metricInc("jobs_reaped_total", n).catch(() => {}); } }).catch(() => {});
 }, 5000);
 
 let repoState: RepoState | null = null;
@@ -554,6 +554,9 @@ api.get("/metrics", async (c) => {
   counterFamily("mill_dispatch_skipped_total", "Triggers skipped because the workflow won't compile", "dispatch_skipped:", "reason", (k) => k.slice("dispatch_skipped:".length));
   if (counters["retries_total"]) { help("mill_retries_total", "Run-level retries", "counter"); lines.push(`mill_retries_total ${num(counters["retries_total"])}`); }
   if (counters["ingress_auth_failures_total"]) { help("mill_ingress_auth_failures_total", "Ingress bearer auth failures", "counter"); lines.push(`mill_ingress_auth_failures_total ${num(counters["ingress_auth_failures_total"])}`); }
+  // Orphaned-job recovery — a non-zero rate means workers are crashing/restarting mid-job.
+  if (counters["jobs_reclaimed_total"]) { help("mill_jobs_reclaimed_total", "Jobs a restarted worker reclaimed from its own processing list (same-id restart)", "counter"); lines.push(`mill_jobs_reclaimed_total ${num(counters["jobs_reclaimed_total"])}`); }
+  if (counters["jobs_reaped_total"]) { help("mill_jobs_reaped_total", "Jobs the reaper requeued from workers whose heartbeat expired (crash)", "counter"); lines.push(`mill_jobs_reaped_total ${num(counters["jobs_reaped_total"])}`); }
 
   // ── histograms (cumulative buckets + _sum + _count → real p50/p95/p99 in Prometheus) ──
   const histogram = (metric: string, h: string, name: string) => {

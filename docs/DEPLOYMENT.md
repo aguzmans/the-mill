@@ -71,7 +71,7 @@ have no safe default.
 | `MILL_PAUSE_PCT` / `MILL_RESUME_PCT` | | `85` / `70` | | Load-shed thresholds. |
 | `MILL_JOB_WALL_MS` | | `0` (off) | | Hard per-run wall-clock cap. A run exceeding it is failed and the worker slot freed — a backstop for a node that blocks forever (e.g. a `fetch` with no timeout). `0` = no limit. |
 | `MILL_WORKER_ID` | | hostname | | Registry id — **must be unique per pod** (the worker keys its heartbeat + processing list on it; it derives a distinct id from the pod-name suffix, so inject the pod name via `fieldRef: metadata.name`). |
-| `MILL_BUNDLE_DIR` | | `$HOME/mill-bundles` (`/tmp/…`) | | Where the worker materializes project bundles fetched from Redis. Keep it on the pod's `tmpfs`/`emptyDir` — never a shared volume. |
+| `MILL_BUNDLE_DIR` | | `$HOME/mill-bundles` | | Where the worker materializes bundles fetched from Redis. **Must be writable** — on a `readOnlyRootFilesystem` pod the default `$HOME` (`/root`) is **not**, so mount an `emptyDir` and set this (or `HOME`) to it, else every run fails `EROFS … mkdir`. Keep it per-pod ephemeral (`emptyDir`/`tmpfs`) — never a shared volume. |
 | `MILL_JOB_TTL_SECONDS` | | `604800` | | Redis key TTL — **must match the controller** (§ Redis retention). |
 | `MILL_STD_REGISTRY` | | — | | Base URL for `std://…@ver` remote callScript bundles — needed wherever the workflow runs (same value as the controller). |
 | `MILL_REMOTE_CACHE` | | `$TMPDIR/mill-remote` | | Local cache dir for fetched `std://` bundles — keep on the pod's `tmpfs`. |
@@ -590,3 +590,25 @@ deployment. Confirm the nav badge reads **Live** (not Prototype).
 **`… requires a git-backed workspace (PROJECT_REPO)`** on Save/Delete/New Project — the
 controller is running in **dir mode** (no `PROJECT_REPO` set), which is read-only from a
 mounted folder. Set `PROJECT_REPO` (+ PVC at `WORKDIR`) to enable git-backed writes.
+
+**Every run fails immediately with `EROFS: read-only file system, mkdir '/root/mill-bundles'`
+(or `…/tmp/mill-bundles`)** — the **worker has no writable scratch dir**. Workers fetch each
+job's project bundle from Redis and materialize it under `$MILL_BUNDLE_DIR` (default
+`$HOME/mill-bundles`) before running; on a `readOnlyRootFilesystem` pod that path isn't
+writable. Fix on the **worker** Deployment (see the §4 Worker manifest — this is the
+volume-free-but-`/tmp`-writable shape):
+- mount an **`emptyDir` at `/tmp`** (or any writable path), and
+- point the bundle dir there — set `HOME=/tmp` (so it becomes `/tmp/mill-bundles`) **or**
+  `MILL_BUNDLE_DIR=<the mounted path>`.
+
+Keep `readOnlyRootFilesystem: true`; you only need the one small `emptyDir`. **No PVC, no
+shared volume** — it's per-pod ephemeral scratch. Failing fast with this clear error (instead
+of hanging) is the intended behaviour once the worker try/catch ships — the job is marked
+`failed` with the message above, and `mill_jobs_failed_total{reason="workflow_not_found"}` will
+also move.
+
+**A run fails with `… request timed out after 10000ms`** — a node's outbound `fetch` (e.g. to
+Acuity or an internal service) was blocked for its timeout window. Almost always **worker
+egress**: the pod can reach Redis but not that host. Allow the egress (NetworkPolicy / egress
+rules) for the workers, not just the controller. The timeout is deliberate — it fails the job
+cleanly instead of hanging a worker slot forever.

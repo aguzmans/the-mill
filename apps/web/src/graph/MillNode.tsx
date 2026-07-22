@@ -35,6 +35,31 @@ export function KindIcon({ kind, className }: { kind: NodeKind; className?: stri
   }
 }
 
+/** Human label per kind — used for the type-chip tooltip. */
+export const kindLabel: Record<NodeKind, string> = {
+  start: "Start / trigger",
+  jscode: "JavaScript step",
+  if: "Branch (if)",
+  callScript: "Call script",
+  loop: "Loop (for each)",
+  fanout: "Fan-out (parallel)",
+  end: "End",
+};
+
+/** The type indicator: an accent-colored chip holding the kind's icon. Stays constant
+ *  regardless of run status so a step's *type* is always readable at a glance. */
+export function TypeChip({ kind, className }: { kind: NodeKind; className?: string }) {
+  const accent = kindAccent[kind];
+  return (
+    <span
+      title={kindLabel[kind]}
+      className={`grid ${className ?? "h-6 w-6"} shrink-0 place-items-center rounded-md border ${accent.border} ${accent.bg} ${accent.text}`}
+    >
+      <KindIcon kind={kind} />
+    </span>
+  );
+}
+
 function StatusIcon({ status }: { status: NodeStatus }) {
   if (status === "running") return <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-300" />;
   if (status === "succeeded") return <CheckCircle2 className="h-3.5 w-3.5 text-emerald-300" />;
@@ -52,7 +77,12 @@ export function MillNode({ data, selected }: NodeProps) {
   const accent = kindAccent[kind];
   const label = data.label as string;
   const running = status !== "idle";
-  const icon = running ? <StatusIcon status={status} /> : <span className={accent.text}><KindIcon kind={kind} /></span>;
+  // Type identity (chip) is constant; run status shows as a small glyph on the right.
+  const typeChip = <TypeChip kind={kind} />;
+  const statusGlyph = running ? <StatusIcon status={status} /> : null;
+  // Solid accent stripe down the left edge — a per-type color that survives the running
+  // state (unlike the outer border, which flips to the status ring while a job executes).
+  const stripe = <span className={`pointer-events-none absolute left-0 top-0 h-full w-1 rounded-l-xl ${accent.dot}`} />;
   const ringSel = selected ? "ring-2 ring-brand-500" : "";
 
   // start / end — compact pills with a single handle.
@@ -62,11 +92,12 @@ export function MillNode({ data, selected }: NodeProps) {
         data-testid={`node-${data.nodeKey}`}
         data-status={status}
         data-kind={kind}
-        className={`flex w-28 items-center gap-2 rounded-full border ${accent.border} ${accent.bg} px-3 py-2 shadow-lg shadow-black/30 ${statusRing[status]} ${ringSel}`}
+        className={`flex w-32 items-center gap-2 rounded-full border ${accent.border} ${accent.bg} px-3 py-2 shadow-lg shadow-black/30 ${statusRing[status]} ${ringSel}`}
       >
         {kind === "end" && targetHandle}
-        {icon}
+        {typeChip}
         <span className="text-sm font-medium text-white">{label}</span>
+        {statusGlyph ? <span className="ml-auto">{statusGlyph}</span> : null}
         {kind === "start" && sourceHandle}
       </div>
     );
@@ -79,12 +110,14 @@ export function MillNode({ data, selected }: NodeProps) {
         data-testid={`node-${data.nodeKey}`}
         data-status={status}
         data-kind={kind}
-        className={`relative w-44 rounded-xl border ${accent.border} bg-ink-800/95 px-3 py-2.5 shadow-lg shadow-black/30 ${statusRing[status]} ${ringSel}`}
+        className={`relative w-44 rounded-xl border ${accent.border} bg-ink-800/95 pl-4 pr-3 py-2.5 shadow-lg shadow-black/30 ${statusRing[status]} ${ringSel}`}
       >
+        {stripe}
         {targetHandle}
         <div className="flex items-center gap-2">
-          {icon}
+          {typeChip}
           <span className="truncate text-sm font-medium text-white">{label}</span>
+          {statusGlyph ? <span className="ml-auto">{statusGlyph}</span> : null}
         </div>
         {data.condition ? <div className="mt-1 truncate font-mono text-[10px] text-amber-200/80">if ({data.condition as string})</div> : null}
         <Handle id="true" type="source" position={Position.Bottom} style={{ left: "38%" }} className="!h-2 !w-2 !border-0 !bg-emerald-400" />
@@ -102,14 +135,16 @@ export function MillNode({ data, selected }: NodeProps) {
       data-testid={`node-${data.nodeKey}`}
       data-status={status}
       data-kind={kind}
-      className={`w-48 rounded-xl border bg-ink-800/95 px-3 py-2.5 shadow-lg shadow-black/30 transition-colors ${
+      className={`relative w-48 rounded-xl border bg-ink-800/95 pl-4 pr-3 py-2.5 shadow-lg shadow-black/30 transition-colors ${
         running ? statusRing[status] : accent.border
       } ${ringSel}`}
     >
+      {stripe}
       {targetHandle}
       <div className="flex items-center gap-2">
-        {icon}
+        {typeChip}
         <span className="truncate text-sm font-medium text-white">{label}</span>
+        {statusGlyph ? <span className="ml-auto">{statusGlyph}</span> : null}
       </div>
       {kind === "jscode" && data.filename ? (
         <div className="mt-1 truncate font-mono text-[10px] text-slate-500">{data.filename as string}</div>

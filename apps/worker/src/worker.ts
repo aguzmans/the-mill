@@ -142,7 +142,7 @@ async function loop() {
   // Reclaim jobs orphaned in this pod's own processing list by a previous crash/restart (same
   // pod name → same id, so the reaper won't touch it). Requeued jobs resume via their journal.
   const reclaimed = await q.requeueOwn(workerId).catch(() => 0);
-  if (reclaimed) log.info("reclaimed orphaned jobs on startup", { workerId, reclaimed });
+  if (reclaimed) { log.info("reclaimed orphaned jobs on startup", { workerId, reclaimed }); q.metricInc("jobs_reclaimed_total", reclaimed).catch(() => {}); }
   await beat();
   while (true) {
     // Reactive gate: pause pulling above the memory threshold (never below min).
