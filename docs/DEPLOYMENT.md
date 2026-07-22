@@ -47,6 +47,7 @@ have no safe default.
 | `PORT` | | `8080` | | HTTP port. |
 | `RECONCILE_INTERVAL_MS` | | `15000` | | Reconcile loop period. |
 | `MILL_AUTOSYNC` | | `true` | | `false` → validate but **hold** new revisions (manual Sync applies). |
+| `MILL_CRON_TZ` | | `UTC` | | IANA timezone cron schedules fire in (e.g. `Asia/Singapore`). Default UTC — matches the editor's next-run preview. |
 | `MILL_INGRESS_TOKEN` | | — | 🔒 | Global bearer for `/p` webhook endpoints (or use per-project tokens). |
 | `MILL_GIT_WEBHOOK_SECRET` | | — | 🔒 | HMAC secret for the `POST /git/webhook` push hook. When set, the controller verifies `X-Hub-Signature-256` and reconciles instantly on push (instead of waiting for the poll). Set the same secret in the GitHub webhook. |
 | `MILL_ADMIN_TOKEN` | | — | 🔒 | If set, all `/api/*` require this bearer (except `/api/health`, `/api/metrics`). Defense-in-depth; also locks the UI — usually leave unset and auth at the Ingress. |

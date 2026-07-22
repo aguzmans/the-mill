@@ -27,7 +27,10 @@ export class TriggerEngine {
     for (const t of triggers) {
       if (t.type === "cron" && t.schedule) {
         try {
-          this.crons.push(new Cron(t.schedule, () => this.onFire(t, {})));
+          // Pin the schedule's timezone (default UTC) so fire times are deterministic regardless
+          // of the container's TZ — and so the editor's next-run preview (computed in UTC) matches
+          // exactly what runs. Override per-deployment with MILL_CRON_TZ (an IANA zone).
+          this.crons.push(new Cron(t.schedule, { timezone: process.env.MILL_CRON_TZ || "UTC" }, () => this.onFire(t, {})));
         } catch (e) {
           console.error(`bad cron '${t.schedule}' for ${t.project}/${t.workflow}:`, e instanceof Error ? e.message : e);
         }

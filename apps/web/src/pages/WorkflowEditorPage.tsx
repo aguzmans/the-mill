@@ -7,9 +7,10 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft, Play, Save, Download, GitCommitHorizontal, Terminal, Boxes, Clock, Webhook, Hand, Zap,
-  Copy, ShieldCheck, KeyRound, Cpu, History, RotateCcw, AreaChart, GitPullRequest, GitBranch, Flag, Split, Plus, Trash2, XCircle,
+  Copy, ShieldCheck, KeyRound, Cpu, History, RotateCcw, AreaChart, GitPullRequest, GitBranch, Flag, Split, Plus, Trash2, XCircle, AlertCircle, CheckCircle2,
 } from "lucide-react";
 import { findWorkflow, NODE_KINDS, compileCondition, type NodeStatus, type NodeKind, type WorkflowNode, type WorkflowEdge, type RunRecord, type Workflow, type IfClause } from "../lib/mock";
+import { cronError, nextRuns, untilLabel, CRON_PRESETS } from "../lib/cron";
 import { nodeTypes, KindIcon, kindAccent } from "../graph/MillNode";
 import { resolvePosition, deoverlap } from "../graph/layout";
 import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
@@ -197,6 +198,9 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
   // The manual Run button is only meaningful when the workflow declares a `manual` trigger.
   // Webhook/cron/event-only jobs run via their endpoint/schedule — surface that instead.
   const hasManualTrigger = triggers.some((t) => t.type === "manual");
+  // Block Save while any cron trigger's schedule is invalid — the reconciler would otherwise
+  // silently drop it. Validated with the same engine (croner) the controller schedules with.
+  const cronInvalid = triggers.some((t) => t.type === "cron" && cronError(t.schedule ?? "") !== null);
   const nonManualBy = triggers.find((t) => t.type === "webhook") ? "webhook — POST to its endpoint (Triggers panel)"
     : triggers.find((t) => t.type === "cron") ? `cron schedule (${triggers.find((t) => t.type === "cron")?.schedule || "…"})`
     : triggers.find((t) => t.type === "event") ? "an event" : "no trigger — add one";
@@ -402,6 +406,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
   }, [nodes, edges, workflow, triggers, exclusive, inputSchema]);
 
   const doSave = useCallback(async () => {
+    if (cronInvalid) { flash("Can't save — a cron trigger has an invalid schedule"); return; }
     if (!LIVE) { setShowCommit(false); flash(`Committed to ${project.branch} · reconcile queued`); return; }
     setSaving(true);
     try {
@@ -417,7 +422,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
     } finally {
       setSaving(false);
     }
-  }, [serialize, project, workflow, commitMsg, flash]);
+  }, [serialize, project, workflow, commitMsg, flash, cronInvalid]);
 
   const addLog = (line: string) => setLogs((l) => [...l, line]);
   // The node designated to fail on a Degraded run (the last failed run's offending node).
@@ -541,10 +546,12 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               </button>
             </Tip>
           )}
-          <Tip text="Save commits workflow.yaml + node .js back to the git repo. The reconciler then syncs running state.">
-            <button className="btn-ghost" data-testid="save-btn" onClick={() => setShowCommit(true)}>
-              <Save className="h-4 w-4" /> Save
-            </button>
+          <Tip text={cronInvalid ? "Fix the invalid cron schedule (Triggers panel) before saving." : "Save commits workflow.yaml + node .js back to the git repo. The reconciler then syncs running state."}>
+            <span>
+              <button className="btn-ghost disabled:opacity-40 disabled:cursor-not-allowed" data-testid="save-btn" onClick={() => setShowCommit(true)} disabled={cronInvalid}>
+                <Save className="h-4 w-4" /> Save
+              </button>
+            </span>
           </Tip>
           <Tip text="Export this project as a standalone, runnable JS bundle (.tar.gz). A workflow can call its siblings, so the whole project is the unit; run.sh <workflow> runs a specific one.">
             <button className="btn-ghost" data-testid="export-workflow-btn" onClick={() => {
@@ -740,7 +747,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               className="btn-primary"
               data-testid="commit-submit"
               onClick={doSave}
-              disabled={saving}
+              disabled={saving || cronInvalid}
             >
               <GitCommitHorizontal className="h-4 w-4" /> {saving ? "Committing…" : "Commit"}
             </button>
@@ -1324,6 +1331,59 @@ function TriggerIcon({ type }: { type: string }) {
   return type === "cron" ? <Clock className="h-3.5 w-3.5" /> : type === "webhook" ? <Webhook className="h-3.5 w-3.5" /> : type === "event" ? <Zap className="h-3.5 w-3.5" /> : <Hand className="h-3.5 w-3.5" />;
 }
 
+// Cron sub-editor: quick-pick presets, live validation, and a preview of the next N fire times
+// (croner — the same engine the controller schedules with, so this preview == reality on Save).
+function CronEditor({ value, onChange, index }: { value: string; onChange: (v: string) => void; index: number }) {
+  const [showAll, setShowAll] = useState(false);
+  const err = cronError(value);
+  const runs = err ? [] : nextRuns(value, showAll ? 10 : 5);
+  // Render in UTC to match the controller's schedule exactly (see nextRuns). A user in another
+  // timezone thus sees the true fire time, not a locally-shifted one.
+  const fmt = (d: Date) => d.toLocaleString(undefined, { timeZone: "UTC", weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+  return (
+    <div className="mt-2 space-y-1.5 pl-6" data-testid={`cron-editor-${index}`}>
+      <div className="flex flex-wrap gap-1">
+        {CRON_PRESETS.map((p) => (
+          <button
+            key={p.value}
+            type="button"
+            title={p.value}
+            onClick={() => onChange(p.value)}
+            className={`chip text-[10px] ${value.trim() === p.value ? "bg-brand-500/20 text-brand-200" : "bg-white/5 text-slate-400 hover:text-slate-200"}`}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+      {err ? (
+        <div className="flex items-start gap-1.5 text-[11px] text-rose-300" data-testid={`cron-error-${index}`}>
+          <AlertCircle className="mt-px h-3 w-3 shrink-0" />
+          <span>{err}</span>
+        </div>
+      ) : (
+        <div data-testid={`cron-preview-${index}`}>
+          <div className="flex items-center gap-1.5 text-[10px] text-emerald-300/90">
+            <CheckCircle2 className="h-3 w-3" />
+            <span>Next {runs.length} run{runs.length === 1 ? "" : "s"} · times in UTC (the controller's timezone)</span>
+          </div>
+          <ul className="mt-1 space-y-0.5">
+            {runs.map((d, k) => (
+              <li key={k} className="flex items-center gap-2 font-mono text-[11px] text-slate-300">
+                <Clock className="h-3 w-3 shrink-0 text-slate-500" />
+                <span className="tabular-nums">{fmt(d)} UTC</span>
+                <span className="text-slate-500">· {untilLabel(d)}</span>
+              </li>
+            ))}
+          </ul>
+          <button type="button" className="mt-1 text-[10px] text-brand-300 hover:text-brand-200" onClick={() => setShowAll((s) => !s)} data-testid={`cron-toggle-${index}`}>
+            {showAll ? "show next 5" : "show next 10"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, inputSchema, setInputSchema, workflow, projectId, publicBaseUrl, onCopy }: { triggers: EditTrigger[]; setTriggers: (t: EditTrigger[]) => void; exclusive: boolean; setExclusive: (v: boolean) => void; inputSchema: string; setInputSchema: (v: string) => void; workflow: string; projectId: string; publicBaseUrl?: string | null; onCopy: (url: string) => void }) {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const base = publicBaseUrl || origin; // public /p ingress host if configured, else this origin
@@ -1352,8 +1412,8 @@ function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, inputSc
               </select>
               {t.type === "cron" && (
                 <>
-                  <input className="inp !py-1 flex-1 font-mono text-[11px]" data-testid={`trigger-schedule-${i}`} placeholder="* * * * *  (e.g. 0 9 * * 1-5)" value={t.schedule ?? ""} onChange={(e) => update(i, { schedule: e.target.value })} />
-                  <InfoTip text="Standard cron (min hour dom mon dow), or a 6-field with seconds. e.g. '*/30 * * * * *' = every 30s." />
+                  <input className={`inp !py-1 flex-1 font-mono text-[11px] ${cronError(t.schedule ?? "") ? "!border-rose-500/60 focus:!border-rose-500" : (t.schedule ?? "").trim() ? "!border-emerald-500/40" : ""}`} data-testid={`trigger-schedule-${i}`} placeholder="* * * * *  (e.g. 0 9 * * 1-5)" value={t.schedule ?? ""} onChange={(e) => update(i, { schedule: e.target.value })} spellCheck={false} />
+                  <InfoTip text="Standard cron (min hour dom mon dow), or a 6-field with seconds. e.g. '*/30 * * * * *' = every 30s. Fires in the controller's timezone (UTC on staging)." />
                 </>
               )}
               {t.type === "webhook" && (
@@ -1361,6 +1421,7 @@ function TriggersPanel({ triggers, setTriggers, exclusive, setExclusive, inputSc
               )}
               <button type="button" className="rounded p-1 text-slate-500 hover:text-rose-300" data-testid={`trigger-remove-${i}`} onClick={() => remove(i)} title="Remove trigger"><Trash2 className="h-3.5 w-3.5" /></button>
             </div>
+            {t.type === "cron" && <CronEditor value={t.schedule ?? ""} onChange={(v) => update(i, { schedule: v })} index={i} />}
             {t.type === "webhook" && (
               <div className="mt-1.5 flex items-center gap-2 pl-6">
                 <span className={`chip shrink-0 ${isPublic(t) ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-500/15 text-slate-400"}`}>{isPublic(t) ? "no token" : "bearer"}</span>

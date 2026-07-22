@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { Cron } from "croner";
 
 // The Mill project/workflow file format — the single source of truth (no DB).
 // Types are inferred from these schemas so the schema and the types never drift.
@@ -56,12 +57,30 @@ export const workflowEdge = z.object({
   branch: z.enum(["true", "false"]).optional(), // required on edges leaving an `if`
 });
 
-export const trigger = z.object({
-  type: z.enum(["cron", "webhook", "manual", "event"]),
-  schedule: z.string().optional(),
-  path: z.string().optional(),
-  concurrencyPolicy: z.enum(["Allow", "Forbid", "Replace"]).optional(),
-});
+export const trigger = z
+  .object({
+    type: z.enum(["cron", "webhook", "manual", "event"]),
+    schedule: z.string().optional(),
+    path: z.string().optional(),
+    concurrencyPolicy: z.enum(["Allow", "Forbid", "Replace"]).optional(),
+  })
+  // A cron trigger MUST carry a valid schedule. Validate with croner (the same engine that
+  // schedules it) so a malformed expression is rejected at parse time — otherwise the
+  // TriggerEngine would silently drop it and the workflow would just never fire.
+  .superRefine((t, ctx) => {
+    if (t.type !== "cron") return;
+    const s = (t.schedule ?? "").trim();
+    if (!s) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "a cron trigger requires a `schedule`", path: ["schedule"] });
+      return;
+    }
+    try {
+      const c = new Cron(s);
+      if (!c.nextRun()) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `cron '${s}' has valid syntax but never fires`, path: ["schedule"] });
+    } catch (e) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `invalid cron schedule '${s}': ${e instanceof Error ? e.message.replace(/^CronPattern:\s*/i, "") : String(e)}`, path: ["schedule"] });
+    }
+  });
 
 export const workflowDef = z.object({
   apiVersion: z.literal("mill/v1"),
