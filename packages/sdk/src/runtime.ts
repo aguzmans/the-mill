@@ -20,6 +20,9 @@ export interface ExecuteDeps {
   onNodeDone?: (key: string, output: unknown) => void;
   /** Originating HTTP request for webhook runs — exposed on every node's ctx.request. */
   request?: import("./ctx").RequestCtx;
+  /** Cooperative cancellation — checked at each node boundary. Return true to stop the run
+   *  gracefully (a `cancel` request from the API). Nodes already running finish first. */
+  shouldCancel?: () => boolean | Promise<boolean>;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -34,6 +37,15 @@ export class WorkflowError extends Error {
   constructor(public node: string, public override cause: unknown, public statuses: Record<string, NodeStatus> = {}) {
     super(`node '${node}' failed: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = "WorkflowError";
+  }
+}
+
+/** Thrown when a run is cancelled at a node boundary (a `cancel` request). Carries the statuses
+ *  so the run records which nodes finished before the stop. */
+export class CancelledError extends Error {
+  constructor(public node: string, public statuses: Record<string, NodeStatus> = {}) {
+    super(`run cancelled at node '${node}'`);
+    this.name = "CancelledError";
   }
 }
 
@@ -94,6 +106,8 @@ export async function executePlan(plan: ExecPlan, deps: ExecuteDeps): Promise<Ru
   for (const key of plan.order) {
     const node = plan.nodes[key];
     if (!node) continue;
+    // Cooperative cancellation: stop cleanly at this node boundary if a cancel was requested.
+    if (await deps.shouldCancel?.()) throw new CancelledError(key, statuses);
     const runnable = key === plan.startKey || (activated.get(key)?.size ?? 0) > 0;
     if (!runnable) {
       statuses[key] = "skipped";

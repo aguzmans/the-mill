@@ -12,6 +12,9 @@ const WF = "capcheck";
 const SECRET = `E2E_SECRET_${stamp.toUpperCase()}`;
 const CAP = `${stamp}${"a1b2c3d4e5f6a7b8c9d0e1f2".slice(0, 32)}`; // >=24 chars → capability path
 
+// Clean up the project this suite creates, even on mid-suite failure — no leaked `sec-*` projects.
+test.afterAll(async () => { await fetch(`${BASE}/api/projects/${PID}`, { method: "DELETE" }).catch(() => {}); });
+
 test.describe.serial("secrets store + capability-URL auth (live)", () => {
   test("a secret can be set and listed (masked — value never returned)", async ({ request }) => {
     const put = await request.put(`${BASE}/api/secrets/${SECRET}`, { data: { value: "s3cr3t-value" } });

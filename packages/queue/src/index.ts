@@ -6,7 +6,7 @@ import Redis from "ioredis";
 // end. The production swap is BullMQ (retries/backoff, repeatable-cron, stalled-job
 // recovery) behind this same seam — see ARCHITECTURE §3.4 / ROADMAP M2.
 
-export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "superseded";
+export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "superseded" | "cancelled";
 
 export interface JobSpec {
   id: string;
@@ -216,6 +216,11 @@ export class MillQueue {
     await this.redis.hset(this.key("job", id), { status, ...extra });
   }
 
+  /** Request a cooperative cancel: the worker running this job stops at its next node boundary
+   *  and records it as `cancelled`. Safe to call on any job (no-op if it isn't running). */
+  async requestCancel(id: string): Promise<void> { await this.redis.hset(this.key("job", id), { cancelRequested: "1" }); }
+  async isCancelRequested(id: string): Promise<boolean> { return (await this.redis.hget(this.key("job", id), "cancelRequested")) === "1"; }
+
   /**
    * Requeue any jobs still in THIS worker's processing list — leftovers from a previous life of
    * the same-named pod. A container restart keeps the worker id, so `reapDead` (which only
@@ -261,7 +266,7 @@ export class MillQueue {
     const now = Date.now();
     const j = await this.getJob(id);
     await this.redis.hset(this.key("job", id), { status, finishedAt: now.toString(), ...extra });
-    if (status === "succeeded" || status === "failed") {
+    if (status === "succeeded" || status === "failed" || status === "cancelled") {
       const createdAt = Number(j.createdAt || now);
       const startedAt = Number(j.startedAt || createdAt);
       const rec: CompletionRecord = {

@@ -1,5 +1,5 @@
 import { buildPlan } from "@mill/compiler";
-import { executePlan, makeCtx, checkSchema, WorkflowError, type RunEvent, type Ctx, type NodeFn } from "@mill/sdk";
+import { executePlan, makeCtx, checkSchema, WorkflowError, CancelledError, type RunEvent, type Ctx, type NodeFn } from "@mill/sdk";
 import { loadWorkflow, loadNodeFn, resolveCallTarget } from "@mill/projectfs";
 import type { CallTarget, Limits, PlanNode } from "@mill/core";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -56,7 +56,7 @@ export interface Job {
 }
 
 export interface ExecResult {
-  status: "succeeded" | "failed";
+  status: "succeeded" | "failed" | "cancelled";
   result?: unknown;
   error?: string;
   events: RunEvent[];
@@ -75,6 +75,7 @@ export interface RunHooks {
   journal?: Record<string, unknown>;
   onNodeDone?: (key: string, output: unknown) => void;
   request?: import("@mill/sdk").RequestCtx;
+  shouldCancel?: () => boolean | Promise<boolean>;
 }
 
 /** Load → compile → execute a workflow in-process, recursing for callScript. */
@@ -86,6 +87,9 @@ export async function runWorkflow(job: Job, onEvent?: (e: RunEvent) => void, hoo
     const { result, statuses } = await runOne(job.projectDir, job.workflow, job.input, job.secrets ?? {}, sink, job.revision, { ...hooks, request: job.request });
     return { status: "succeeded", result, statuses, events, ms: Math.round(performance.now() - t0) };
   } catch (err) {
+    if (err instanceof CancelledError) {
+      return { status: "cancelled", error: err.message, statuses: err.statuses, events, ms: Math.round(performance.now() - t0) };
+    }
     const statuses = err instanceof WorkflowError ? err.statuses : undefined;
     return { status: "failed", error: err instanceof Error ? err.message : String(err), statuses, events, ms: Math.round(performance.now() - t0) };
   }
@@ -116,6 +120,7 @@ async function runOne(
     journal: hooks?.journal,
     onNodeDone: hooks?.onNodeDone,
     request: hooks?.request, // ctx.request on the top-level workflow's nodes
+    shouldCancel: hooks?.shouldCancel, // cooperative cancel at each node boundary
   });
   return { result: r.result, statuses: r.statuses };
 }

@@ -43,6 +43,7 @@ have no safe default.
 | `GIT_TOKEN` | ✅* | — | 🔒 | Git credential (GitHub PAT/deploy token) for a private repo. |
 | `REDIS_URL` | ✅ | — | | e.g. `redis://mill-redis:6379`. |
 | `WORKDIR` | | `/app/workdir` | | Working-copy path — **mount the PVC here** (**controller only**; workers need no workdir — they fetch bundles from Redis). |
+| `PROJECTS_DIR` | | `/projects` | | **Dir-mode only** — used *instead* of git when `PROJECT_REPO` is unset (read projects from this local path, no reconcile/Save). Git-backed is the norm; leave unset in prod. |
 | `PORT` | | `8080` | | HTTP port. |
 | `RECONCILE_INTERVAL_MS` | | `15000` | | Reconcile loop period. |
 | `MILL_AUTOSYNC` | | `true` | | `false` → validate but **hold** new revisions (manual Sync applies). |
@@ -55,27 +56,34 @@ have no safe default.
 | `MILL_SECRETS` | | `{}` | 🔒 | Node secrets available to the controller's step-tester (same bag as the worker). |
 | `MILL_SECRETS_KEY` | | — | 🔒 | Encrypts the Redis-backed **runtime secret store** (UI-managed) at rest (AES-256-GCM). Set the **same value on the api and every worker**. Unset → values stored plaintext in Redis (dev only). |
 | `MILL_LOG_LEVEL` / `MILL_LOG_FORMAT` | | `info` / auto | | `debug…error`; `json` forces JSON logs. |
+| `MILL_JOB_TTL_SECONDS` | | `604800` | | Redis TTL for jobs / events / journal / **project bundles** — see [§ Redis retention](#redis--persistence-retention--sizing). **Set the same value on the worker.** |
+| `MILL_COMPLETED_MAX` | | `5000` | | Rolling cap on the dashboard completed-runs list — see [§ Redis retention](#redis--persistence-retention--sizing). |
 | _`<project ingress tokens>`_ | | — | 🔒 | Any env named by a project's `ingress.tokenEnv` (e.g. `PAYMENTS_INGRESS_TOKEN`). |
 
-\* `GIT_TOKEN` required only for private repos.
+\* `GIT_TOKEN` required only for private repos. (`MILL_VERBOSE` exists but only affects a *standalone exported* bundle's run — not a controller/worker deploy var.)
 
 ### Worker
 | Env | Req | Default | Secret? | Purpose |
 |---|---|---|---|---|
 | `REDIS_URL` | ✅ | — | | Same Redis as the controller. |
-| `MILL_CONC_MIN` / `MILL_CONC_MAX` | | `1` / `8` | | Per-worker concurrency band. |
+| `MILL_CONC_MIN` / `MILL_CONC_MAX` | | `1` / `8` | | Per-worker concurrency band. (`MILL_CONCURRENCY` is a deprecated alias for `MILL_CONC_MAX`.) |
 | `MILL_MEM_MAX_MB` | | `1024` | | Memory ceiling the worker sizes admission against — **set to the pod memory limit**. |
 | `MILL_PAUSE_PCT` / `MILL_RESUME_PCT` | | `85` / `70` | | Load-shed thresholds. |
+| `MILL_JOB_WALL_MS` | | `0` (off) | | Hard per-run wall-clock cap. A run exceeding it is failed and the worker slot freed — a backstop for a node that blocks forever (e.g. a `fetch` with no timeout). `0` = no limit. |
 | `MILL_WORKER_ID` | | hostname | | Registry id — **must be unique per pod** (the worker keys its heartbeat + processing list on it; it derives a distinct id from the pod-name suffix, so inject the pod name via `fieldRef: metadata.name`). |
 | `MILL_BUNDLE_DIR` | | `$HOME/mill-bundles` (`/tmp/…`) | | Where the worker materializes project bundles fetched from Redis. Keep it on the pod's `tmpfs`/`emptyDir` — never a shared volume. |
+| `MILL_JOB_TTL_SECONDS` | | `604800` | | Redis key TTL — **must match the controller** (§ Redis retention). |
+| `MILL_STD_REGISTRY` | | — | | Base URL for `std://…@ver` remote callScript bundles — needed wherever the workflow runs (same value as the controller). |
+| `MILL_REMOTE_CACHE` | | `$TMPDIR/mill-remote` | | Local cache dir for fetched `std://` bundles — keep on the pod's `tmpfs`. |
 | `MILL_SECRETS` **and/or** individual secret env vars | | `{}` | 🔒 | **Node secrets** — see §3. |
 | `MILL_SECRETS_KEY` | | — | 🔒 | **Must match the controller's** so the worker can decrypt UI-managed secrets. |
-| `MILL_LOG_LEVEL` / `MILL_LOG_FORMAT` | | | | As above. |
+| `MILL_LOG_LEVEL` / `MILL_LOG_FORMAT` | | `info` / auto | | As above. |
 
 > **Isolation on k8s:** run the worker **in-process** (omit `MILL_EXECUTOR`). Pod-level
 > isolation + resource limits are the boundary; a per-workflow `K8sJobExecutor`
 > (pod-per-run, gVisor/Kata RuntimeClass) is the future opt-in for untrusted code. The
-> `MILL_EXECUTOR=docker` mode needs a Docker socket and is **not** for k8s.
+> `MILL_EXECUTOR=docker` mode (with `MILL_IMAGE` + `MILL_WORKDIR_VOLUME`) needs a Docker
+> socket and is a **local-only** dev trick — **not** for k8s; leave all three unset.
 >
 > The local `docker-compose.yml` **mirrors this**: `api` and `worker` are separate services
 > (workers never colocate with the api), the `worker` runs in-process and is hardened like a
@@ -246,6 +254,7 @@ data:
   MILL_AUTOSYNC: "true"
   MILL_LOG_FORMAT: "json"
   MILL_STD_REGISTRY: "https://mill-registry.internal"
+  MILL_PUBLIC_WEBHOOK_URL: "https://win-the-mill.example.com"   # public /p ingress origin (for webhook URLs the UI shows)
 ---
 apiVersion: v1
 kind: Secret

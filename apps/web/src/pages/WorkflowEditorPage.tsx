@@ -7,7 +7,7 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft, Play, Save, Download, GitCommitHorizontal, Terminal, Boxes, Clock, Webhook, Hand, Zap,
-  Copy, ShieldCheck, KeyRound, Cpu, History, RotateCcw, AreaChart, GitPullRequest, GitBranch, Flag, Split, Plus, Trash2,
+  Copy, ShieldCheck, KeyRound, Cpu, History, RotateCcw, AreaChart, GitPullRequest, GitBranch, Flag, Split, Plus, Trash2, XCircle,
 } from "lucide-react";
 import { findWorkflow, NODE_KINDS, compileCondition, type NodeStatus, type NodeKind, type WorkflowNode, type WorkflowEdge, type RunRecord, type Workflow, type IfClause } from "../lib/mock";
 import { nodeTypes, KindIcon, kindAccent } from "../graph/MillNode";
@@ -16,12 +16,13 @@ import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
 import { JsEditor } from "../components/JsEditor";
 import { InfoTip, Tip } from "../components/InfoTip";
 import { Modal, DiffRow, Spec, useToast, Toast } from "../components/Kit";
-import { LIVE, triggerRun, streamEvents, getJob, getWorkflowGraph, saveWorkflow, testNode, getRuns, retryRun, getTimeline, getStatus, getFleet, getEndpoints, type LiveGraph, type NodeTestResult, type LiveRun } from "../lib/api";
+import { LIVE, triggerRun, streamEvents, getJob, getWorkflowGraph, saveWorkflow, testNode, getRuns, retryRun, cancelRun, getTimeline, getStatus, getFleet, getEndpoints, type LiveGraph, type NodeTestResult, type LiveRun } from "../lib/api";
 
 const capW = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 type EditorProject = { id: string; name: string; branch: string; revision?: string; workflows?: Workflow[] };
 
-/** Position live nodes left-to-right by graph depth (workflow.yaml has no positions). */
+/** Position live nodes top-to-bottom by graph depth (workflow.yaml has no positions). Depth
+ *  runs DOWN the canvas; sibling nodes at the same depth spread across a row. */
 function autoLayout(edges: { from: string; to: string }[], order: string[]): Record<string, { x: number; y: number }> {
   const depth: Record<string, number> = {};
   for (const key of order) {
@@ -31,16 +32,16 @@ function autoLayout(edges: { from: string; to: string }[], order: string[]): Rec
   const byDepth: Record<number, string[]> = {};
   for (const key of order) (byDepth[depth[key] ?? 0] ??= []).push(key);
   const pos: Record<string, { x: number; y: number }> = {};
-  // Column pitch (COL) must exceed the node's rendered width so sequential steps never touch;
-  // ROW likewise exceeds node height. Nodes stacked in one column are centred against the
-  // tallest column so branches read as a balanced tree instead of top-aligned overlaps.
-  const COL = 300, ROW = 120;
-  const maxRows = Math.max(...Object.values(byDepth).map((n) => n.length));
+  // ROW (vertical pitch between depths) exceeds node height so sequential steps never touch;
+  // COL (horizontal pitch between siblings) exceeds node width. Sibling nodes at one depth are
+  // centred against the widest row so branches read as a balanced top-down tree.
+  const COL = 230, ROW = 130;
+  const maxCols = Math.max(...Object.values(byDepth).map((n) => n.length));
   for (const key of order) {
     const d = depth[key] ?? 0;
-    const col = byDepth[d];
-    const rowOffset = (maxRows - col.length) / 2; // centre this column's rows vertically
-    pos[key] = { x: d * COL + 20, y: (col.indexOf(key) + rowOffset) * ROW + 20 };
+    const row = byDepth[d];
+    const colOffset = (maxCols - row.length) / 2; // centre this depth's nodes horizontally
+    pos[key] = { x: (row.indexOf(key) + colOffset) * COL + 20, y: d * ROW + 20 };
   }
   return pos;
 }
@@ -68,9 +69,9 @@ function seedWorkflow(name: string, trigger: "manual" | "cron" | "webhook" | "ev
     sync: "OutOfSync", health: "Healthy", lastRun: "idle",
     triggers: [{ type: trigger, detail: "" }],
     nodes: [
-      { key: "start", kind: "start", name: "Start", position: { x: 0, y: 150 } },
-      { key: "step", kind: "jscode", name: "Step", file: "nodes/step.js", position: { x: 260, y: 150 } },
-      { key: "end", kind: "end", name: "End", position: { x: 520, y: 150 } },
+      { key: "start", kind: "start", name: "Start", position: { x: 160, y: 0 } },
+      { key: "step", kind: "jscode", name: "Step", file: "nodes/step.js", position: { x: 160, y: 130 } },
+      { key: "end", kind: "end", name: "End", position: { x: 160, y: 260 } },
     ],
     edges: [{ from: "start", to: "step" }, { from: "step", to: "end" }],
     runs: [],
@@ -93,7 +94,7 @@ function relTime(ms: number): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 function toRunRecord(r: LiveRun): RunRecord {
-  const st = (["queued", "running", "succeeded", "failed"].includes(r.status) ? r.status : "idle") as NodeStatus;
+  const st = (["queued", "running", "succeeded", "failed", "cancelled"].includes(r.status) ? r.status : "idle") as NodeStatus;
   return {
     id: r.id,
     status: st,
@@ -168,6 +169,8 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
   const [selected, setSelected] = useState<string | null>(workflow?.nodes[0]?.key ?? null);
   const [logs, setLogs] = useState<string[]>([]);
   const [running, setRunning] = useState(false);
+  const [runJobId, setRunJobId] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
   const [runResult, setRunResult] = useState<NodeStatus | null>(null);
   const [input, setInput] = useState('{ "since": "2026-07-01" }');
   const [showCommit, setShowCommit] = useState(false);
@@ -465,6 +468,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       return;
     }
     addLog(`  job ${jobId}`);
+    setRunJobId(jobId);
     streamEvents(
       jobId,
       (e) => {
@@ -480,9 +484,13 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
         try {
           const j = await getJob(jobId);
           setRunResult(j.status === "succeeded" ? "succeeded" : "failed");
-          addLog(j.status === "succeeded" ? `✓ run complete · result ${JSON.stringify(j.result)}` : `✗ run failed: ${j.error}`);
+          addLog(j.status === "succeeded" ? `✓ run complete · result ${JSON.stringify(j.result)}`
+            : j.status === "cancelled" ? `⊘ run cancelled${j.error ? ` (${j.error})` : ""}`
+            : `✗ run failed: ${j.error}`);
         } finally {
           setRunning(false);
+          setRunJobId(null);
+          setCancelling(false);
         }
       },
     );
@@ -515,6 +523,14 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               <Play className="h-4 w-4" /> {running ? "Running…" : "Run"}
             </button>
           </Tip>
+          {running && runJobId && LIVE && (
+            <Tip text="Politely stop the run: the current node finishes, then it stops at the next boundary and records as cancelled.">
+              <button className="btn-ghost text-rose-300 hover:text-rose-200 disabled:opacity-60" data-testid="cancel-run-btn" disabled={cancelling}
+                onClick={() => { setCancelling(true); cancelRun(runJobId).then(() => addLog("⊘ cancel requested…")).catch((e) => { addLog(`✗ cancel: ${e.message}`); setCancelling(false); }); }}>
+                <XCircle className="h-4 w-4" /> {cancelling ? "Cancelling…" : "Cancel"}
+              </button>
+            </Tip>
+          )}
           <Tip text="Save commits workflow.yaml + node .js back to the git repo. The reconciler then syncs running state.">
             <button className="btn-ghost" data-testid="save-btn" onClick={() => setShowCommit(true)}>
               <Save className="h-4 w-4" /> Save

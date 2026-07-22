@@ -444,6 +444,27 @@ api.post("/jobs/:id/retry", async (c) => {
   return c.json({ jobId, retriedFrom: c.req.param("id"), project: projectId, workflow: job.workflow });
 });
 
+// Request a cooperative cancel: a running job stops at its next node boundary and records as
+// `cancelled`; a still-queued job is cancelled before it starts. Idempotent.
+api.post("/jobs/:id/cancel", async (c) => {
+  const id = c.req.param("id");
+  const job = await q.getJob(id);
+  if (!Object.keys(job).length) return c.json({ error: "job not found" }, 404);
+  if (job.status === "succeeded" || job.status === "failed" || job.status === "cancelled") {
+    return c.json({ id, status: job.status, alreadyDone: true });
+  }
+  await q.requestCancel(id);
+  // Still queued → cancel immediately (the worker skips it when pulled). Running → cooperative
+  // stop at the next node boundary (the worker's shouldCancel check).
+  if (job.status === "queued") {
+    await q.markDone(id, "cancelled", { error: "cancelled before start" });
+    await q.publishEvent(id, { type: "done", status: "cancelled", result: null, error: "cancelled before start" }).catch(() => {});
+    return c.json({ id, status: "cancelled" });
+  }
+  await q.publishEvent(id, { type: "log", node: "", level: "warn", message: "cancel requested — stopping at the next node" }).catch(() => {});
+  return c.json({ id, cancelRequested: true });
+});
+
 // Live per-node status + logs (Server-Sent Events). Replays history, then streams.
 api.get("/jobs/:id/events", (c) => {
   const id = c.req.param("id");

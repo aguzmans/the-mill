@@ -46,6 +46,7 @@ const statusStyles: Record<NodeStatus, { cls: string; label: string }> = {
   running: { cls: "bg-sky-500/15 text-sky-300", label: "Running" },
   succeeded: { cls: "bg-emerald-500/15 text-emerald-300", label: "Succeeded" },
   failed: { cls: "bg-rose-500/15 text-rose-300", label: "Failed" },
+  cancelled: { cls: "bg-amber-500/15 text-amber-300", label: "Cancelled" },
 };
 
 export function StatusPill({ status }: { status: NodeStatus }) {

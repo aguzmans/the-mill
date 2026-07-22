@@ -8,7 +8,7 @@
 
 export type SyncStatus = "Synced" | "OutOfSync";
 export type Health = "Healthy" | "Progressing" | "Degraded";
-export type NodeStatus = "idle" | "queued" | "running" | "succeeded" | "failed";
+export type NodeStatus = "idle" | "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type TriggerType = "cron" | "webhook" | "manual" | "event";
 export type ConcurrencyPolicy = "Allow" | "Forbid" | "Replace";
 
@@ -263,10 +263,10 @@ const invoices: Workflow = {
     { type: "manual", detail: "", enabled: true },
   ],
   nodes: [
-    { key: "start", kind: "start", name: "Start", position: { x: 0, y: 150 }, inputSchema: "{ since: string /* ISO date */ }" },
+    { key: "start", kind: "start", name: "Start", position: { x: 150, y: 0 }, inputSchema: "{ since: string /* ISO date */ }" },
     {
       key: "fetch", kind: "jscode", name: "Fetch Invoices", file: "nodes/fetch.js", code: fetchCode,
-      deps: { "node-fetch": "^3" }, position: { x: 170, y: 150 },
+      deps: { "node-fetch": "^3" }, position: { x: 150, y: 170 },
       inputSchema: "{ since: string }",
       outputSchema: "Array<{ id, status, lines: {amount}[] }>",
       secrets: ["API_URL", "API_TOKEN"],
@@ -274,20 +274,20 @@ const invoices: Workflow = {
       executor: "container",
     },
     {
-      key: "gate", kind: "if", name: "Any open invoices?", position: { x: 360, y: 150 },
+      key: "gate", kind: "if", name: "Any open invoices?", position: { x: 150, y: 360 },
       conditions: [{ expr: "invoices.length > 0" }, { connector: "or", expr: "input.force === true" }],
       condition: "invoices.length > 0 || input.force === true",
     },
     {
       key: "transform", kind: "jscode", name: "Compute Totals", file: "nodes/transform.js", code: transformCode,
-      position: { x: 545, y: 40 },
+      position: { x: 40, y: 545 },
       inputSchema: "Array<{ id, status, lines: {amount}[] }>",
       outputSchema: "Array<{ id, total: number }>",
       limits: defaultLimits, executor: "container",
     },
     {
       key: "load", kind: "jscode", name: "Load Warehouse", file: "nodes/load.js", code: loadCode,
-      position: { x: 725, y: 40 },
+      position: { x: 40, y: 725 },
       inputSchema: "Array<{ id, total: number }>",
       outputSchema: "{ loaded: number }",
       secrets: ["WAREHOUSE_DSN"],
@@ -295,10 +295,10 @@ const invoices: Workflow = {
       executor: "gvisor",
     },
     {
-      key: "notify", kind: "callScript", name: "Notify Slack", position: { x: 905, y: 40 },
+      key: "notify", kind: "callScript", name: "Notify Slack", position: { x: 40, y: 905 },
       call: { workflow: "Post to Slack", ref: "std://acme/notify-slack@v2", standalone: true },
     },
-    { key: "end", kind: "end", name: "End", position: { x: 725, y: 270 }, outputSchema: "{ loaded: number } | null" },
+    { key: "end", kind: "end", name: "End", position: { x: 270, y: 725 }, outputSchema: "{ loaded: number } | null" },
   ],
   edges: [
     { from: "start", to: "fetch" },
@@ -349,27 +349,27 @@ const reconcile: Workflow = {
   activeRevision: "a1b2c3d",
   triggers: [{ type: "cron", detail: "*/15 * * * *", nextRun: "in 4m", enabled: true, concurrencyPolicy: "Replace" }],
   nodes: [
-    { key: "start", kind: "start", name: "Start", position: { x: 0, y: 130 }, inputSchema: "{ since: string }" },
+    { key: "start", kind: "start", name: "Start", position: { x: 130, y: 0 }, inputSchema: "{ since: string }" },
     {
-      key: "pull", kind: "jscode", name: "Pull Payments", file: "nodes/pull.js", code: pullCode, position: { x: 170, y: 130 },
+      key: "pull", kind: "jscode", name: "Pull Payments", file: "nodes/pull.js", code: pullCode, position: { x: 130, y: 170 },
       inputSchema: "{ since: string }", outputSchema: "Array<Payment>", secrets: ["PSP_URL", "PSP_KEY"],
       limits: defaultLimits, executor: "container",
     },
     {
-      key: "match", kind: "jscode", name: "Match", file: "nodes/match.js", code: matchCode, position: { x: 350, y: 130 },
+      key: "match", kind: "jscode", name: "Match", file: "nodes/match.js", code: matchCode, position: { x: 130, y: 350 },
       inputSchema: "Array<Payment>", outputSchema: "{ matched: number, flagged: number }",
       limits: defaultLimits, executor: "container",
     },
     {
-      key: "decide", kind: "if", name: "Any unmatched?", position: { x: 535, y: 130 },
+      key: "decide", kind: "if", name: "Any unmatched?", position: { x: 130, y: 535 },
       conditions: [{ expr: "result.flagged > 0" }, { connector: "and", expr: "ctx.now.getDate() <= 5" }],
       condition: "result.flagged > 0 && ctx.now.getDate() <= 5",
     },
     {
-      key: "dun", kind: "callScript", name: "Run Dunning", position: { x: 720, y: 40 },
+      key: "dun", kind: "callScript", name: "Run Dunning", position: { x: 40, y: 720 },
       call: { workflow: "Dunning Emails", ref: "workflows/dunning", project: "billing", standalone: false },
     },
-    { key: "end", kind: "end", name: "End", position: { x: 720, y: 240 } },
+    { key: "end", kind: "end", name: "End", position: { x: 240, y: 720 } },
   ],
   edges: [
     { from: "start", to: "pull" },
@@ -404,19 +404,19 @@ const dunning: Workflow = {
     { type: "event", detail: "called by reconcile", enabled: true },
   ],
   nodes: [
-    { key: "start", kind: "start", name: "Start", position: { x: 0, y: 130 }, inputSchema: "{}" },
+    { key: "start", kind: "start", name: "Start", position: { x: 130, y: 0 }, inputSchema: "{}" },
     {
-      key: "query", kind: "jscode", name: "Query Overdue", file: "nodes/query.js", code: queryCode, position: { x: 170, y: 130 },
+      key: "query", kind: "jscode", name: "Query Overdue", file: "nodes/query.js", code: queryCode, position: { x: 130, y: 170 },
       inputSchema: "{}", outputSchema: "Array<Invoice>", secrets: ["WAREHOUSE_DSN"],
       limits: defaultLimits, executor: "container",
     },
-    { key: "gate", kind: "if", name: "Anything overdue?", position: { x: 355, y: 130 }, condition: "overdue.length > 0" },
+    { key: "gate", kind: "if", name: "Anything overdue?", position: { x: 130, y: 355 }, condition: "overdue.length > 0" },
     {
-      key: "send", kind: "jscode", name: "Send Email", file: "nodes/send.js", code: sendCode, position: { x: 540, y: 40 },
+      key: "send", kind: "jscode", name: "Send Email", file: "nodes/send.js", code: sendCode, position: { x: 40, y: 540 },
       inputSchema: "Array<Invoice>", outputSchema: "{ sent: number }", secrets: ["SMTP_URL"],
       limits: defaultLimits, executor: "container",
     },
-    { key: "end", kind: "end", name: "End", position: { x: 540, y: 240 } },
+    { key: "end", kind: "end", name: "End", position: { x: 240, y: 540 } },
   ],
   edges: [
     { from: "start", to: "query" },

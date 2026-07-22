@@ -157,6 +157,12 @@ export interface NodeTiming { key: string; status: string; ms: number }
 export async function getTimeline(jobId: string): Promise<{ nodeTimings: NodeTiming[]; error?: { node: string; message: string } }> {
   return getJSON(`/jobs/${jobId}/timeline`);
 }
+export async function cancelRun(jobId: string): Promise<{ id: string; status?: string; cancelRequested?: boolean }> {
+  const r = await fetch(`${BASE}/jobs/${jobId}/cancel`, { method: "POST", headers: authHeaders() });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `cancel ${r.status}`);
+  return j;
+}
 export async function retryRun(jobId: string): Promise<{ jobId: string }> {
   const r = await fetch(`${BASE}/jobs/${jobId}/retry`, { method: "POST", headers: authHeaders() });
   const j = await r.json().catch(() => ({}));

@@ -28,6 +28,7 @@ const concMax = Number(process.env.MILL_CONC_MAX ?? process.env.MILL_CONCURRENCY
 const memMaxMB = Number(process.env.MILL_MEM_MAX_MB ?? 1024);
 const pausePct = Number(process.env.MILL_PAUSE_PCT ?? 85);
 const resumePct = Number(process.env.MILL_RESUME_PCT ?? 70);
+const WALL_MS = Number(process.env.MILL_JOB_WALL_MS ?? 0); // hard per-run wall-clock cap (0 = off)
 // Node secrets come from three sources (a node only ever sees the refs it declares — makeCtx
 // scrubs to `secrets: [...]`, so exposing the whole set here is safe): individual env vars
 // (e.g. `envFrom` a k8s Secret), the MILL_SECRETS JSON blob, and the Redis store (UI-managed).
@@ -75,8 +76,8 @@ async function materializeBundle(project: string, revision: string, bundleKey: s
 async function handle(spec: JobSpec, raw: string) {
   // Replace concurrency policy: a run superseded while still queued must not execute.
   const pre = await q.getJob(spec.id).then((j) => j.status).catch(() => undefined);
-  if (pre === "superseded") {
-    log.info("skip superseded job (Replace policy)", { job: spec.id, workflow: spec.workflow });
+  if (pre === "superseded" || pre === "cancelled") {
+    log.info(`skip ${pre} job`, { job: spec.id, workflow: spec.workflow });
     await q.ack(workerId, raw).catch(() => {});
     return;
   }
@@ -101,10 +102,18 @@ async function handle(spec: JobSpec, raw: string) {
       // In-process: journal completed nodes so a requeued job (after a worker crash) resumes
       // where it left off instead of re-doing finished work.
       const journal = await q.journalGet(spec.id).catch(() => ({}));
-      res = await runWorkflow(job, (e) => { q.publishEvent(spec.id, e).catch(() => {}); }, {
+      const runP = runWorkflow(job, (e) => { q.publishEvent(spec.id, e).catch(() => {}); }, {
         journal,
         onNodeDone: (k, o) => { q.journalSet(spec.id, k, o).catch(() => {}); },
+        shouldCancel: () => q.isCancelRequested(spec.id), // API `cancel` → stop at next node
       });
+      // Optional wall-clock backstop (MILL_JOB_WALL_MS): a run that blocks forever inside a node
+      // (e.g. a hung fetch) can't be interrupted in-process, but this frees the worker slot and
+      // fails the job instead of hanging it. 0 = no limit.
+      res = WALL_MS > 0
+        ? await Promise.race([runP, new Promise<typeof runP extends Promise<infer R> ? R : never>((resolve) =>
+            setTimeout(() => resolve({ status: "failed", error: `wall-clock timeout after ${WALL_MS}ms`, events: [], ms: WALL_MS }), WALL_MS))])
+        : await runP;
       if (res.status === "succeeded") await q.journalClear(spec.id).catch(() => {}); // done — drop the journal
     }
     await q.markDone(spec.id, res.status, {

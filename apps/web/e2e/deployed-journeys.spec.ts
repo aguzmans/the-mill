@@ -23,6 +23,10 @@ test.beforeEach(async ({ page }) => {
   page.on("pageerror", (e) => { throw new Error(`pageerror: ${e.message}`); });
 });
 
+// Always clean up the project this suite creates — even if a step fails mid-way — so test runs
+// never leak `e2e-*` projects into the reconciled repo.
+test.afterAll(async () => { await fetch(`${BASE}/api/projects/${PID}`, { method: "DELETE" }).catch(() => {}); });
+
 test.describe.serial("live developer journey", () => {
   test("workspace never shows demo/mock projects (and empty state when empty)", async ({ page }) => {
     await page.goto(`${BASE}/workspace`);

@@ -8,6 +8,7 @@ const statusRing: Record<NodeStatus, string> = {
   running: "border-sky-400 animate-pulseRing",
   succeeded: "border-emerald-400/70",
   failed: "border-rose-500/70",
+  cancelled: "border-amber-400/60",
 };
 
 /** Per-kind accent + icon, reused by the palette and inspector. */
@@ -41,8 +42,9 @@ function StatusIcon({ status }: { status: NodeStatus }) {
   return null;
 }
 
-const targetHandle = <Handle type="target" position={Position.Left} className="!h-2 !w-2 !border-0 !bg-brand-400" />;
-const sourceHandle = <Handle type="source" position={Position.Right} className="!h-2 !w-2 !border-0 !bg-cyanx" />;
+// Top-to-bottom flow: edges enter the top of a node and leave the bottom.
+const targetHandle = <Handle type="target" position={Position.Top} className="!h-2 !w-2 !border-0 !bg-brand-400" />;
+const sourceHandle = <Handle type="source" position={Position.Bottom} className="!h-2 !w-2 !border-0 !bg-cyanx" />;
 
 export function MillNode({ data, selected }: NodeProps) {
   const kind = ((data.kind as NodeKind) ?? "jscode") as NodeKind;
@@ -85,8 +87,8 @@ export function MillNode({ data, selected }: NodeProps) {
           <span className="truncate text-sm font-medium text-white">{label}</span>
         </div>
         {data.condition ? <div className="mt-1 truncate font-mono text-[10px] text-amber-200/80">if ({data.condition as string})</div> : null}
-        <Handle id="true" type="source" position={Position.Right} style={{ top: "38%" }} className="!h-2 !w-2 !border-0 !bg-emerald-400" />
-        <Handle id="false" type="source" position={Position.Right} style={{ top: "72%" }} className="!h-2 !w-2 !border-0 !bg-rose-400" />
+        <Handle id="true" type="source" position={Position.Bottom} style={{ left: "38%" }} className="!h-2 !w-2 !border-0 !bg-emerald-400" />
+        <Handle id="false" type="source" position={Position.Bottom} style={{ left: "72%" }} className="!h-2 !w-2 !border-0 !bg-rose-400" />
         <span className="pointer-events-none absolute right-1.5 top-[30%] text-[9px] font-medium text-emerald-300">T</span>
         <span className="pointer-events-none absolute right-1.5 top-[64%] text-[9px] font-medium text-rose-300">F</span>
       </div>

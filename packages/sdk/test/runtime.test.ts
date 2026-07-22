@@ -1,6 +1,6 @@
 import { test, expect, describe } from "bun:test";
 import type { ExecPlan, PlanNode, NodeKind } from "@mill/core";
-import { executePlan, makeCtx, WorkflowError, type NodeFn } from "../src";
+import { executePlan, makeCtx, WorkflowError, CancelledError, type NodeFn } from "../src";
 
 const n = (key: string, kind: NodeKind, extra: Partial<PlanNode> = {}): PlanNode => ({
   key, kind, name: key, parents: [], children: [], ...extra,
@@ -326,5 +326,33 @@ describe("makeCtx", () => {
     expect(withReq.request).toEqual(req);
     const noReq = makeCtx({ node: "x", inputs: {}, allSecrets: {}, state: {} });
     expect(noReq.request).toBeUndefined();
+  });
+});
+
+describe("executePlan — cooperative cancel", () => {
+  test("shouldCancel true → throws CancelledError before any node runs", async () => {
+    let ran = 0;
+    const load = async (node: PlanNode) => ((i: any) => { ran++; return { n: i.n }; }) as NodeFn;
+    await expect(executePlan(branchingPlan(), { input: { n: 5 }, loadNode: load, callScript: noCall, shouldCancel: () => true }))
+      .rejects.toThrow(CancelledError);
+    expect(ran).toBe(0);
+  });
+
+  test("stops at the next node boundary once cancel is requested mid-run", async () => {
+    let ran = 0;
+    let cancelled = false;
+    const counting: Record<string, NodeFn> = {
+      a: (i: any) => { ran++; return { n: i.n }; },
+      b: (i: any) => { ran++; return { doubled: i.n * 2 }; },
+    };
+    const p = executePlan(branchingPlan(), {
+      input: { n: 5 },
+      loadNode: async (node) => counting[node.key],
+      callScript: noCall,
+      onNodeDone: (k) => { if (k === "a") cancelled = true; }, // request cancel right after 'a'
+      shouldCancel: () => cancelled,
+    });
+    await expect(p).rejects.toThrow(/cancelled at node 'g'/);
+    expect(ran).toBe(1); // only 'a' ran; the branch nodes never executed
   });
 });
