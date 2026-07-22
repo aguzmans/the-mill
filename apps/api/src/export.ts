@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 // The @mill/sdk runtime source, by a layout-stable path (works on host + in the image),
@@ -85,6 +85,10 @@ const RUN_SH = `#!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Load secrets from .env if present (copy .env.example → .env and fill it in). Each node still
+# only sees the secret refs it declares.
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+
 if ! command -v bun >/dev/null 2>&1; then
   echo "This bundle needs Bun. Install it, then re-run:" >&2
   echo "  curl -fsSL https://bun.sh/install | bash" >&2
@@ -102,7 +106,18 @@ fi
 exec bun run index.js "$@"
 `;
 
-function readme(projectName: string, workflows: string[]): string {
+function readme(projectName: string, workflows: string[], secrets: string[]): string {
+  const secretsBlock = secrets.length
+    ? `## Secrets
+This workload needs ${secrets.length} secret${secrets.length === 1 ? "" : "s"}: ${secrets.map((s) => `\`${s}\``).join(", ")}.
+See **\`.env.example\`** for the full list (with which node uses each + example values):
+\`\`\`bash
+cp .env.example .env      # then fill in real values — run.sh loads .env automatically
+\`\`\`
+`
+    : `## Secrets
+This workload declares no secrets — nothing to configure (see \`.env.example\`).
+`;
   return `# ${projectName} — exported from Mill
 
 A standalone bundle. Runs the same compiled program Mill runs. **\`run.sh\` does everything
@@ -124,9 +139,85 @@ curl -s -XPOST localhost:8080/run/${workflows[0] ?? "workflow"} -d '{}'   # → 
 \`POST /run/<workflow>\` (alias \`/hooks/<workflow>\`) runs a workflow with the JSON body as
 input — the same entrypoint a webhook trigger would hit.
 
+${secretsBlock}
 Workflows: ${workflows.join(", ")}.
 Secrets are read from the environment (each node sees only the refs it declares).
 `;
+}
+
+// A plausible placeholder value for a secret, inferred from its name — enough to make the
+// .env.example self-documenting without ever emitting a real credential.
+function exampleFor(name: string): string {
+  const u = name.toUpperCase();
+  if (/(URL|URI|ENDPOINT)$/.test(u)) return "https://api.example.com";
+  if (/PORT$/.test(u)) return "8080";
+  if (/EMAIL$/.test(u)) return "you@example.com";
+  if (/(USERNAME|USER_ID|_ID|USER)$/.test(u)) return "your-" + name.toLowerCase().replace(/_/g, "-");
+  if (/(ENABLED|DRY_RUN|DEBUG|VERBOSE)$/.test(u)) return "false";
+  // KEY / TOKEN / SECRET / PASSWORD / AUTH / CREDENTIAL and everything else → a clear placeholder.
+  return "changeme";
+}
+
+/**
+ * Which secrets a project's workflows use. `declared` = a node's `secrets:` list (what the
+ * runtime actually injects). `undeclared` = names referenced as `ctx.secrets.X` in node code
+ * but NOT declared — those won't be injected (Mill scrubs each node to its declared refs), so
+ * they're surfaced as a warning. Both map name → the "workflow/node" sites that use it.
+ */
+function collectSecrets(projectDir: string, wfNames: string[]): { declared: Map<string, Set<string>>; undeclared: Map<string, Set<string>> } {
+  const declared = new Map<string, Set<string>>();
+  const referenced = new Map<string, Set<string>>();
+  const add = (m: Map<string, Set<string>>, name: string, site: string) => { (m.get(name) ?? m.set(name, new Set()).get(name)!).add(site); };
+  for (const name of wfNames) {
+    let loaded;
+    try { loaded = loadWorkflow(projectDir, name); } catch { continue; }
+    const { def, dir } = loaded;
+    for (const n of def.nodes) {
+      const site = `${name}/${n.key}`;
+      for (const s of (n as { secrets?: string[] }).secrets ?? []) add(declared, s, site);
+      const file = (n as { file?: string }).file;
+      if ((n.kind === "jscode" || n.kind === "loop") && file) {
+        try {
+          const src = readFileSync(resolve(dir, file), "utf8");
+          for (const m of src.matchAll(/\bctx\.secrets\.([A-Za-z_$][\w$]*)/g)) add(referenced, m[1], site);
+          for (const m of src.matchAll(/\bctx\.secrets\[\s*["'`]([^"'`\]]+)["'`]\s*\]/g)) add(referenced, m[1], site);
+        } catch { /* unreadable node file — skip */ }
+      }
+    }
+  }
+  const undeclared = new Map<string, Set<string>>();
+  for (const [name, sites] of referenced) if (!declared.has(name)) undeclared.set(name, sites);
+  return { declared, undeclared };
+}
+
+/** Render a .env.example documenting the secrets this bundle needs (with example values). */
+function renderEnvExample(projectName: string, declared: Map<string, Set<string>>, undeclared: Map<string, Set<string>>): string {
+  const lines = [
+    `# .env.example — environment variables the "${projectName}" workflows use.`,
+    `# Copy to .env and fill in real values, then run:   cp .env.example .env && ./run.sh`,
+    `# (run.sh auto-loads .env; each node only sees the secret refs it declares.)`,
+    ``,
+  ];
+  if (declared.size === 0 && undeclared.size === 0) {
+    lines.push(`# This project declares no secrets — nothing to configure.`, ``);
+    return lines.join("\n");
+  }
+  for (const name of [...declared.keys()].sort()) {
+    lines.push(`# used by: ${[...declared.get(name)!].sort().join(", ")}`, `${name}=${exampleFor(name)}`, ``);
+  }
+  if (undeclared.size) {
+    lines.push(
+      `# ─────────────────────────────────────────────────────────────────────────`,
+      `# Referenced in node code as ctx.secrets.* but NOT declared in the node's`,
+      `# \`secrets:\` list — Mill will NOT inject these. Add them to the node's secrets`,
+      `# in workflow.yaml if they're really needed, then re-export.`,
+      ``,
+    );
+    for (const name of [...undeclared.keys()].sort()) {
+      lines.push(`# referenced by: ${[...undeclared.get(name)!].sort().join(", ")}`, `# ${name}=${exampleFor(name)}`, ``);
+    }
+  }
+  return lines.join("\n");
 }
 
 export async function exportProject(projectDir: string): Promise<{ tgz: Uint8Array; name: string }> {
@@ -166,13 +257,17 @@ export async function exportProject(projectDir: string): Promise<{ tgz: Uint8Arr
     if (!built.success) throw new Error("bundle failed: " + built.logs.map((l) => String(l.message ?? l)).join("; "));
     const indexJs = await built.outputs[0].text();
 
+    // Evaluate which secrets the workload needs → a self-documenting .env.example.
+    const { declared, undeclared } = collectSecrets(projectDir, wfNames);
+
     writeFileSync(join(out, "index.js"), indexJs);
     writeFileSync(join(out, "package.json"), JSON.stringify({ name: proj.metadata.name, private: true, type: "module", dependencies: deps, scripts: { start: "bun run index.js", "start-server": "bun run index.js serve" } }, null, 2));
     writeFileSync(join(out, "run.sh"), RUN_SH, { mode: 0o755 });
-    writeFileSync(join(out, "README.md"), readme(proj.metadata.name, wfNames));
+    writeFileSync(join(out, ".env.example"), renderEnvExample(proj.metadata.name, declared, undeclared));
+    writeFileSync(join(out, "README.md"), readme(proj.metadata.name, wfNames, [...declared.keys()].sort()));
 
     const tgzPath = join(out, "bundle.tgz");
-    await Bun.spawn(["tar", "-czf", tgzPath, "-C", out, "index.js", "package.json", "run.sh", "README.md"]).exited;
+    await Bun.spawn(["tar", "-czf", tgzPath, "-C", out, "index.js", "package.json", "run.sh", "README.md", ".env.example"]).exited;
     const tgz = new Uint8Array(await Bun.file(tgzPath).arrayBuffer());
     return { tgz, name: proj.metadata.name };
   } finally {

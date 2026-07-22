@@ -1,6 +1,6 @@
 import { test, expect, describe } from "bun:test";
 import { resolve, join } from "node:path";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { exportProject } from "../src/export";
 import { listWorkflows } from "@mill/projectfs";
@@ -110,4 +110,52 @@ describe("exportProject — server mode (others expose an API port)", () => {
       cleanup();
     }
   }, 40000);
+});
+
+describe("exportProject — .env.example (secrets the workload needs)", () => {
+  test("lists declared secrets with their usage sites + example values", async () => {
+    const { dir, cleanup } = await extract(example("acuity"));
+    try {
+      const env = readFileSync(join(dir, ".env.example"), "utf8");
+      // every declared secret is present as an active KEY=value line
+      for (const s of ["ACUITY_USER_ID", "ACUITY_API_KEY", "BILLING_API_URL", "CRM_API_KEY", "NOTIFY_API_URL", "WEBHOOK_SECRET"]) {
+        expect(env, `missing ${s}`).toContain(`\n${s}=`);
+      }
+      expect(env).toContain("used by: intake/fetch-acuity");   // annotated with the node that uses it
+      expect(env).toMatch(/_URL=https:\/\//);                  // URL-name heuristic → sample URL
+      expect(env).toContain("ACUITY_USER_ID=your-acuity-user-id");
+      // README advertises the secret requirement
+      expect(readFileSync(join(dir, "README.md"), "utf8")).toContain("This workload needs");
+    } finally { cleanup(); }
+  }, 30000);
+
+  test("a project with no secrets gets a clear placeholder file", async () => {
+    const { dir, cleanup } = await extract(example("pipelines"));
+    try {
+      expect(readFileSync(join(dir, ".env.example"), "utf8")).toContain("declares no secrets");
+    } finally { cleanup(); }
+  }, 30000);
+
+  test("flags secrets referenced in code but NOT declared (so they won't be injected)", async () => {
+    const proj = mkdtempSync(join(tmpdir(), "mill-proj-"));
+    const nodes = join(proj, "workflows", "w", "nodes");
+    mkdirSync(nodes, { recursive: true });
+    writeFileSync(join(proj, "project.yaml"), "apiVersion: mill/v1\nkind: Project\nmetadata:\n  name: synth\n");
+    writeFileSync(join(proj, "workflows", "w", "workflow.yaml"),
+      "apiVersion: mill/v1\nkind: Workflow\nmetadata:\n  name: w\nnodes:\n" +
+      "  - { key: start, kind: start }\n" +
+      "  - { key: step, kind: jscode, file: nodes/step.js, secrets: [ DECLARED_KEY ] }\n" +
+      "  - { key: end, kind: end }\nedges:\n" +
+      "  - { from: start, to: step }\n  - { from: step, to: end }\n");
+    writeFileSync(join(nodes, "step.js"), "export default (i, ctx) => ({ a: ctx.secrets.DECLARED_KEY, b: ctx.secrets.UNDECLARED_TOKEN });\n");
+    try {
+      const { dir, cleanup } = await extract(proj);
+      try {
+        const env = readFileSync(join(dir, ".env.example"), "utf8");
+        expect(env).toContain("DECLARED_KEY=");        // declared → active line
+        expect(env).toContain("NOT declared");         // warning section present
+        expect(env).toContain("# UNDECLARED_TOKEN=");  // commented out (won't be injected)
+      } finally { cleanup(); }
+    } finally { rmSync(proj, { recursive: true, force: true }); }
+  }, 30000);
 });
