@@ -52,6 +52,18 @@ export function validateNodeSources(dir: string, def: WorkflowDef): { node: stri
   const errors: { node: string; error: string }[] = [];
   const transpiler = new Bun.Transpiler({ loader: "js" });
   for (const n of def.nodes) {
+    // sql nodes: no .js file, but their param/each expressions are JS — parse-check them so a
+    // typo (e.g. `item.` ) is caught at reconcile time, not at run time.
+    if (n.kind === "sql") {
+      const exprs: string[] = [...((n as { params?: string[] }).params ?? [])];
+      const pf = (n as { paramsFrom?: string }).paramsFrom; if (pf) exprs.push(pf);
+      const each = (n as { each?: string }).each; if (each) exprs.push(each);
+      for (const e of exprs) {
+        try { transpiler.transformSync(`(${e});`); }
+        catch (err) { errors.push({ node: n.key, error: `invalid expression '${e}': ${err instanceof Error ? err.message.split("\n")[0] : String(err)}` }); }
+      }
+      continue;
+    }
     const file = (n as { file?: string }).file;
     if (!file) continue; // only jscode / loop-with-file nodes have source
     const abs = join(dir, file);
@@ -63,12 +75,18 @@ export function validateNodeSources(dir: string, def: WorkflowDef): { node: stri
 }
 
 /** Union of every node's declared npm `deps` across all workflows in a project. */
+/** The pg version SQL nodes run on (kept in one place so runtime + export agree). */
+export const PG_DEP_VERSION = "^8.13.1";
+
 export function collectDeps(projectDir: string): Record<string, string> {
   const deps: Record<string, string> = {};
   for (const name of listWorkflows(projectDir)) {
     try {
       const { def } = loadWorkflow(projectDir, name);
-      for (const n of def.nodes) if (n.deps) Object.assign(deps, n.deps);
+      for (const n of def.nodes) {
+        if (n.deps) Object.assign(deps, n.deps);
+        if (n.kind === "sql") deps.pg ??= PG_DEP_VERSION; // sql nodes need the pg driver at runtime
+      }
     } catch { /* a broken workflow is caught elsewhere; skip its deps */ }
   }
   return deps;

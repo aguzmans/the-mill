@@ -4,7 +4,7 @@ import { Cron } from "croner";
 // The Mill project/workflow file format — the single source of truth (no DB).
 // Types are inferred from these schemas so the schema and the types never drift.
 
-export const nodeKind = z.enum(["start", "jscode", "if", "callScript", "loop", "fanout", "end"]);
+export const nodeKind = z.enum(["start", "jscode", "if", "callScript", "loop", "fanout", "end", "sql"]);
 
 export const ifClause = z.object({
   connector: z.enum(["and", "or"]).optional(), // undefined on the first clause
@@ -49,6 +49,25 @@ export const workflowNode = z.object({
   //   `file` (a per-item JS Code module) or `call` (a per-item Call Script) — mutually
   //   exclusive. Iterations run sequentially; `ctx.state` carries across them.
   each: z.string().optional(),
+  // sql: run a parametrized query against a database (v1: postgres). The connection is a secret
+  //   ref holding a URL (e.g. postgres://…); `query` uses $1..$n placeholders bound SERVER-SIDE
+  //   (never string-interpolated). Values come from `params` (one JS expression per placeholder)
+  //   or `paramsFrom` (a single expression yielding the whole ordered array — precedence over
+  //   `params`). `mode:each` runs the query once per item of `each` (item/index in scope), and
+  //   `transaction:true` makes that batch atomic. See ARCHITECTURE §SQL.
+  dialect: z.enum(["postgres"]).optional(),
+  connection: z.string().optional(),
+  query: z.string().optional(),
+  params: z.array(z.string()).optional(),
+  paramsFrom: z.string().optional(),
+  mode: z.enum(["single", "each"]).optional(),
+  transaction: z.boolean().optional(),
+  timeoutMs: z.number().int().positive().optional(),
+}).superRefine((n, ctx) => {
+  if (n.kind !== "sql") return;
+  if (!n.connection?.trim()) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "sql node needs a `connection` (a secret ref, e.g. DATABASE_URL)", path: ["connection"] });
+  if (!n.query?.trim()) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "sql node needs a `query`", path: ["query"] });
+  if (n.mode === "each" && !n.each?.trim()) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "sql node with mode:each needs an `each` expression (the array to iterate)", path: ["each"] });
 });
 
 export const workflowEdge = z.object({

@@ -6,7 +6,7 @@ import Redis from "ioredis";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createHmac } from "node:crypto";
 import { join, resolve } from "node:path";
-import { MillQueue, SecretStore, validSecretName } from "@mill/queue";
+import { MillQueue, SecretStore, validSecretName, scopeLabel, type SecretScope } from "@mill/queue";
 import { computeStats, computeQueueView } from "./fleet";
 import { runNode } from "@mill/executor";
 import { createLogger } from "@mill/telemetry";
@@ -382,8 +382,8 @@ api.post("/projects/:id/workflows/:wf/nodes/:key/test", async (c) => {
   const dir = join(PROJECTS_DIR, id);
   if (!existsSync(join(dir, "workflows", wf, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
   const body = await c.req.json().catch(() => ({}));
-  // Precedence: process env / k8s Secrets < Redis store (UI-managed) < ad-hoc test overrides.
-  const secrets = { ...ENV_SECRETS, ...(await secretStore.all().catch(() => ({}))), ...(body?.secrets ?? {}) };
+  // Precedence: env/k8s < global < project < workflow (resolve) < ad-hoc test overrides.
+  const secrets = { ...ENV_SECRETS, ...(await secretStore.resolve(id, wf).catch(() => ({}))), ...(body?.secrets ?? {}) };
   try {
     const r = await runNode(dir, wf, key, body?.input ?? {}, secrets, lastStatus?.syncedRevision);
     return c.json(r, r.status === "failed" && r.error?.startsWith("no node") ? 404 : 200);
@@ -392,12 +392,24 @@ api.post("/projects/:id/workflows/:wf/nodes/:key/test", async (c) => {
   }
 });
 
-// ── Secrets (runtime, Redis-backed) ──────────────────────────────────────────
+// ── Secrets (runtime, Redis-backed, scoped) ──────────────────────────────────
 // Values are injected into ctx.secrets at run time (a node sees only the refs it declares).
 // Write-only from the UI: names are listed, values are NEVER returned. Admin-guarded by the
-// /api/* middleware when MILL_ADMIN_TOKEN is set.
+// /api/* middleware when MILL_ADMIN_TOKEN is set. Scope is chosen via ?project=&workflow= —
+// none = global, project only = project scope, both = workflow scope. Run-time precedence is
+// most-specific-wins (env < global < project < workflow).
+function scopeFromReq(c: { req: { query: (k: string) => string | undefined } }): SecretScope {
+  const project = c.req.query("project");
+  const workflow = c.req.query("workflow");
+  if (project && workflow) return { kind: "workflow", project, workflow };
+  if (project) return { kind: "project", project };
+  return { kind: "global" };
+}
 api.get("/secrets", async (c) => {
-  return c.json({ names: await secretStore.names(), encryptedAtRest: secretStore.encryptedAtRest() });
+  try {
+    const scope = scopeFromReq(c);
+    return c.json({ scope: scopeLabel(scope), names: await secretStore.names(scope), encryptedAtRest: secretStore.encryptedAtRest() });
+  } catch (e) { return c.json({ error: e instanceof Error ? e.message : String(e) }, 400); }
 });
 api.put("/secrets/:name", async (c) => {
   const name = c.req.param("name");
@@ -405,12 +417,39 @@ api.put("/secrets/:name", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const value = body?.value;
   if (typeof value !== "string" || value.length === 0) return c.json({ error: "body must be { value: <non-empty string> }" }, 400);
-  await secretStore.set(name, value);
-  return c.json({ saved: name, encryptedAtRest: secretStore.encryptedAtRest() });
+  try {
+    const scope = scopeFromReq(c);
+    await secretStore.set(name, value, scope);
+    return c.json({ saved: name, scope: scopeLabel(scope), encryptedAtRest: secretStore.encryptedAtRest() });
+  } catch (e) { return c.json({ error: e instanceof Error ? e.message : String(e) }, 400); }
 });
 api.delete("/secrets/:name", async (c) => {
-  const removed = await secretStore.remove(c.req.param("name"));
-  return c.json({ removed: removed > 0 ? c.req.param("name") : null });
+  try {
+    const scope = scopeFromReq(c);
+    const removed = await secretStore.remove(c.req.param("name"), scope);
+    return c.json({ removed: removed > 0 ? c.req.param("name") : null, scope: scopeLabel(scope) });
+  } catch (e) { return c.json({ error: e instanceof Error ? e.message : String(e) }, 400); }
+});
+
+// Effective secrets for a workflow: what it actually resolves + which scope each name comes from
+// (global/project/workflow, most-specific-wins), cross-referenced with the names its nodes declare.
+// Read-only, names only. `missing` = declared by a node but set in no Mill scope (may come from
+// env/k8s at deploy time, or is genuinely unconfigured).
+api.get("/projects/:id/workflows/:wf/effective-secrets", async (c) => {
+  const { id, wf } = c.req.param();
+  const dir = join(PROJECTS_DIR, id);
+  if (!existsSync(join(dir, "workflows", wf, "workflow.yaml"))) return c.json({ error: "workflow not found" }, 404);
+  let declared: string[] = [];
+  try {
+    const { def } = loadWorkflow(dir, wf);
+    const set = new Set<string>();
+    for (const n of def.nodes) for (const s of (n as { secrets?: string[] }).secrets ?? []) set.add(s);
+    declared = [...set].sort();
+  } catch { /* broken workflow — declared stays empty */ }
+  const resolved = await secretStore.sources(id, wf).catch(() => []);
+  const have = new Set(resolved.map((r) => r.name));
+  const missing = declared.filter((n) => !have.has(n));
+  return c.json({ workflow: `${id}/${wf}`, resolved, declared, missing });
 });
 
 api.get("/jobs/:id", async (c) => {

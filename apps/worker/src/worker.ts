@@ -84,9 +84,10 @@ async function handle(spec: JobSpec, raw: string) {
   running.set(spec.id, { id: spec.id, workflow: spec.workflow, startedAt: Date.now() });
   await q.markRunning(spec.id, workerId);
   try {
-    // Re-read UI-managed secrets per job (cheap HGETALL) so a value added in the UI applies to
-    // the next run without a worker restart. Env/k8s Secrets < Redis store (UI wins on conflict).
-    const secrets = { ...envSecrets, ...(await secretStore.all().catch(() => ({}))) };
+    // Re-read UI-managed secrets per job (cheap HGETALLs) so a value added in the UI applies to
+    // the next run without a worker restart. Scopes layer most-specific-wins:
+    //   env/k8s < global < project < workflow. resolve() merges them for this job's project+workflow.
+    const secrets = { ...envSecrets, ...(await secretStore.resolve(spec.project, spec.workflow).catch(() => ({}))) };
     // Fetch the project's code from Redis into ephemeral /tmp (no shared workdir). Falls back to
     // spec.projectDir only when no bundle was published (dir-mode dev).
     const projectDir = spec.bundleKey && spec.revision && spec.project

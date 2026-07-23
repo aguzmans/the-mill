@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 // so Bun.build can inline it into the standalone bundle regardless of node_modules layout.
 const SDK_PATH = resolve(import.meta.dir, "../../../packages/sdk/src/index.ts");
 import { buildPlan } from "@mill/compiler";
-import { loadProject, listWorkflows, loadWorkflow } from "@mill/projectfs";
+import { loadProject, listWorkflows, loadWorkflow, PG_DEP_VERSION } from "@mill/projectfs";
 
 // Export a project as a standalone, runnable JS bundle (ARCHITECTURE §7). The generated
 // entry embeds every workflow's compiled plan + imports its node code + the @mill/sdk
@@ -149,6 +149,8 @@ Secrets are read from the environment (each node sees only the refs it declares)
 // .env.example self-documenting without ever emitting a real credential.
 function exampleFor(name: string): string {
   const u = name.toUpperCase();
+  // DB connection strings: postgres URL / DSN → a realistic example (SQL nodes use these).
+  if (/(DATABASE_URL|_DSN|DSN|PG_URL|POSTGRES_URL|PGURL)$/.test(u) || (/(DATABASE|POSTGRES|_DB)/.test(u) && /(URL|URI|DSN)/.test(u))) return "postgres://user:pass@host:5432/dbname?sslmode=require";
   if (/(URL|URI|ENDPOINT)$/.test(u)) return "https://api.example.com";
   if (/PORT$/.test(u)) return "8080";
   if (/EMAIL$/.test(u)) return "you@example.com";
@@ -175,6 +177,9 @@ function collectSecrets(projectDir: string, wfNames: string[]): { declared: Map<
     for (const n of def.nodes) {
       const site = `${name}/${n.key}`;
       for (const s of (n as { secrets?: string[] }).secrets ?? []) add(declared, s, site);
+      // a sql node's `connection` is an auto-declared secret ref — count it too.
+      const conn = (n as { connection?: string }).connection;
+      if (n.kind === "sql" && conn) add(declared, conn, site);
       const file = (n as { file?: string }).file;
       if ((n.kind === "jscode" || n.kind === "loop") && file) {
         try {
@@ -244,6 +249,7 @@ export async function exportProject(projectDir: string): Promise<{ tgz: Uint8Arr
         nodeMap.push(`  ${JSON.stringify(`${name}/${n.key}`)}: ${v},`);
       }
       if (n.deps) Object.assign(deps, n.deps);
+      if (n.kind === "sql") deps.pg ??= PG_DEP_VERSION; // sql nodes need pg in the standalone bundle
     }
   }
 

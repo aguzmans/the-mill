@@ -5,9 +5,10 @@
   "main": "src/worker.ts",
   "dependencies": {
     "@mill/executor": "*",
-    "@mill/queue": "*",
     "@mill/projectfs": "*",
+    "@mill/queue": "*",
+    "@mill/telemetry": "*",
     "ioredis": "^5.4.2",
-    "@mill/telemetry": "*"
+    "pg": "^8.13.1"
   }
 }

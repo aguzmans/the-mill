@@ -218,7 +218,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       id: n.key,
       type: "mill",
       position: spread[n.key] ?? n.position,
-      data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, inputSchema: n.inputSchema, outputSchema: n.outputSchema, status: "idle" as NodeStatus },
+      data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, inputSchema: n.inputSchema, outputSchema: n.outputSchema, connection: n.connection, query: n.query, params: n.params, paramsFrom: n.paramsFrom, mode: n.mode, transaction: n.transaction, timeoutMs: n.timeoutMs, status: "idle" as NodeStatus },
     }));
   }, [workflow]);
   const initialEdges = useMemo<Edge[]>(
@@ -296,6 +296,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       if (kind === "callScript") data.call = { workflow: "", ref: "", standalone: true };
       if (kind === "jscode") { data.code = DEFAULT_JS; data.filename = `nodes/${id}.js`; }
       if (kind === "loop") { data.each = "input"; data.code = DEFAULT_LOOP_BODY; data.filename = `nodes/${id}.js`; }
+      if (kind === "sql") { data.connection = "DATABASE_URL"; data.query = "select * from your_table where id = $1"; data.params = ["input.id"]; data.mode = "single"; }
       setNodes((nds) => {
         const base = screen && rf ? rf.screenToFlowPosition(screen) : { x: nds.length ? Math.max(...nds.map((n) => n.position.x)) + 60 : 60, y: 80 };
         const at = resolvePosition(base, kind, nds as { position: { x: number; y: number }; data?: { kind?: NodeKind } }[]);
@@ -347,6 +348,13 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
     [setNodes],
   );
 
+  const setSql = useCallback(
+    (id: string, patch: Record<string, unknown>) => {
+      setNodes((nds) => nds.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)));
+    },
+    [setNodes],
+  );
+
   // Live: the other workflows in this project — the in-project call targets.
   const [callTargets, setCallTargets] = useState<{ id: string; name: string }[]>([]);
   useEffect(() => {
@@ -373,6 +381,15 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       if (kind === "if") { if (d.condition) node.condition = d.condition; if (d.conditions) node.conditions = d.conditions; }
       if (kind === "callScript") node.call = d.call;
       if (kind === "loop") { node.each = (d.each as string) || "input"; if (d.filename) node.file = d.filename; else if (d.call) node.call = d.call; }
+      if (kind === "sql") {
+        node.connection = (d.connection as string) || "DATABASE_URL";
+        node.query = (d.query as string) || "";
+        node.mode = (d.mode as "single" | "each") || "single";
+        if (d.paramsFrom) node.paramsFrom = d.paramsFrom as string;
+        else node.params = (d.params as string[]) ?? [];
+        if (node.mode === "each") { node.each = (d.each as string) || "input"; if (d.transaction) node.transaction = true; }
+        if (d.timeoutMs) node.timeoutMs = Number(d.timeoutMs);
+      }
       if (d.deps && Object.keys(d.deps as object).length) node.deps = d.deps; // external npm deps
       if (d.inputSchema) node.inputSchema = d.inputSchema; // enforced JS predicates
       if (d.outputSchema) node.outputSchema = d.outputSchema;
@@ -623,6 +640,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               onSetDeps={setDeps}
               onSetCall={setCall}
               onSetSchema={setSchema}
+              onSetSql={setSql}
             />
           </div>
         }
@@ -886,9 +904,10 @@ type InspectorProps = {
   onSetDeps: (id: string, deps: Record<string, string>) => void;
   onSetCall: (id: string, call: WorkflowNode["call"]) => void;
   onSetSchema: (id: string, which: "inputSchema" | "outputSchema", value: string) => void;
+  onSetSql: (id: string, patch: Record<string, unknown>) => void;
 };
 
-function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkflows, callTargets, onEdit, onApplyCode, onSetDeps, onSetCall, onSetSchema }: InspectorProps) {
+function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkflows, callTargets, onEdit, onApplyCode, onSetDeps, onSetCall, onSetSchema, onSetSql }: InspectorProps) {
   const [tab, setTab] = useState<JsTab>("code");
   if (!selected) return <p className="mt-3 text-sm text-slate-500">Select a node in the graph.</p>;
   const mock = workflow.nodes.find((n) => n.key === selected);
@@ -915,6 +934,7 @@ function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkfl
         {kind === "callScript" && <CallPanel node={mock} liveCall={liveData.call as WorkflowNode["call"]} workflow={workflow} projectWorkflows={projectWorkflows} callTargets={callTargets} onSetCall={(call) => onSetCall(selected, call)} onEdit={onEdit} />}
         {kind === "jscode" && <JsPanel node={mock} file={jsFile} code={jsCode} tab={tab} setTab={setTab} onApply={(c) => onApplyCode(selected, c)}
           inputSchema={(liveData.inputSchema as string) ?? mock?.inputSchema ?? ""} outputSchema={(liveData.outputSchema as string) ?? mock?.outputSchema ?? ""} onSetSchema={(w, v) => onSetSchema(selected, w, v)} />}
+        {kind === "sql" && <SqlPanel data={{ ...(mock ?? {}), ...liveData }} onSet={(patch) => onSetSql(selected, patch)} />}
         {kind === "loop" && (
           <LoopPanel
             node={mock}
@@ -1329,6 +1349,93 @@ function LimitBox({ icon, label, value }: { icon: React.ReactNode; label: string
 // ── Triggers panel ───────────────────────────────────────────────────────────
 function TriggerIcon({ type }: { type: string }) {
   return type === "cron" ? <Clock className="h-3.5 w-3.5" /> : type === "webhook" ? <Webhook className="h-3.5 w-3.5" /> : type === "event" ? <Zap className="h-3.5 w-3.5" /> : <Hand className="h-3.5 w-3.5" />;
+}
+
+// SQL node inspector (v1: postgres). Edit the connection secret, the $1..$n query, how params
+// bind (per-placeholder expressions or a whole-item passthrough), and single vs per-item mode.
+function SqlPanel({ data, onSet }: { data: Record<string, unknown>; onSet: (patch: Record<string, unknown>) => void }) {
+  const connection = (data.connection as string) ?? "DATABASE_URL";
+  const query = (data.query as string) ?? "";
+  const mode = ((data.mode as string) ?? "single") as "single" | "each";
+  const params = (data.params as string[]) ?? [];
+  const paramsFrom = (data.paramsFrom as string) ?? "";
+  const usePF = !!paramsFrom;
+  const each = (data.each as string) ?? "input";
+  const transaction = !!data.transaction;
+  const timeoutMs = data.timeoutMs as number | undefined;
+  const lbl = "mb-1 block text-xs font-medium text-slate-300";
+
+  return (
+    <div className="space-y-3 text-xs" data-testid="sql-panel">
+      <div>
+        <label className={lbl}>Connection <InfoTip text="A secret ref holding a postgres:// URL. Resolves through global → project → workflow scopes (Secrets page). Auto-declared, so the node sees it in ctx.secrets." /></label>
+        <input className="inp !py-1 w-full font-mono text-[11px]" data-testid="sql-connection" value={connection} onChange={(e) => onSet({ connection: e.target.value })} placeholder="DATABASE_URL" spellCheck={false} />
+      </div>
+
+      <div>
+        <label className={lbl}>Query <InfoTip text="Use $1..$n placeholders — values are bound server-side (never string-interpolated). An array-valued param binds as a Postgres array, e.g. WHERE id = ANY($1)." /></label>
+        <textarea className="inp w-full font-mono text-[11px] leading-relaxed" data-testid="sql-query" rows={5} value={query} onChange={(e) => onSet({ query: e.target.value })} placeholder="select id, email from users where org_id = $1" spellCheck={false} />
+      </div>
+
+      <div>
+        <label className={lbl}>Run mode</label>
+        <select className="inp !w-auto !py-1 text-xs" data-testid="sql-mode" value={mode} onChange={(e) => onSet({ mode: e.target.value })}>
+          <option value="single">single — one query</option>
+          <option value="each">for each item</option>
+        </select>
+      </div>
+
+      {mode === "each" && (
+        <div className="space-y-2 rounded-lg border border-white/5 bg-ink-950/40 p-2">
+          <div>
+            <label className={lbl}>Iterate (array expression) <InfoTip text="A JS expression over `input`/`ctx` yielding the array to loop. Each element is `item` (with `index`) in the param expressions below." /></label>
+            <input className="inp !py-1 w-full font-mono text-[11px]" data-testid="sql-each" value={each} onChange={(e) => onSet({ each: e.target.value })} placeholder="input.rows" spellCheck={false} />
+          </div>
+          <label className="flex items-center gap-2 text-[11px] text-slate-300">
+            <input type="checkbox" data-testid="sql-transaction" checked={transaction} onChange={(e) => onSet({ transaction: e.target.checked })} />
+            Wrap the batch in one transaction (all-or-nothing)
+          </label>
+        </div>
+      )}
+
+      <div>
+        <div className="flex items-center justify-between">
+          <label className={lbl}>Parameters ($1..$n)</label>
+          <label className="flex items-center gap-1.5 text-[10px] text-slate-400">
+            <input type="checkbox" data-testid="sql-usepf" checked={usePF}
+              onChange={(e) => onSet(e.target.checked ? { paramsFrom: mode === "each" ? "item" : "input", params: undefined } : { paramsFrom: undefined, params: params.length ? params : [""] })} />
+            whole item/array as params
+          </label>
+        </div>
+        {usePF ? (
+          <>
+            <input className="inp !py-1 w-full font-mono text-[11px]" data-testid="sql-paramsfrom" value={paramsFrom} onChange={(e) => onSet({ paramsFrom: e.target.value })} placeholder="item" spellCheck={false} />
+            <p className="mt-1 text-[10px] text-slate-500">The expression must yield the whole ordered array [$1, $2, …].</p>
+          </>
+        ) : (
+          <div className="space-y-1" data-testid="sql-params">
+            {params.map((p, i) => (
+              <div key={i} className="flex items-center gap-1.5">
+                <span className="w-6 shrink-0 font-mono text-[10px] text-indigo-300">${i + 1}</span>
+                <input className="inp !py-1 flex-1 font-mono text-[11px]" data-testid={`sql-param-${i}`} value={p} onChange={(e) => onSet({ params: params.map((x, j) => (j === i ? e.target.value : x)) })} placeholder={mode === "each" ? "item.col" : "input.x"} spellCheck={false} />
+                <button type="button" className="rounded p-1 text-slate-500 hover:text-rose-300" data-testid={`sql-param-rm-${i}`} onClick={() => onSet({ params: params.filter((_, j) => j !== i) })}><Trash2 className="h-3.5 w-3.5" /></button>
+              </div>
+            ))}
+            <button type="button" className="btn-ghost text-[11px]" data-testid="sql-param-add" onClick={() => onSet({ params: [...params, ""] })}><Plus className="h-3.5 w-3.5" /> add param</button>
+          </div>
+        )}
+      </div>
+
+      <div>
+        <label className={lbl}>Statement timeout (ms, optional)</label>
+        <input className="inp !py-1 !w-32 font-mono text-[11px]" data-testid="sql-timeout" type="number" min={0} value={timeoutMs ?? ""} onChange={(e) => onSet({ timeoutMs: e.target.value ? Number(e.target.value) : undefined })} placeholder="30000" />
+      </div>
+
+      <p className="rounded-lg border border-white/5 bg-ink-950/40 px-2 py-1.5 text-[10px] text-slate-500">
+        Output to the next step: <span className="font-mono text-slate-400">{mode === "each" ? "{ results: [{ item, rows, rowCount }], rowCount }" : "{ rows, rowCount, command, fields }"}</span>
+      </p>
+    </div>
+  );
 }
 
 // Cron sub-editor: quick-pick presets, live validation, and a preview of the next N fire times

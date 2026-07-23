@@ -36,35 +36,89 @@ export function decryptSecret(s: string): string {
 
 /** Secret names follow env-var conventions so a node can read `ctx.secrets.NAME`. */
 export const validSecretName = (n: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n);
+/** Project/workflow ids are folder names — keep them safe to embed in a Redis key. */
+const validScopeId = (s: string): boolean => /^[A-Za-z0-9._-]+$/.test(s);
+
+// A secret lives in one of three scopes. At run time they layer most-specific-wins:
+//   env/k8s  <  global  <  project  <  workflow
+// so a global value is a shared default that a project or a single workflow can override.
+export type SecretScope =
+  | { kind: "global" }
+  | { kind: "project"; project: string }
+  | { kind: "workflow"; project: string; workflow: string };
+
+export const GLOBAL: SecretScope = { kind: "global" };
+/** Human label for a scope (used in API responses / UI). */
+export function scopeLabel(s: SecretScope): string {
+  return s.kind === "global" ? "global" : s.kind === "project" ? `project:${s.project}` : `workflow:${s.project}/${s.workflow}`;
+}
 
 export class SecretStore {
   constructor(private redis: Redis, private prefix = "mill") {}
-  private hkey(): string { return `${this.prefix}:secrets`; }
 
-  /** Store (or overwrite) a secret value. */
-  async set(name: string, value: string): Promise<void> {
+  // Per-scope Redis hash. Global keeps the original `mill:secrets` key (backward compatible),
+  // so existing secrets keep working untouched.
+  private hkey(scope: SecretScope = GLOBAL): string {
+    if (scope.kind === "global") return `${this.prefix}:secrets`;
+    if (!validScopeId(scope.project)) throw new Error(`invalid project id '${scope.project}'`);
+    if (scope.kind === "project") return `${this.prefix}:secrets:p:${scope.project}`;
+    if (!validScopeId(scope.workflow)) throw new Error(`invalid workflow id '${scope.workflow}'`);
+    return `${this.prefix}:secrets:w:${scope.project}:${scope.workflow}`;
+  }
+
+  /** Store (or overwrite) a secret value in a scope (default: global). */
+  async set(name: string, value: string, scope: SecretScope = GLOBAL): Promise<void> {
     if (!validSecretName(name)) throw new Error(`invalid secret name '${name}' — use letters, digits, underscore`);
-    await this.redis.hset(this.hkey(), name, encryptSecret(value));
+    await this.redis.hset(this.hkey(scope), name, encryptSecret(value));
   }
-  async remove(name: string): Promise<number> {
-    return this.redis.hdel(this.hkey(), name);
+  async remove(name: string, scope: SecretScope = GLOBAL): Promise<number> {
+    return this.redis.hdel(this.hkey(scope), name);
   }
-  /** Names only — values are NEVER returned to the UI. */
-  async names(): Promise<string[]> {
-    return (await this.redis.hkeys(this.hkey())).sort();
+  /** Names only, for one scope — values are NEVER returned to the UI. */
+  async names(scope: SecretScope = GLOBAL): Promise<string[]> {
+    return (await this.redis.hkeys(this.hkey(scope))).sort();
   }
-  async has(name: string): Promise<boolean> {
-    return (await this.redis.hexists(this.hkey(), name)) === 1;
+  async has(name: string, scope: SecretScope = GLOBAL): Promise<boolean> {
+    return (await this.redis.hexists(this.hkey(scope), name)) === 1;
   }
-  /** Decrypted values, for the worker/step-tester to inject into ctx.secrets. */
-  async all(): Promise<Record<string, string>> {
-    const h = await this.redis.hgetall(this.hkey());
+  /** Decrypted values for one scope. */
+  async all(scope: SecretScope = GLOBAL): Promise<Record<string, string>> {
+    const h = await this.redis.hgetall(this.hkey(scope));
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(h)) {
       try { out[k] = decryptSecret(v); } catch { /* unreadable (key rotated) — skip */ }
     }
     return out;
   }
+  /**
+   * Effective secrets for a run: global < project < workflow, later layers overriding earlier
+   * (most-specific wins). This is what the worker/step-tester injects into ctx.secrets.
+   */
+  async resolve(project?: string, workflow?: string): Promise<Record<string, string>> {
+    const layers: SecretScope[] = [GLOBAL];
+    if (project) layers.push({ kind: "project", project });
+    if (project && workflow) layers.push({ kind: "workflow", project, workflow });
+    const out: Record<string, string> = {};
+    for (const s of layers) Object.assign(out, await this.all(s));
+    return out;
+  }
+  /**
+   * Provenance for a run's effective secrets (names only). For each name that resolves, reports
+   * the winning scope (`source`) and every scope that holds it (`scopes`, precedence order) — so a
+   * UI can show "API_KEY comes from workflow, overriding project + global". No values are read.
+   */
+  async sources(project?: string, workflow?: string): Promise<{ name: string; source: "global" | "project" | "workflow"; scopes: ("global" | "project" | "workflow")[] }[]> {
+    const layers: { label: "global" | "project" | "workflow"; scope: SecretScope }[] = [{ label: "global", scope: GLOBAL }];
+    if (project) layers.push({ label: "project", scope: { kind: "project", project } });
+    if (project && workflow) layers.push({ label: "workflow", scope: { kind: "workflow", project, workflow } });
+    const namesByLayer = await Promise.all(layers.map((l) => this.names(l.scope)));
+    const map = new Map<string, ("global" | "project" | "workflow")[]>();
+    layers.forEach((l, i) => { for (const n of namesByLayer[i]) map.set(n, [...(map.get(n) ?? []), l.label]); });
+    return [...map.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, scopes]) => ({ name, source: scopes[scopes.length - 1], scopes })); // last = most-specific = winner
+  }
+
   /** True when values are encrypted at rest (MILL_SECRETS_KEY configured). */
   encryptedAtRest(): boolean { return !!keyBuf(); }
 }

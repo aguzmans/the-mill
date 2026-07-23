@@ -18,6 +18,11 @@ export function buildPlan(wf: WorkflowDef): ExecPlan {
   const order = topoSort(wf);
   const nodes: Record<string, PlanNode> = {};
   for (const n of wf.nodes) {
+    // A sql node's connection is a secret ref — declare it automatically so ctx.secrets exposes
+    // it without the author also listing it under `secrets:`.
+    const secrets = n.kind === "sql" && n.connection
+      ? [...new Set([...(n.secrets ?? []), n.connection])]
+      : n.secrets;
     nodes[n.key] = {
       key: n.key,
       kind: n.kind,
@@ -28,8 +33,17 @@ export function buildPlan(wf: WorkflowDef): ExecPlan {
       retry: n.retry,
       inputSchema: n.inputSchema,
       outputSchema: n.outputSchema,
-      secrets: n.secrets,
+      secrets,
       condition: n.kind === "if" ? compileCondition(n) : undefined,
+      // sql fields (v1: postgres) — carried onto the plan for the runtime's `case "sql"`.
+      dialect: n.kind === "sql" ? (n.dialect ?? "postgres") : undefined,
+      connection: n.connection,
+      query: n.query,
+      params: n.params,
+      paramsFrom: n.paramsFrom,
+      mode: n.kind === "sql" ? (n.mode ?? "single") : n.mode,
+      transaction: n.transaction,
+      timeoutMs: n.timeoutMs,
       parents: parentsOf(wf, n.key),
       children: childrenOf(wf, n.key).map((e) => ({ to: e.to, branch: e.branch })),
     };

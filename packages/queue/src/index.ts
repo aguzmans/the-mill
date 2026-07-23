@@ -389,4 +389,4 @@ export class MillQueue {
   }
 }
 
-export { SecretStore, validSecretName, encryptSecret, decryptSecret } from "./secrets";
+export { SecretStore, validSecretName, encryptSecret, decryptSecret, scopeLabel, GLOBAL, type SecretScope } from "./secrets";

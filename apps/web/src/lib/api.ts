@@ -211,18 +211,43 @@ export async function saveWorkflow(projectId: string, wf: string, body: SaveWork
   return j;
 }
 
-// ── Secrets (runtime, Redis-backed) — values are write-only from the UI ──────────
-export interface SecretsInfo { names: string[]; encryptedAtRest: boolean }
-export async function getSecrets(): Promise<SecretsInfo> {
-  return getJSON(`/secrets`);
+// Projects + their workflows (for scope pickers).
+export interface ProjectListItem { id: string; name: string; workflows: string[] }
+export async function getProjects(): Promise<ProjectListItem[]> {
+  return getJSON(`/projects`);
 }
-export async function putSecret(name: string, value: string): Promise<void> {
-  const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}`, {
+
+// ── Secrets (runtime, Redis-backed, scoped) — values are write-only from the UI ──────────
+// Scope: {} = global, {project} = project, {project, workflow} = a single workflow. Run-time
+// precedence is most-specific-wins (env < global < project < workflow).
+export type SecretScope = { project?: string; workflow?: string };
+export interface SecretsInfo { names: string[]; encryptedAtRest: boolean; scope?: string }
+function scopeQuery(s?: SecretScope): string {
+  const p = new URLSearchParams();
+  if (s?.project) p.set("project", s.project);
+  if (s?.project && s?.workflow) p.set("workflow", s.workflow);
+  const q = p.toString();
+  return q ? `?${q}` : "";
+}
+export async function getSecrets(scope?: SecretScope): Promise<SecretsInfo> {
+  return getJSON(`/secrets${scopeQuery(scope)}`);
+}
+export async function putSecret(name: string, value: string, scope?: SecretScope): Promise<void> {
+  const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}${scopeQuery(scope)}`, {
     method: "PUT", headers: authHeaders({ "content-type": "application/json" }), body: JSON.stringify({ value }),
   });
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `save failed (${r.status})`);
 }
-export async function deleteSecret(name: string): Promise<void> {
-  const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}`, { method: "DELETE", headers: authHeaders() });
+export async function deleteSecret(name: string, scope?: SecretScope): Promise<void> {
+  const r = await fetch(`${BASE}/secrets/${encodeURIComponent(name)}${scopeQuery(scope)}`, { method: "DELETE", headers: authHeaders() });
   if (!r.ok) throw new Error(`delete failed (${r.status})`);
+}
+
+// Effective (resolved) secrets for a workflow: which scope each name comes from, plus the names
+// its nodes declare and any that are declared-but-unset. Read-only, names only.
+export type SecretSourceScope = "global" | "project" | "workflow";
+export interface EffectiveSecret { name: string; source: SecretSourceScope; scopes: SecretSourceScope[] }
+export interface EffectiveSecrets { workflow: string; resolved: EffectiveSecret[]; declared: string[]; missing: string[] }
+export async function getEffectiveSecrets(project: string, workflow: string): Promise<EffectiveSecrets> {
+  return getJSON(`/projects/${encodeURIComponent(project)}/workflows/${encodeURIComponent(workflow)}/effective-secrets`);
 }

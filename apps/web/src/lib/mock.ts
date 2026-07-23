@@ -25,7 +25,7 @@ export type ExecutorTier = "in-process" | "container" | "nsjail" | "gvisor" | "f
  *  - callScript — invoke another script as a step (same project OR standalone/remote).
  *  - end        — the exit clause; the flow returns when no more work remains.
  */
-export type NodeKind = "start" | "jscode" | "if" | "callScript" | "loop" | "fanout" | "end";
+export type NodeKind = "start" | "jscode" | "if" | "callScript" | "loop" | "fanout" | "end" | "sql";
 
 /** One clause of an `if` condition; clauses after the first carry a connector. */
 export interface IfClause {
@@ -48,6 +48,7 @@ export const NODE_KINDS: { kind: NodeKind; label: string; blurb: string }[] = [
   { kind: "callScript", label: "Call Script", blurb: "Invoke another script as a step. The target can live in this project or be a standalone/remote script." },
   { kind: "loop", label: "Loop", blurb: "forEach over an array (from the previous node) — runs a body per item and collects the results. The body is a JS Code file or a Call Script; iterations run in order and share ctx.state." },
   { kind: "fanout", label: "Fanout", blurb: "Dynamic router: an expression yields a list of { workflow, input } targets, called in PARALLEL. Returns a per-target { workflow, ok, result|error } so one failure never kills the batch — ideal for conditionally calling 1-N downstream workloads." },
+  { kind: "sql", label: "SQL", blurb: "Run a parametrized query against Postgres. Connect via a secret URL, bind $1..$n from inputs (server-side, no injection), and run it once or per-item over an array (optionally in a transaction). Rows flow to the next step." },
   { kind: "end", label: "End", blurb: "Exit clause — the flow returns when no more execution is required." },
 ];
 
@@ -89,6 +90,15 @@ export interface WorkflowNode {
   secrets?: string[]; // secret *refs* only — values never in git (§10)
   limits?: Limits;
   executor?: ExecutorTier;
+  // sql only (v1: postgres):
+  dialect?: "postgres";
+  connection?: string; // secret ref holding the connection URL
+  query?: string; // $1..$n placeholder SQL
+  params?: string[]; // one JS expression per placeholder
+  paramsFrom?: string; // single expression → the whole ordered params array (wins over params)
+  mode?: "single" | "each";
+  transaction?: boolean;
+  timeoutMs?: number;
   // if only:
   condition?: string; // compiled display string
   conditions?: IfClause[]; // the multi-conditional clauses (source of truth)

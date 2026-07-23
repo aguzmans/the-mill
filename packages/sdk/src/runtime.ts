@@ -1,5 +1,6 @@
 import type { ExecPlan, PlanNode, CallTarget } from "@mill/core";
 import { makeCtx, type Ctx, type RunEvent } from "./ctx";
+import { runSqlNode, defaultPgDriver } from "./sql";
 
 export type NodeFn = (input: unknown, ctx: Ctx) => unknown | Promise<unknown>;
 export type NodeStatus = "succeeded" | "failed" | "skipped";
@@ -23,6 +24,8 @@ export interface ExecuteDeps {
   /** Cooperative cancellation — checked at each node boundary. Return true to stop the run
    *  gracefully (a `cancel` request from the API). Nodes already running finish first. */
   shouldCancel?: () => boolean | Promise<boolean>;
+  /** DB driver for `sql` nodes. Defaults to the built-in pg driver; tests inject a fake. */
+  sqlDriver?: import("./sql").SqlDriver;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -122,7 +125,7 @@ export async function executePlan(plan: ExecPlan, deps: ExecuteDeps): Promise<Ru
 
     // Journal skip: if this node completed in a prior attempt, reuse its output — retries
     // never re-do finished work (node-boundary durability). Only for the executable kinds.
-    if (deps.journal && key in deps.journal && (node.kind === "jscode" || node.kind === "callScript" || node.kind === "loop")) {
+    if (deps.journal && key in deps.journal && (node.kind === "jscode" || node.kind === "callScript" || node.kind === "loop" || node.kind === "sql")) {
       const out = deps.journal[key];
       outputs[key] = out;
       statuses[key] = "succeeded";
@@ -151,6 +154,9 @@ export async function executePlan(plan: ExecPlan, deps: ExecuteDeps): Promise<Ru
               out = await fn(primary, ctx);
               break;
             }
+            case "sql":
+              out = await runSqlNode(node, primary, ctx, deps.sqlDriver ?? defaultPgDriver);
+              break;
             case "callScript":
               out = await deps.callScript(node.call!, primary, ctx);
               break;

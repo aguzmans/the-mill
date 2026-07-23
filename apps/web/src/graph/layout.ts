@@ -9,6 +9,7 @@ export const NODE_SIZE: Record<NodeKind, { w: number; h: number }> = {
   callScript: { w: 192, h: 66 },
   loop: { w: 192, h: 72 },
   fanout: { w: 192, h: 66 },
+  sql: { w: 192, h: 78 },
 };
 
 /** Small minimum gap between nodes — close is fine, overlapping is not. */

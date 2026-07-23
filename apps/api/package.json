@@ -4,16 +4,17 @@
   "type": "module",
   "main": "src/server.ts",
   "dependencies": {
-    "@mill/core": "*",
-    "@mill/sdk": "*",
     "@mill/compiler": "*",
-    "@mill/projectfs": "*",
-    "@mill/gitops": "*",
-    "@mill/queue": "*",
+    "@mill/core": "*",
     "@mill/executor": "*",
+    "@mill/gitops": "*",
+    "@mill/projectfs": "*",
+    "@mill/queue": "*",
+    "@mill/sdk": "*",
+    "@mill/telemetry": "*",
     "croner": "^8.1.2",
     "hono": "^4.6.14",
     "ioredis": "^5.4.2",
-    "@mill/telemetry": "*"
+    "pg": "^8.13.1"
   }
 }

@@ -69,4 +69,70 @@ describe("SecretStore", () => {
     expect(decryptSecret("plain:hello")).toBe("hello");
     expect(decryptSecret("legacy-no-prefix")).toBe("legacy-no-prefix");
   });
+
+  test("scopes are isolated + stored under distinct keys", async () => {
+    const r = new FakeRedis();
+    const s = new SecretStore(r as any, "test");
+    await s.set("API_KEY", "global-val");                                          // global
+    await s.set("API_KEY", "proj-val", { kind: "project", project: "billing" });   // project
+    await s.set("API_KEY", "wf-val", { kind: "workflow", project: "billing", workflow: "invoices" });
+
+    expect(await s.names()).toEqual(["API_KEY"]);
+    expect(await s.all()).toEqual({ API_KEY: "global-val" });
+    expect(await s.all({ kind: "project", project: "billing" })).toEqual({ API_KEY: "proj-val" });
+    expect(r.raw("test:secrets:p:billing", "API_KEY")).toBeDefined();              // distinct redis key
+    expect(r.raw("test:secrets:w:billing:invoices", "API_KEY")).toBeDefined();
+    // deleting a workflow secret doesn't touch the project/global one
+    await s.remove("API_KEY", { kind: "workflow", project: "billing", workflow: "invoices" });
+    expect(await s.all({ kind: "workflow", project: "billing", workflow: "invoices" })).toEqual({});
+    expect(await s.all({ kind: "project", project: "billing" })).toEqual({ API_KEY: "proj-val" });
+  });
+
+  test("resolve() layers most-specific-wins: global < project < workflow", async () => {
+    const r = new FakeRedis();
+    const s = new SecretStore(r as any, "test");
+    await s.set("SHARED", "g", { kind: "global" });
+    await s.set("ONLY_GLOBAL", "g");
+    await s.set("SHARED", "p", { kind: "project", project: "billing" });
+    await s.set("ONLY_PROJECT", "p", { kind: "project", project: "billing" });
+    await s.set("SHARED", "w", { kind: "workflow", project: "billing", workflow: "invoices" });
+
+    // workflow run: sees all three layers, SHARED resolves to the workflow value
+    expect(await s.resolve("billing", "invoices")).toEqual({ SHARED: "w", ONLY_GLOBAL: "g", ONLY_PROJECT: "p" });
+    // project-level (no workflow): SHARED resolves to the project value; no workflow-only keys
+    expect(await s.resolve("billing")).toEqual({ SHARED: "p", ONLY_GLOBAL: "g", ONLY_PROJECT: "p" });
+    // a different project only gets global
+    expect(await s.resolve("other")).toEqual({ SHARED: "g", ONLY_GLOBAL: "g" });
+    // no project → global only
+    expect(await s.resolve()).toEqual({ SHARED: "g", ONLY_GLOBAL: "g" });
+  });
+
+  test("sources() reports provenance most-specific-wins", async () => {
+    const r = new FakeRedis();
+    const s = new SecretStore(r as any, "test");
+    await s.set("SHARED", "g");                                                   // global
+    await s.set("ONLY_GLOBAL", "g");
+    await s.set("SHARED", "p", { kind: "project", project: "billing" });          // project
+    await s.set("SHARED", "w", { kind: "workflow", project: "billing", workflow: "invoices" });
+    await s.set("WF_ONLY", "w", { kind: "workflow", project: "billing", workflow: "invoices" });
+
+    const src = await s.sources("billing", "invoices");
+    const by = Object.fromEntries(src.map((x) => [x.name, x]));
+    expect(by.SHARED.source).toBe("workflow");
+    expect(by.SHARED.scopes).toEqual(["global", "project", "workflow"]); // present in all three
+    expect(by.ONLY_GLOBAL.source).toBe("global");
+    expect(by.WF_ONLY.source).toBe("workflow");
+    expect(by.WF_ONLY.scopes).toEqual(["workflow"]);
+    // at project level (no workflow), SHARED's winner is project and no workflow-only names appear
+    const projSrc = await s.sources("billing");
+    expect(Object.fromEntries(projSrc.map((x) => [x.name, x.source])).SHARED).toBe("project");
+    expect(projSrc.find((x) => x.name === "WF_ONLY")).toBeUndefined();
+  });
+
+  test("rejects unsafe project/workflow ids in a scope key", async () => {
+    const r = new FakeRedis();
+    const s = new SecretStore(r as any, "test");
+    await expect(s.set("K", "v", { kind: "project", project: "bad:id" })).rejects.toThrow(/invalid project id/);
+    await expect(s.set("K", "v", { kind: "workflow", project: "ok", workflow: "bad/../id" })).rejects.toThrow(/invalid workflow id/);
+  });
 });
