@@ -2,12 +2,15 @@
   "name": "@mill/cli",
   "version": "0.0.0",
   "type": "module",
-  "bin": { "mill": "src/mill.ts" },
+  "bin": {
+    "mill": "src/mill.ts"
+  },
   "dependencies": {
     "@mill/core": "*",
     "@mill/sdk": "*",
     "@mill/compiler": "*",
     "@mill/executor": "*",
-    "@mill/projectfs": "*"
+    "@mill/projectfs": "*",
+    "@mill/windmill-import": "*"
   }
 }

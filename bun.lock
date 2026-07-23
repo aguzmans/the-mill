@@ -45,6 +45,7 @@
         "@mill/executor": "*",
         "@mill/projectfs": "*",
         "@mill/sdk": "*",
+        "@mill/windmill-import": "*",
       },
     },
     "apps/web": {
@@ -146,6 +147,13 @@
       "name": "@mill/telemetry",
       "version": "0.0.0",
     },
+    "packages/windmill-import": {
+      "name": "@mill/windmill-import",
+      "version": "0.0.0",
+      "dependencies": {
+        "yaml": "^2.5.0",
+      },
+    },
   },
   "packages": {
     "@alloc/quick-lru": ["@alloc/quick-lru@5.2.0", "", {}, "sha512-UrcABB+4bUrFABwbluTIBErXwvbsU/V7TZWfmbgJfbkwiBuziS9gxdODUyuiecfdGQ85jglMW6juS3+z5TsKLw=="],
@@ -197,6 +205,8 @@
     "@mill/telemetry": ["@mill/telemetry@workspace:packages/telemetry"],
 
     "@mill/web": ["@mill/web@workspace:apps/web"],
+
+    "@mill/windmill-import": ["@mill/windmill-import@workspace:packages/windmill-import"],
 
     "@mill/worker": ["@mill/worker@workspace:apps/worker"],
 

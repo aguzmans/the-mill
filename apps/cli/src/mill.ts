@@ -85,7 +85,22 @@ async function main() {
     process.exit(r.status === "succeeded" ? 0 : 1);
   }
 
-  console.error("commands: validate | run | run-node");
+  if (cmd === "import") {
+    const [source, flowPath, outDir] = pos;
+    if (source !== "windmill" || !flowPath || !outDir) {
+      console.error("usage: mill import windmill <flow.yaml | .flow dir | openflow.json> <out-project-dir> [--workflow <name>]");
+      process.exit(2);
+    }
+    const { importToProject } = await import("@mill/windmill-import/src/cli");
+    const { wfName, wfDir, report } = importToProject(flowPath, outDir, flags.workflow ? String(flags.workflow) : undefined);
+    console.log(`✓ imported → ${wfDir}  (workflow: ${wfName})`);
+    console.log(`  steps: ${report.supported}/${report.total} converted` + (report.deps.length ? ` · deps: ${report.deps.join(", ")} (pin versions!)` : ""));
+    for (const w of report.warnings) console.log(`  ⚠ ${w}`);
+    for (const s of report.skipped) console.log(`  ⤫ '${s.id}' (${s.type}) — ${s.reason}`);
+    process.exit(0);
+  }
+
+  console.error("commands: validate | run | run-node | import windmill");
   process.exit(2);
 }
 

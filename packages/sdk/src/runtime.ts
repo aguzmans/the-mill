@@ -97,6 +97,13 @@ export async function executePlan(plan: ExecPlan, deps: ExecuteDeps): Promise<Ru
     activated.set(to, s);
   };
   const state: Record<string, unknown> = {};
+  // Cross-node data access (shared, run-scoped): `ctx.state.flow_input` is the run input and
+  // `ctx.state.results[<nodeKey>]` is each node's output as it completes — so any node can read
+  // an earlier node's result or the original input, not just its immediate parent's output.
+  // (This is what makes Windmill-style flows, where steps reference `results.<id>`, importable.)
+  state.flow_input = deps.input;
+  const results: Record<string, unknown> = {};
+  state.results = results;
   let result: unknown = undefined;
 
   // Workflow-level input schema: validate the RUN input up front, attributed to the start node,
@@ -128,6 +135,7 @@ export async function executePlan(plan: ExecPlan, deps: ExecuteDeps): Promise<Ru
     if (deps.journal && key in deps.journal && (node.kind === "jscode" || node.kind === "callScript" || node.kind === "loop" || node.kind === "sql")) {
       const out = deps.journal[key];
       outputs[key] = out;
+      results[key] = out;
       statuses[key] = "succeeded";
       for (const c of node.children) activate(key, c.to);
       deps.onEvent?.({ type: "log", node: key, level: "debug", message: "skipped — journaled from a prior attempt" });
@@ -215,6 +223,7 @@ export async function executePlan(plan: ExecPlan, deps: ExecuteDeps): Promise<Ru
         }
       }
       outputs[key] = out;
+      results[key] = out; // expose to ctx.state.results[<key>] for downstream nodes
       statuses[key] = "succeeded";
       // Non-if nodes activate all successors unconditionally; `if` already gated above.
       if (node.kind !== "if") for (const c of node.children) activate(key, c.to);

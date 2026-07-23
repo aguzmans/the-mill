@@ -1,0 +1,10 @@
+{
+  "name": "@mill/windmill-import",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "main": "src/index.ts",
+  "dependencies": {
+    "yaml": "^2.5.0"
+  }
+}
