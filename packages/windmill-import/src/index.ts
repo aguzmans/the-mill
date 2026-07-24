@@ -33,6 +33,32 @@ type MEdge = { from: string; to: string; branch?: "true" | "false" };
 const JS_LANGS = new Set(["bun", "deno", "nativets"]);
 const sanitize = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, "_").replace(/^-+/, "") || "step";
 
+// ── Windmill SQL "magic comments" ────────────────────────────────────────────
+// Windmill has no SQL export — a Postgres step is copy-pasted raw query text whose leading
+// `--` lines carry real semantics, not documentation:
+//   -- database f/database/postgresql   → which DB resource the query targets
+//   -- return_last_result               → return only the final statement's rows
+//   -- $1 invoices                      → positional param $1 is fed by the arg `invoices`
+// We parse them so both `mill import` AND a copy-paste into the editor reproduce the binding.
+// Keep this grammar in sync with apps/web/src/lib/windmillSql.ts (the editor's mirror).
+export interface WmSqlHeader {
+  database?: string;
+  returnLastResult: boolean;
+  /** Ordered by placeholder index; `$1 invoices` → { index: 1, name: "invoices" }. */
+  params: { index: number; name: string; default?: string }[];
+}
+export function parseWmSqlHeader(text: string): WmSqlHeader {
+  const params: WmSqlHeader["params"] = [];
+  for (const m of text.matchAll(/^\s*--\s*\$(\d+)\s+([A-Za-z_]\w*)\s*(?:=\s*(.+?))?\s*$/gm))
+    params.push({ index: Number(m[1]), name: m[2], default: m[3]?.trim() || undefined });
+  params.sort((a, b) => a.index - b.index);
+  return {
+    database: text.match(/^\s*--\s*database\s+(\S+)/m)?.[1],
+    returnLastResult: /^\s*--\s*return_last_result\b/m.test(text),
+    params,
+  };
+}
+
 // ── content + code helpers ──────────────────────────────────────────────────
 export type Inline = { __inline: string };
 const isInline = (v: unknown): v is Inline => !!v && typeof v === "object" && "__inline" in (v as object);
@@ -208,14 +234,16 @@ ${this.preamble()}
       this.nodes.push(node); this.supported++; out = { entry: key, exits: [key] };
     } else if (v.type === "rawscript" && v.language === "postgresql") {
       const sql = getContent(v, this.resolveInline);
+      const header = parseWmSqlHeader(sql);
       const names: string[] = [];
-      for (const m of sql.matchAll(/^\s*--\s*\$(\d+)\s+([A-Za-z_]\w*)/gm)) names[Number(m[1]) - 1] = m[2];
+      for (const p of header.params) names[p.index - 1] = p.name;
+      // `-- $N name` binds $N to the Windmill arg `name`; resolve it through this step's
+      // input_transforms (upstream result / flow_input) → a Mill param expression over ctx.state.
       const params = names.map((n) => (n && v.input_transforms?.[n] ? (v.input_transforms[n].type === "static" ? JSON.stringify((v.input_transforms[n] as { value?: unknown }).value ?? null) : `(${this.ctxExpr(((v.input_transforms[n] as { expr?: string }).expr ?? "undefined").trim())})`) : "undefined"));
       const node: MNode = { key, kind: "sql", name, connection: "DATABASE_URL", query: sql };
       if (params.length) node.params = params;
       this.nodes.push(node); this.supported++;
-      const pin = sql.match(/^\s*--\s*database\s+(\S+)/m)?.[1];
-      this.warn(`step '${rawId}' → sql node; point the DATABASE_URL secret at ${pin ? `the Windmill resource '${pin}'` : "your Postgres URL"}.`);
+      this.warn(`step '${rawId}' → sql node; point the DATABASE_URL secret at ${header.database ? `the Windmill resource '${header.database}'` : "your Postgres URL"}.${header.returnLastResult ? " (return_last_result: Mill's single mode already returns the final statement's rows.)" : ""}`);
       out = { entry: key, exits: [key] };
     } else if (v.type === "script" || v.type === "flow") {
       out = this.emitCall(rawId, key, v, name);

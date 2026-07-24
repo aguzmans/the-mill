@@ -2,7 +2,7 @@ import { test, expect, describe } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { importWindmillFlow, type OpenFlow } from "../src/index";
+import { importWindmillFlow, parseWmSqlHeader, type OpenFlow } from "../src/index";
 import { parseWorkflow } from "@mill/core";
 import { runWorkflow } from "@mill/executor";
 
@@ -53,6 +53,37 @@ describe("windmill import", () => {
     expect(q.connection).toBe("DATABASE_URL");
     expect(q.params).toEqual(["(ctx.state.flow_input.id)", "true"]); // sql exprs reach ctx.state
     expect(parseWorkflow(def).ok).toBe(true);
+  });
+
+  test("SQL magic comments (database / return_last_result / $1) parse from raw query text", () => {
+    // The exact shape Windmill users copy-paste: pragma comments, a CTE chain, one final SELECT.
+    const query = [
+      "-- database f/database/postgresql",
+      "-- return_last_result",
+      "-- $1 invoices",
+      "WITH inv_input AS (SELECT * FROM jsonb_to_recordset($1::text::jsonb) AS x(invoice_id varchar(64)))",
+      "SELECT COUNT(*) AS invoices_written FROM inv_input;",
+    ].join("\n");
+    const h = parseWmSqlHeader(query);
+    expect(h.database).toBe("f/database/postgresql");
+    expect(h.returnLastResult).toBe(true);
+    expect(h.params).toEqual([{ index: 1, name: "invoices", default: undefined }]);
+
+    // …and the same text imported as a step keeps the raw query and binds $1 to its arg.
+    const flow: OpenFlow = { value: { modules: [
+      { id: "writeInvoices", value: { type: "rawscript", language: "postgresql", content: query,
+        input_transforms: { invoices: { type: "javascript", expr: "results.fetch" } } } },
+    ] } };
+    const r = importWindmillFlow(flow, { name: "inv" });
+    const q = require("yaml").parse(r.workflowYaml).nodes.find((n: any) => n.key === "writeInvoices");
+    expect(q.kind).toBe("sql");
+    expect(q.query).toContain("jsonb_to_recordset");   // full query preserved, comments and all
+    expect(q.params).toEqual(["(ctx.state.results.fetch)"]);
+  });
+
+  test("SQL header params sort by index and tolerate `= default`", () => {
+    const h = parseWmSqlHeader("-- $2 limit = 100\n-- $1 orgId\nselect 1");
+    expect(h.params).toEqual([{ index: 1, name: "orgId", default: undefined }, { index: 2, name: "limit", default: "100" }]);
   });
 
   test("non-JS languages are skipped + reported (loud TODO node, nothing silent)", () => {

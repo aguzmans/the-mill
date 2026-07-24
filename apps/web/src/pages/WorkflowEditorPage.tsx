@@ -7,10 +7,11 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft, Play, Save, Download, GitCommitHorizontal, Terminal, Boxes, Clock, Webhook, Hand, Zap,
-  Copy, ShieldCheck, KeyRound, Cpu, History, RotateCcw, AreaChart, GitPullRequest, GitBranch, Flag, Split, Plus, Trash2, XCircle, AlertCircle, CheckCircle2,
+  Copy, ShieldCheck, KeyRound, Cpu, History, RotateCcw, AreaChart, GitPullRequest, GitBranch, Flag, Split, Plus, Trash2, XCircle, AlertCircle, CheckCircle2, Wand2,
 } from "lucide-react";
 import { findWorkflow, NODE_KINDS, compileCondition, type NodeStatus, type NodeKind, type WorkflowNode, type WorkflowEdge, type RunRecord, type Workflow, type IfClause } from "../lib/mock";
 import { cronError, nextRuns, untilLabel, CRON_PRESETS } from "../lib/cron";
+import { parseWindmillSqlHeader, hasWindmillHeader, windmillParamExprs } from "../lib/windmillSql";
 import { nodeTypes, KindIcon, kindAccent } from "../graph/MillNode";
 import { resolvePosition, deoverlap } from "../graph/layout";
 import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
@@ -1375,6 +1376,34 @@ function TriggerIcon({ type }: { type: string }) {
   return type === "cron" ? <Clock className="h-3.5 w-3.5" /> : type === "webhook" ? <Webhook className="h-3.5 w-3.5" /> : type === "event" ? <Zap className="h-3.5 w-3.5" /> : <Hand className="h-3.5 w-3.5" />;
 }
 
+// Windmill has no SQL export — users copy the raw query, whose leading `--` lines carry real
+// meaning (the DB resource, return mode, and `$1 name` param bindings). When we detect them in
+// the pasted query, offer a one-click "fill params from comments" so the copy-paste path
+// reproduces the binding the flow importer would. See lib/windmillSql.ts.
+function WindmillSqlHint({ query, params, usePF, onSet }: { query: string; params: string[]; usePF: boolean; onSet: (patch: Record<string, unknown>) => void }) {
+  const h = parseWindmillSqlHeader(query);
+  if (!hasWindmillHeader(h)) return null;
+  const fill = () => onSet({ params: windmillParamExprs(h, params), paramsFrom: undefined });
+  return (
+    <div className="mt-1.5 space-y-1.5 rounded-lg border border-indigo-400/20 bg-indigo-500/5 px-2 py-1.5 text-[10px]" data-testid="wm-sql-hint">
+      <div className="flex items-center gap-1.5 font-medium text-indigo-200"><Wand2 className="h-3 w-3" /> Windmill header detected</div>
+      {h.params.length > 0 && (
+        <div className="text-slate-400">
+          {h.params.length} param{h.params.length > 1 ? "s" : ""}: <span className="font-mono text-slate-300">{h.params.map((p) => `$${p.index}→${p.name}`).join(", ")}</span>
+        </div>
+      )}
+      {h.database && <div className="text-slate-400">Resource <span className="font-mono text-slate-300">{h.database}</span> — point the connection secret at it.</div>}
+      {h.returnLastResult && <div className="text-slate-500">return_last_result — single mode already returns the final statement's rows.</div>}
+      {h.params.length > 0 && (
+        <button type="button" data-testid="wm-sql-fill" onClick={fill}
+          className="mt-0.5 inline-flex items-center gap-1 rounded bg-indigo-500/20 px-1.5 py-0.5 font-medium text-indigo-200 hover:bg-indigo-500/30">
+          <Wand2 className="h-3 w-3" /> {usePF ? "Fill $1..$n from comments" : "Fill params from comments"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // SQL node inspector (v1: postgres). Edit the connection secret, the $1..$n query, how params
 // bind (per-placeholder expressions or a whole-item passthrough), and single vs per-item mode.
 function SqlPanel({ data, onSet }: { data: Record<string, unknown>; onSet: (patch: Record<string, unknown>) => void }) {
@@ -1399,6 +1428,7 @@ function SqlPanel({ data, onSet }: { data: Record<string, unknown>; onSet: (patc
       <div>
         <label className={lbl}>Query <InfoTip text="Use $1..$n placeholders — values are bound server-side (never string-interpolated). An array-valued param binds as a Postgres array, e.g. WHERE id = ANY($1)." /></label>
         <textarea className="inp w-full font-mono text-[11px] leading-relaxed" data-testid="sql-query" rows={5} value={query} onChange={(e) => onSet({ query: e.target.value })} placeholder="select id, email from users where org_id = $1" spellCheck={false} />
+        <WindmillSqlHint query={query} params={params} usePF={usePF} onSet={onSet} />
       </div>
 
       <div>
