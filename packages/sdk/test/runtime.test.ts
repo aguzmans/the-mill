@@ -356,3 +356,43 @@ describe("executePlan — cooperative cancel", () => {
     expect(ran).toBe(1); // only 'a' ran; the branch nodes never executed
   });
 });
+
+describe("executePlan — continueOnError", () => {
+  // start → a (throws) → b → end
+  const linear = (): ExecPlan => ({
+    workflow: "t", startKey: "start", order: ["start", "a", "b", "end"],
+    nodes: {
+      start: n("start", "start", { children: [{ to: "a" }] }),
+      a: n("a", "jscode", { file: "a.js", parents: ["start"], children: [{ to: "b" }] }),
+      b: n("b", "jscode", { file: "b.js", parents: ["a"], children: [{ to: "end" }] }),
+      end: n("end", "end", { parents: ["b"] }),
+    },
+  });
+  const boom: Record<string, NodeFn> = {
+    a: () => { throw new Error("kaboom"); },
+    b: (input: any) => ({ sawInput: input, ok: true }),
+  };
+  const load = async (node: PlanNode) => boom[node.key];
+
+  test("a failing node WITHOUT continueOnError fails the whole run", async () => {
+    await expect(executePlan(linear(), { input: {}, loadNode: load, callScript: noCall }))
+      .rejects.toThrow(/kaboom/);
+  });
+
+  test("with continueOnError, the run continues; downstream gets null; run succeeds", async () => {
+    const plan = linear();
+    plan.nodes.a.continueOnError = true;
+    const r = await executePlan(plan, { input: {}, loadNode: load, callScript: noCall });
+    expect(r.statuses.a).toBe("failed");     // the node did fail…
+    expect(r.statuses.b).toBe("succeeded");  // …but b still ran
+    expect((r.outputs.b as any).sawInput).toBe(null); // and saw a null upstream result
+    expect(r.result).toEqual({ sawInput: null, ok: true }); // run completed
+  });
+
+  test("continueOnError does NOT swallow a cancellation", async () => {
+    const plan = linear();
+    plan.nodes.a.continueOnError = true;
+    await expect(executePlan(plan, { input: {}, loadNode: load, callScript: noCall, shouldCancel: () => true }))
+      .rejects.toThrow(CancelledError);
+  });
+});

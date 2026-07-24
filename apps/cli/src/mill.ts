@@ -86,17 +86,29 @@ async function main() {
   }
 
   if (cmd === "import") {
-    const [source, flowPath, outDir] = pos;
-    if (source !== "windmill" || !flowPath || !outDir) {
-      console.error("usage: mill import windmill <flow.yaml | .flow dir | openflow.json> <out-project-dir> [--workflow <name>]");
+    const [source, srcPath, outDir] = pos;
+    if (source !== "windmill" || !srcPath || !outDir) {
+      console.error("usage: mill import windmill <flow.yaml | .flow dir | openflow.json | wmill-sync folder> <out-project-dir> [--workflow <name>]");
       process.exit(2);
     }
-    const { importToProject } = await import("@mill/windmill-import/src/cli");
-    const { wfName, wfDir, report } = importToProject(flowPath, outDir, flags.workflow ? String(flags.workflow) : undefined);
-    console.log(`✓ imported → ${wfDir}  (workflow: ${wfName})`);
-    console.log(`  steps: ${report.supported}/${report.total} converted` + (report.deps.length ? ` · deps: ${report.deps.join(", ")} (pin versions!)` : ""));
-    for (const w of report.warnings) console.log(`  ⚠ ${w}`);
-    for (const s of report.skipped) console.log(`  ⤫ '${s.id}' (${s.type}) — ${s.reason}`);
+    const { existsSync, statSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const cli = await import("@mill/windmill-import/src/cli");
+    // A plain folder (not a .flow dir, no flow.yaml) → import the whole workspace.
+    const isWorkspace = existsSync(srcPath) && statSync(srcPath).isDirectory() && !srcPath.endsWith(".flow") && !existsSync(join(srcPath, "flow.yaml"));
+    if (isWorkspace) {
+      const items = cli.importWorkspace(srcPath, outDir);
+      const totals = items.reduce((a, i) => ({ s: a.s + i.report.supported, t: a.t + i.report.total, sk: a.sk + i.report.skipped.length }), { s: 0, t: 0, sk: 0 });
+      console.log(`✓ imported workspace → ${outDir}  (${items.length} workflows: ${items.filter((i) => i.kind === "flow").length} flows, ${items.filter((i) => i.kind === "script").length} scripts)`);
+      console.log(`  steps: ${totals.s}/${totals.t} converted · ${totals.sk} need manual porting`);
+      for (const i of items) if (i.report.skipped.length) console.log(`  ⤫ ${i.wfName}: ${i.report.skipped.map((s) => `${s.id} (${s.type})`).join(", ")}`);
+    } else {
+      const { wfName, wfDir, report } = cli.importToProject(srcPath, outDir, flags.workflow ? String(flags.workflow) : undefined);
+      console.log(`✓ imported → ${wfDir}  (workflow: ${wfName})`);
+      console.log(`  steps: ${report.supported}/${report.total} converted` + (report.deps.length ? ` · deps: ${report.deps.join(", ")} (pin versions!)` : ""));
+      for (const w of report.warnings) console.log(`  ⚠ ${w}`);
+      for (const s of report.skipped) console.log(`  ⤫ '${s.id}' (${s.type}) — ${s.reason}`);
+    }
     process.exit(0);
   }
 

@@ -218,7 +218,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
       id: n.key,
       type: "mill",
       position: spread[n.key] ?? n.position,
-      data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, inputSchema: n.inputSchema, outputSchema: n.outputSchema, connection: n.connection, query: n.query, params: n.params, paramsFrom: n.paramsFrom, mode: n.mode, transaction: n.transaction, timeoutMs: n.timeoutMs, status: "idle" as NodeStatus },
+      data: { label: n.name, filename: n.file, nodeKey: n.key, kind: n.kind, condition: n.condition, call: n.call, each: n.each, deps: n.deps, inputSchema: n.inputSchema, outputSchema: n.outputSchema, connection: n.connection, query: n.query, params: n.params, paramsFrom: n.paramsFrom, mode: n.mode, transaction: n.transaction, timeoutMs: n.timeoutMs, continueOnError: n.continueOnError, status: "idle" as NodeStatus },
     }));
   }, [workflow]);
   const initialEdges = useMemo<Edge[]>(
@@ -391,6 +391,7 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
         if (d.timeoutMs) node.timeoutMs = Number(d.timeoutMs);
       }
       if (d.deps && Object.keys(d.deps as object).length) node.deps = d.deps; // external npm deps
+      if (d.continueOnError && kind !== "start" && kind !== "end") node.continueOnError = true; // don't fail the run
       if (d.inputSchema) node.inputSchema = d.inputSchema; // enforced JS predicates
       if (d.outputSchema) node.outputSchema = d.outputSchema;
       return node;
@@ -613,6 +614,11 @@ function EditorInner({ project, workflow }: { project: EditorProject; workflow: 
               // otherwise the rightmost node renders off-screen on load. Allow deeper zoom-out.
               minZoom={0.2}
               fitViewOptions={{ padding: 0.15, minZoom: 0.2 }}
+              // Don't hijack the page scroll: wheel over the canvas scrolls the page
+              // (preventScrolling=false lets the event bubble; zoomOnScroll=false stops
+              // wheel-zoom). Zoom stays available via pinch/ctrl+wheel and the +/- Controls.
+              zoomOnScroll={false}
+              preventScrolling={false}
               proOptions={{ hideAttribution: true }}
             >
               <Background color="#233" gap={18} />
@@ -955,6 +961,24 @@ function NodeInspector({ selected, liveNodes, workflow, projectId, projectWorkfl
           />
         )}
       </div>
+
+      {/* Failure handling — any executable step can be allowed to fail without failing the run. */}
+      {kind !== "start" && kind !== "end" && (
+        <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border border-white/5 bg-ink-950/40 px-3 py-2.5 text-xs" data-testid="continue-on-error">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            data-testid="continue-on-error-checkbox"
+            checked={Boolean((liveData.continueOnError ?? mock?.continueOnError) ?? false)}
+            onChange={(e) => onSetSql(selected, { continueOnError: e.target.checked })}
+          />
+          <span>
+            <span className="font-medium text-slate-200">Continue if this step fails</span>
+            <InfoTip text="If this step still fails after retries, don't fail the whole run — record the error, hand downstream steps a null result, and keep going. (Imported from Windmill's continue_on_error.)" />
+            <span className="block text-[11px] text-slate-500">The run succeeds unless a step without this option fails.</span>
+          </span>
+        </label>
+      )}
 
       {/* External npm dependencies for JS Code / loop-body nodes. Prefer live (edited) data
           over the static loaded definition so edits render immediately. */}

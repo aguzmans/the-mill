@@ -90,6 +90,8 @@ export interface WorkflowNode {
   secrets?: string[]; // secret *refs* only — values never in git (§10)
   limits?: Limits;
   executor?: ExecutorTier;
+  // any executable node: continue the run (with a null output) if this step fails.
+  continueOnError?: boolean;
   // sql only (v1: postgres):
   dialect?: "postgres";
   connection?: string; // secret ref holding the connection URL

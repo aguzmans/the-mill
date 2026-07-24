@@ -43,6 +43,9 @@ export const workflowNode = z.object({
   call: callTarget.optional(),
   // retry: per-node retry policy — attempt up to maxAttempts with linear backoff + jitter.
   retry: z.object({ maxAttempts: z.number().int().positive(), backoffMs: z.number().int().nonnegative().optional(), jitter: z.boolean().optional() }).optional(),
+  // continueOnError: if this node fails (after retries), don't fail the whole run — record the
+  // error, hand downstream nodes a `null` result, and keep going. (Windmill's continue_on_error.)
+  continueOnError: z.boolean().optional(),
   // loop (forEach): iterate an array and run a body per item, collecting results.
   //   `each` is a JS expression over the upstream output (`input`) + `ctx` that yields the
   //   array to iterate (defaults to `input` when omitted). The body is this same node's

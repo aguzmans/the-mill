@@ -27,6 +27,7 @@ export interface PlanNode {
   transaction?: boolean; // each-mode: wrap the batch in one transaction
   timeoutMs?: number; // statement_timeout backstop
   retry?: { maxAttempts: number; backoffMs?: number; jitter?: boolean }; // per-node retry policy
+  continueOnError?: boolean; // on failure (after retries), continue the run with a null output
   inputSchema?: string; // JS boolean expr over `input` — enforced before the node runs
   outputSchema?: string; // JS boolean expr over `output` — enforced after the node runs
   secrets?: string[]; // declared secret refs exposed to this node's sandbox

@@ -230,8 +230,20 @@ export async function executePlan(plan: ExecPlan, deps: ExecuteDeps): Promise<Ru
       deps.onNodeDone?.(key, out); // journal the completed node for durability across retries
       deps.onEvent?.({ type: "node", node: key, status: "succeeded", ms: Math.round(performance.now() - t0) });
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       statuses[key] = "failed";
-      deps.onEvent?.({ type: "node", node: key, status: "failed", ms: Math.round(performance.now() - t0), error: err instanceof Error ? err.message : String(err) });
+      deps.onEvent?.({ type: "node", node: key, status: "failed", ms: Math.round(performance.now() - t0), error: msg });
+      // continueOnError: don't fail the run — record the error, hand downstream a null result,
+      // and keep going (the run still succeeds unless a non-continue node fails). Cancellation is
+      // never swallowed. This is Windmill's `continue_on_error` / `skip_failure`.
+      if (node.continueOnError && !(err instanceof CancelledError)) {
+        outputs[key] = null;
+        results[key] = null; // ctx.state.results[<key>] = null for downstream refs
+        deps.onEvent?.({ type: "log", node: key, level: "warn", message: `continuing past failure (continueOnError): ${msg}` });
+        if (node.kind !== "if") for (const c of node.children) activate(key, c.to);
+        deps.onNodeDone?.(key, null);
+        continue;
+      }
       throw new WorkflowError(key, err, { ...statuses });
     }
   }

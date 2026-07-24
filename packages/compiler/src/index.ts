@@ -31,6 +31,7 @@ export function buildPlan(wf: WorkflowDef): ExecPlan {
       call: n.call,
       each: n.each,
       retry: n.retry,
+      continueOnError: n.continueOnError,
       inputSchema: n.inputSchema,
       outputSchema: n.outputSchema,
       secrets,
