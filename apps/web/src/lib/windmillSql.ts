@@ -34,19 +34,18 @@ export const hasWindmillHeader = (h: WindmillSqlHeader): boolean =>
   !!h.database || h.returnLastResult || h.params.length > 0;
 
 /**
- * Map header params → ordered Mill param expressions for `$1..$n`. Default each to
- * `input.<name>` (the editor's convention — the upstream step's output), but KEEP any
- * expression the user already wrote at that position so re-running detect never clobbers edits.
- * Gaps (a `$2` declared with no `$1`) become "" so the placeholder count still lines up.
+ * Map header params → ordered Mill param expressions for `$1..$n`. This is an explicit user
+ * action ("Fill params from comments"), so the header is AUTHORITATIVE for every index it
+ * declares — each becomes `input.<name>` (the editor's convention: the upstream step's output),
+ * overwriting whatever placeholder/default sat there. Params BEYOND what the header declares are
+ * preserved (a query may reference more `$n` than it documents), and gaps become "".
  */
 export function windmillParamExprs(h: WindmillSqlHeader, existing: string[] = []): string[] {
-  const max = h.params.reduce((n, p) => Math.max(n, p.index), 0);
+  const max = Math.max(h.params.reduce((n, p) => Math.max(n, p.index), 0), existing.length);
   const out: string[] = [];
   for (let i = 0; i < max; i++) {
-    const prev = existing[i]?.trim();
-    if (prev) { out[i] = existing[i]; continue; }
     const p = h.params.find((x) => x.index === i + 1);
-    out[i] = p ? `input.${p.name}` : "";
+    out[i] = p ? `input.${p.name}` : (existing[i] ?? "");
   }
   return out;
 }
