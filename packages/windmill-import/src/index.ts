@@ -1,4 +1,4 @@
-import { stringify as yamlStringify } from "yaml";
+import { stringify as yamlStringify, parse as yamlParse } from "yaml";
 
 // Windmill OpenFlow → Mill project importer (JS/TS + Postgres + control flow).
 //
@@ -399,4 +399,20 @@ export function importWindmillFlow(flow: OpenFlow, opts: { name: string; resolve
     subWorkflows: imp.subWorkflows,
     dependencies: [...imp.dependencies],
   };
+}
+
+// Parse raw Windmill flow text (from a file upload / paste) into an OpenFlow object. A Windmill
+// "Export flow" gives one self-contained JSON; a `.flow/flow.yaml` may use `!inline <path>` refs
+// to sibling files — with no filesystem here those stay unresolved markers (the importer emits a
+// visible `/* missing inline */` placeholder), which is fine for the single-file web path.
+const INLINE_TAG = { tag: "!inline", resolve: (s: string) => ({ __inline: s }) } as const;
+export function parseFlowText(text: string, filename?: string): OpenFlow {
+  const isJson = filename?.toLowerCase().endsWith(".json") || /^\s*\{/.test(text);
+  return (isJson ? JSON.parse(text) : yamlParse(text, { customTags: [INLINE_TAG as never] })) as OpenFlow;
+}
+
+/** Derive a workflow name from an uploaded filename (…/pay-invoices.flow.yaml → pay-invoices). */
+export function flowNameFromFilename(filename?: string): string {
+  const base = (filename ?? "").split(/[\\/]/).pop() ?? "";
+  return base.replace(/\.flow$/, "").replace(/\.(flow\.)?ya?ml$|\.json$/i, "").replace(/[^A-Za-z0-9._-]/g, "-") || "imported";
 }

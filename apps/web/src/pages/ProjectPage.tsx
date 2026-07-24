@@ -3,13 +3,14 @@ import { Link, useParams, useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import {
   ArrowLeft, GitBranch, RefreshCw, Download, Plus, Clock, Webhook, Hand, Zap,
-  GitCommitHorizontal, AlertTriangle, ShieldCheck, FileArchive, ArrowRight, CheckCircle2, Trash2,
+  GitCommitHorizontal, AlertTriangle, ShieldCheck, FileArchive, ArrowRight, CheckCircle2, Trash2, UploadCloud,
 } from "lucide-react";
 import { findProject, exportBundle, nodeKindCounts, type Trigger, type Project, type ReconcileEvent, type DiffEntry, type Workflow } from "../lib/mock";
 import { KindIcon, kindAccent } from "../graph/MillNode";
 import { SyncBadge, HealthBadge, StatusPill } from "../components/Badges";
 import { InfoTip, Tip } from "../components/InfoTip";
 import { Modal, Drawer, Toggle, DiffRow, Spec, useToast, Toast } from "../components/Kit";
+import { ImportFlowModal } from "../components/ImportFlowModal";
 import { useLiveStatus } from "../lib/useLive";
 import { LIVE, reconcileNow, deleteWorkflow, getReconcileEvents, getDiff, getEndpoints, type ReconcileEventLive, type DiffEntryLive, type ProjectEndpoints } from "../lib/api";
 
@@ -73,6 +74,7 @@ export function ProjectPage() {
   const mockProject = LIVE ? undefined : findProject(projectId);
   const [showReconcile, setShowReconcile] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const [showNewWf, setShowNewWf] = useState(false);
   const [npWfName, setNpWfName] = useState("");
   const [npWfTrigger, setNpWfTrigger] = useState<"manual" | "cron" | "webhook" | "event">("manual");
@@ -190,6 +192,11 @@ export function ProjectPage() {
               <Tip text="GitOps details: the fetch/apply split, what a Sync would change, and recent reconcile activity.">
                 <button className="btn-ghost" data-testid="gitops-btn" onClick={() => setShowReconcile(true)}>
                   <GitBranch className="h-4 w-4" /> GitOps
+                </button>
+              </Tip>
+              <Tip text="Import a Windmill flow (.flow.yaml or OpenFlow .json) into this project — converted to workflow(s), committed, reconciled.">
+                <button className="btn-ghost" data-testid="import-flow-open" onClick={() => setShowImport(true)}>
+                  <UploadCloud className="h-4 w-4" /> Import
                 </button>
               </Tip>
               <Tip text="Export this project as a standalone .tar.gz (YAML + JS + generated entrypoint) that runs on any JS runtime.">
@@ -434,6 +441,9 @@ export function ProjectPage() {
           </label>
         </div>
       </Modal>
+
+      <ImportFlowModal open={showImport} onClose={() => setShowImport(false)} project={project.id}
+        onDone={async (imported) => { await reload(); flash(`Imported ${imported.join(", ")} · committed + reconciled`); }} />
 
       <Toast toast={toast} icon={<GitCommitHorizontal className="h-4 w-4 text-brand-400" />} />
     </div>

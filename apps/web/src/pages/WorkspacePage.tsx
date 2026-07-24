@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
-import { GitBranch, Plus, FolderGit2, Workflow as WorkflowIcon, GitCommitHorizontal, KeyRound, Trash2 } from "lucide-react";
+import { GitBranch, Plus, FolderGit2, Workflow as WorkflowIcon, GitCommitHorizontal, KeyRound, Trash2, UploadCloud } from "lucide-react";
 import { workspace, projects } from "../lib/mock";
 import { SyncBadge, HealthBadge } from "../components/Badges";
 import { InfoTip, Tip } from "../components/InfoTip";
 import { Modal, Toggle, Spec, useToast, Toast } from "../components/Kit";
+import { ImportFlowModal } from "../components/ImportFlowModal";
 import { useLiveStatus } from "../lib/useLive";
 import { LIVE, deleteProject, createProject } from "../lib/api";
 
@@ -13,6 +14,7 @@ const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 export function WorkspacePage() {
   const [showNew, setShowNew] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const [autoSync, setAutoSync] = useState(true);
   const [selfHeal, setSelfHeal] = useState(true);
   const [prune, setPrune] = useState(false);
@@ -79,11 +81,18 @@ export function WorkspacePage() {
             <Spec doc="ARCH §5" />
           </p>
         </div>
-        <Tip text="Register a new project by pointing Mill at a git repo. It appears here once the reconciler indexes it.">
-          <button className="btn-primary" data-testid="new-project" onClick={() => setShowNew(true)}>
-            <Plus className="h-4 w-4" /> New Project
-          </button>
-        </Tip>
+        <div className="flex items-center gap-2">
+          <Tip text="Import a Windmill flow (.flow.yaml or OpenFlow .json) as a brand-new project. Mill converts it to workflows, commits, and reconciles.">
+            <button className="btn-ghost" data-testid="import-flow-open" onClick={() => setShowImport(true)}>
+              <UploadCloud className="h-4 w-4" /> Import from Windmill
+            </button>
+          </Tip>
+          <Tip text="Register a new project by pointing Mill at a git repo. It appears here once the reconciler indexes it.">
+            <button className="btn-primary" data-testid="new-project" onClick={() => setShowNew(true)}>
+              <Plus className="h-4 w-4" /> New Project
+            </button>
+          </Tip>
+        </div>
       </div>
 
       {/* app-of-apps binding */}
@@ -223,6 +232,9 @@ export function WorkspacePage() {
           </div>
         </div>
       </Modal>
+
+      <ImportFlowModal open={showImport} onClose={() => setShowImport(false)}
+        onDone={async (imported, pid) => { await reload(); flash(`Imported ${imported.join(", ")} into ${pid} · committed + reconciled`); }} />
 
       <Toast toast={toast} icon={<GitCommitHorizontal className="h-4 w-4 text-brand-400" />} />
     </div>

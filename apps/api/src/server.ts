@@ -18,7 +18,8 @@ import { loadProject, listWorkflows, loadWorkflow, listProjects, collectDeps, va
 import { buildPlan } from "@mill/compiler";
 import { openRepo, reconcile, deletePaths, writePaths, diffToApply, type RepoState, type ReconcileStatus } from "@mill/gitops";
 import { parseWorkflow } from "@mill/core";
-import { stringify as yamlStringify } from "yaml";
+import { importWindmillFlow, parseFlowText, flowNameFromFilename } from "@mill/windmill-import";
+import { stringify as yamlStringify, parse as yamlParse } from "yaml";
 import { TriggerEngine, type TriggerDef } from "./triggers";
 import { exportProject } from "./export";
 
@@ -709,6 +710,68 @@ api.post("/projects", async (c) => {
     await writePaths(repoState, [{ path: `${id}/project.yaml`, content: yaml }], `create project ${id}`);
     const s = await doReconcile({ force: true });
     return c.json({ created: id, status: s });
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+  }
+});
+
+// Import a Windmill flow (uploaded/pasted OpenFlow text) as one or more Mill workflows.
+// Windmill has no clean export, so the client sends the raw flow text; we convert it in memory,
+// then commit exactly like Save. Creates the project if it doesn't exist yet (so the same
+// endpoint serves both "import into project" and "import as a new project"). A flow whose
+// callScript targets aren't present is BLOCKED with 409 unless `force` — mirroring the CLI.
+api.post("/projects/:id/import/windmill", async (c) => {
+  const { id } = c.req.param();
+  if (!repoState) return c.json({ error: "import requires a git-backed workspace (PROJECT_REPO)" }, 400);
+  if (!/^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$/.test(id)) return c.json({ error: "project id must be 2–40 chars: lowercase letters, digits, hyphens" }, 400);
+
+  let body: { content?: string; filename?: string; name?: string; force?: boolean; sync?: { autoSync?: boolean; selfHeal?: boolean; prune?: boolean } };
+  try { body = await c.req.json(); } catch { return c.json({ error: "invalid JSON body" }, 400); }
+  if (!body.content?.trim()) return c.json({ error: "no flow content — upload or paste a Windmill flow (.flow.yaml / OpenFlow .json)" }, 400);
+
+  // Parse the raw flow text → OpenFlow, then convert in memory.
+  let result: ReturnType<typeof importWindmillFlow>;
+  try {
+    const flow = parseFlowText(body.content, body.filename);
+    const wfName = (body.name?.trim() || flowNameFromFilename(body.filename)).replace(/[^A-Za-z0-9._-]/g, "-");
+    result = importWindmillFlow(flow, { name: wfName });
+  } catch (e) {
+    return c.json({ error: `couldn't parse flow: ${e instanceof Error ? e.message : String(e)}` }, 400);
+  }
+
+  const projectExists = existsSync(join(PROJECTS_DIR, id, "project.yaml"));
+  const all = [{ name: result.name, workflowYaml: result.workflowYaml, files: result.files }, ...result.subWorkflows];
+
+  // A callScript target that's neither imported now nor already on disk → blocked (would 500 at
+  // run time). Let the client decide to import anyway with `force`.
+  const selfProvided = new Set(all.map((w) => w.name));
+  const missing = result.dependencies.filter((d) => !selfProvided.has(d) && !existsSync(join(PROJECTS_DIR, id, "workflows", d, "workflow.yaml")));
+  if (missing.length && !body.force) return c.json({ blocked: true, missing, report: result.report }, 409);
+
+  // Validate every produced workflow BEFORE writing (same guarantee as Save) so a bad import
+  // never lands a broken commit.
+  const writes: { path: string; content: string }[] = [];
+  if (!projectExists) {
+    writes.push({ path: `${id}/project.yaml`, content: yamlStringify({
+      apiVersion: "mill/v1", kind: "Project", metadata: { name: id },
+      sync: { autoSync: body.sync?.autoSync ?? true, selfHeal: body.sync?.selfHeal ?? true, prune: body.sync?.prune ?? false },
+    }) });
+  }
+  for (const w of all) {
+    const parsed = parseWorkflow(yamlParse(w.workflowYaml));
+    if (!parsed.ok) return c.json({ error: `imported workflow '${w.name}' is invalid`, issues: parsed.issues }, 400);
+    const base = `${id}/workflows/${w.name}`;
+    writes.push({ path: `${base}/workflow.yaml`, content: w.workflowYaml });
+    for (const [rel, content] of Object.entries(w.files)) {
+      if (rel.includes("..")) return c.json({ error: `illegal file path '${rel}'` }, 400);
+      writes.push({ path: `${base}/${rel}`, content });
+    }
+  }
+
+  try {
+    await writePaths(repoState, writes, `import windmill flow → ${id}/${all.map((w) => w.name).join(", ")}`);
+    const s = await doReconcile({ force: true });
+    return c.json({ imported: all.map((w) => w.name), createdProject: !projectExists, report: result.report, status: s });
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
   }

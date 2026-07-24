@@ -149,6 +149,23 @@ export async function createProject(id: string, opts?: { autoSync?: boolean; sel
   return j;
 }
 
+export interface WindmillImportReport { total: number; supported: number; skipped: { id: string; type: string; reason: string }[]; warnings: string[]; deps: string[] }
+export interface WindmillImportResult { imported?: string[]; createdProject?: boolean; report?: WindmillImportReport; blocked?: boolean; missing?: string[] }
+/** Convert a Windmill flow (raw OpenFlow text) into Mill workflow(s) + commit. When the flow's
+ *  callScript targets aren't present yet the server returns `{ blocked, missing }` (HTTP 409) —
+ *  the caller can re-send with `force: true`. Creates the project if it doesn't exist. */
+export async function importWindmill(projectId: string, body: { content: string; filename?: string; name?: string; force?: boolean; sync?: { autoSync?: boolean; selfHeal?: boolean; prune?: boolean } }): Promise<WindmillImportResult> {
+  const r = await fetch(`${BASE}/projects/${projectId}/import/windmill`, {
+    method: "POST",
+    headers: authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 409 && j.blocked) return j as WindmillImportResult; // caller offers "import anyway"
+  if (!r.ok) throw new Error(j.error || `import failed (${r.status})`);
+  return j as WindmillImportResult;
+}
+
 export interface LiveRun { id: string; status: string; trigger?: string; revision?: string; createdAt?: string; startedAt?: string; finishedAt?: string; ms?: string; error?: string; workflow?: string }
 export async function getRuns(projectId: string, wf: string): Promise<{ runs: LiveRun[] }> {
   return getJSON(`/projects/${projectId}/workflows/${wf}/runs`);

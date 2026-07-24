@@ -2,7 +2,7 @@ import { test, expect, describe } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { importWindmillFlow, parseWmSqlHeader, type OpenFlow } from "../src/index";
+import { importWindmillFlow, parseWmSqlHeader, parseFlowText, flowNameFromFilename, type OpenFlow } from "../src/index";
 import { parseWorkflow } from "@mill/core";
 import { runWorkflow } from "@mill/executor";
 
@@ -84,6 +84,23 @@ describe("windmill import", () => {
   test("SQL header params sort by index and tolerate `= default`", () => {
     const h = parseWmSqlHeader("-- $2 limit = 100\n-- $1 orgId\nselect 1");
     expect(h.params).toEqual([{ index: 1, name: "orgId", default: undefined }, { index: 2, name: "limit", default: "100" }]);
+  });
+
+  test("parseFlowText reads OpenFlow JSON and YAML (the web upload/paste path)", () => {
+    const mod = { id: "s", value: { type: "rawscript", language: "bun", content: "export async function main() { return 1; }" } };
+    const fromJson = parseFlowText(JSON.stringify({ value: { modules: [mod] } }), "flow.json");
+    const fromYaml = parseFlowText("value:\n  modules:\n    - id: s\n      value:\n        type: rawscript\n        language: bun\n        content: |\n          export async function main() { return 1; }\n", "flow.flow.yaml");
+    expect(fromJson.value?.modules?.[0].id).toBe("s");
+    expect(fromYaml.value?.modules?.[0].id).toBe("s");
+    // Both convert to the same valid Mill workflow.
+    for (const flow of [fromJson, fromYaml])
+      expect(parseWorkflow(require("yaml").parse(importWindmillFlow(flow, { name: "w" }).workflowYaml)).ok).toBe(true);
+  });
+
+  test("flowNameFromFilename strips Windmill extensions", () => {
+    expect(flowNameFromFilename("pay-invoices.flow.yaml")).toBe("pay-invoices");
+    expect(flowNameFromFilename("some/dir/Sync Invoices.json")).toBe("Sync-Invoices");
+    expect(flowNameFromFilename(undefined)).toBe("imported");
   });
 
   test("non-JS languages are skipped + reported (loud TODO node, nothing silent)", () => {
